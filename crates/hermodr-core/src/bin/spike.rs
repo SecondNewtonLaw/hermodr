@@ -14,6 +14,7 @@
 use std::{env, time::Duration};
 
 use anyhow::Result;
+use hermodr_core::HistoryPolicy;
 use whatsapp_rust::prelude::*;
 use whatsapp_rust::wacore::types::events::Event;
 
@@ -25,12 +26,12 @@ fn session_url() -> String {
         .unwrap_or_else(|| "sqlite:spike.db".to_string())
 }
 
-/// Whether to accept the initial history sync.
+/// Whether to accept the deep history sync.
 ///
-/// Default is to skip it: history is exactly what made the v1 web client pull
-/// the account's entire history into a WebKit heap.
-fn should_skip_history() -> bool {
-    !matches!(
+/// Default is to refuse it: that is what made the v1 web client pull the
+/// account's entire history into a WebKit heap.
+fn accept_full_history() -> bool {
+    matches!(
         env::var("SPIKE_HISTORY").as_deref(),
         Ok("accept") | Ok("1") | Ok("true")
     )
@@ -54,21 +55,28 @@ fn report_rss(phase: &str) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let db = session_url();
-    let skip = should_skip_history();
+    let full_history = accept_full_history();
 
     println!("[spike] session: {db}");
     println!(
-        "[spike] history sync: {}",
-        if skip {
-            "SKIPPED (default)"
-        } else {
+        "[spike] deep history: {}",
+        if full_history {
             "ACCEPTED (SPIKE_HISTORY set)"
+        } else {
+            "REFUSED (default) — recent window and on-demand only"
         }
     );
     report_rss("startup");
 
-    let mut builder = Bot::builder()
+    let policy = if full_history {
+        HistoryPolicy::accept_everything()
+    } else {
+        HistoryPolicy::default()
+    };
+
+    let bot = Bot::builder()
         .with_backend(SqliteStore::new(&db).await?)
+        .with_history_sync_admission(policy)
         .on_qr_code(|code, _timeout| async move {
             println!("\n[spike] Scan to pair:\n{code}\n");
         })
@@ -94,13 +102,9 @@ async fn main() -> Result<()> {
                     _ => {}
                 }
             },
-        );
-
-    if skip {
-        builder = builder.skip_history_sync();
-    }
-
-    let bot = builder.build().await?;
+        )
+        .build()
+        .await?;
 
     // Report growth while idle. With history refused these numbers should stay flat.
     tokio::spawn(async {

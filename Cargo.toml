@@ -9,16 +9,12 @@ license = "MIT"
 repository = "https://github.com/emiliano-go/hermodr"
 
 [workspace.dependencies]
-# `simd` is the only default feature that needs nightly Rust, so it is excluded
-# and the rest are opted into explicitly. This keeps the build on stable.
-whatsapp-rust = { version = "0.7", default-features = false, features = [
-    "sqlite-storage",
-    "tokio-transport",
-    "tokio-runtime",
-    "tokio-native",
-    "ureq-client",
-    "signal",
-] }
+# Pinned to a revision rather than the crates.io release: history-sync admission
+# control (`HistorySyncAdmission`) exists here but not in 0.7.0.
+# Consumed from a local checkout at rev 9eb43b9bc2bc561cc34a672b4295528bf4c2d733,
+# because the repository's own .cargo/config.toml injects nightly-only rustflags
+# that would break a stable build if it were vendored as a git dependency.
+whatsapp-rust = { path = "../whatsapp-rust" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 anyhow = "1"
 log = "0.4"
