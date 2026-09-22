@@ -5,5 +5,9 @@
 //! importantly — makes history sync a decision this program gets to make.
 
 pub mod history;
+pub mod service;
+pub mod store;
 
 pub use history::HistoryPolicy;
+pub use service::{Service, ServiceConfig, ServiceEvent};
+pub use store::{ChatSummary, MessageStore, Retention, StoredMessage};

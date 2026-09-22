@@ -14,3 +14,4 @@ log = { workspace = true }
 # Renders the pairing QR to the terminal. Kept in-crate so the spike has no
 # system dependency like `qrencode`.
 qrcode = { version = "0.14", default-features = false }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
