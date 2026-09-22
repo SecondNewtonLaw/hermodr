@@ -1,21 +1,20 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the local chrome UI webview",
-  "webviews": ["ui"],
+  "description": "Capability for the Herm\u00f3\u00f0r window",
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
-    "allow-list-tabs",
-    "allow-add-tab",
-    "allow-select-tab",
-    "allow-close-tab",
-    "allow-rename-tab",
-    "allow-reorder-tabs",
-    "allow-set-zoom",
-    "allow-zoom-by",
-    "allow-reset-zoom",
+    "allow-connect",
+    "allow-messages",
+    "allow-chats",
+    "allow-send-text",
     "allow-get-settings",
     "allow-set-settings",
-    "allow-open-settings"
+    "allow-qr-svg",
+    "allow-connection-state",
+    "allow-resolve-names"
   ]
 }

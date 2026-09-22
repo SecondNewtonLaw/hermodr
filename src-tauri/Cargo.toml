@@ -1,16 +1,11 @@
 [package]
 name = "hermodr"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Hermóðr: a native WhatsApp client"
+authors = ["emiliano-go"]
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [lib]
-# The `_lib` suffix may seem redundant but it is necessary
-# to make the lib name unique and wouldn't conflict with the bin name.
-# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "hermodr_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
@@ -18,15 +13,14 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { path = "../../tauri/crates/tauri-build", features = [] }
 
 [dependencies]
-tauri = { path = "../../tauri/crates/tauri", features = ["unstable", "tray-icon"] }
+# The native protocol client. This is what replaced the embedded WhatsApp Web
+# webview, and with it the whole class of memory and history problems.
+hermodr-core = { path = "../crates/hermodr-core" }
+tauri = { path = "../../tauri/crates/tauri", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 
-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
-webkit2gtk = { version = "2", features = ["v2_40"] }
-
-
-# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
 codegen-units = 1
 lto = true

@@ -6,14 +6,22 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
 use anyhow::Result;
+use serde::Serialize;
 use tokio::sync::broadcast;
 use whatsapp_rust::{
-    prelude::*, wacore::msg_secret::MsgSecretRetention, wacore::types::events::Event, CacheConfig,
+    prelude::*,
+    wacore::msg_secret::MsgSecretRetention,
+    wacore::types::events::Event,
+    wacore_binary::builder::NodeBuilder,
+    CacheConfig,
 };
 
 use crate::{
@@ -112,7 +120,8 @@ fn reclaim_oversized_secrets(session_path: &Path, retention: &Retention) -> Resu
 }
 
 /// Events the UI reacts to.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ServiceEvent {
     /// A pairing QR is ready to display.
     QrCode(String),
@@ -150,6 +159,35 @@ impl ServiceConfig {
     }
 }
 
+/// Fetches a group's subject over the `w:g2` namespace.
+///
+/// Group names are not carried on incoming messages, and the library exposes no
+/// typed accessor for them in this version, so the query is issued directly.
+async fn fetch_group_subject(client: &Client, group: &str) -> Option<String> {
+    let jid: Jid = group.parse().ok()?;
+    let node = NodeBuilder::new("iq")
+        .attr("type", "get")
+        .attr("xmlns", "w:g2")
+        .attr("to", jid)
+        .children([NodeBuilder::new("query")
+            .attr("request", "interactive")
+            .build()])
+        .build();
+
+    let response = client
+        .send_iq_node(node, Some(Duration::from_secs(15)))
+        .await
+        .ok()?;
+
+    // The subject lives on the <group> child of the response.
+    let group_node = response.get().get_optional_child_by_tag(&["group"])?;
+    group_node
+        .attrs()
+        .optional_string("subject")
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// A running account client.
 ///
 /// Dropping this stops the background task and closes the stores.
@@ -158,16 +196,26 @@ pub struct Service {
     store: Arc<MessageStore>,
     events: broadcast::Sender<ServiceEvent>,
     shutdown: tokio::sync::oneshot::Sender<()>,
+    /// Latest pairing code, kept so a subscriber that attaches after the code
+    /// was issued can still display it. The QR is emitted during startup, which
+    /// a late subscriber would otherwise miss entirely.
+    qr: Arc<Mutex<Option<String>>>,
+    connected: Arc<AtomicBool>,
 }
 
 impl Service {
     /// Connects an account, pairing first if it has no session yet.
-    pub async fn start(config: ServiceConfig) -> Result<Self> {
+    ///
+    /// Returns the service along with an event receiver that was registered
+    /// before the connection attempt began. The pairing code is emitted during
+    /// startup, so a receiver created afterwards would miss it; the returned one
+    /// is guaranteed to see every event from the beginning.
+    pub async fn start(config: ServiceConfig) -> Result<(Self, broadcast::Receiver<ServiceEvent>)> {
         let store = Arc::new(MessageStore::open(
             &config.messages_path,
             config.retention,
         )?);
-        let (events, _) = broadcast::channel(256);
+        let (events, initial_rx) = broadcast::channel(256);
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
         if let Ok(removed) = reclaim_oversized_secrets(&config.session_path, &config.retention) {
@@ -182,8 +230,12 @@ impl Service {
             HistoryPolicy::default()
         };
 
+        let qr_state = Arc::new(Mutex::new(None));
+        let connected_state = Arc::new(AtomicBool::new(false));
+
         let store_for_events = store.clone();
         let events_for_events = events.clone();
+        let connected_for_events = connected_state.clone();
 
         let bot = Bot::builder()
             .with_backend(SqliteStore::new(config.session_path.to_string_lossy().as_ref()).await?)
@@ -191,18 +243,28 @@ impl Service {
             .with_cache_config(cache_config_for(&config.retention))
             .on_qr_code({
                 let events = events.clone();
+                let qr_state = qr_state.clone();
                 move |code, _timeout| {
                     let events = events.clone();
+                    let qr_state = qr_state.clone();
                     async move {
+                        *qr_state.lock().unwrap() = Some(code.clone());
                         let _ = events.send(ServiceEvent::QrCode(code));
                     }
                 }
             })
             .on_connected({
                 let events = events.clone();
+                let qr_state = qr_state.clone();
+                let connected_state = connected_state.clone();
                 move |_client| {
                     let events = events.clone();
+                    let qr_state = qr_state.clone();
+                    let connected_state = connected_state.clone();
                     async move {
+                        connected_state.store(true, Ordering::SeqCst);
+                        // The code is spent once paired.
+                        *qr_state.lock().unwrap() = None;
                         let _ = events.send(ServiceEvent::Connected);
                     }
                 }
@@ -212,6 +274,7 @@ impl Service {
                 move |event, _client| {
                     let store = store_for_events.clone();
                     let events = events_for_events.clone();
+                    let connected = connected_for_events.clone();
                     async move {
                         match event.as_ref() {
                             Event::Messages(batch) => {
@@ -219,6 +282,18 @@ impl Service {
                                     let Some(message) = to_stored(inbound) else {
                                         continue;
                                     };
+                                    // The envelope carries the sender's display
+                                    // name, which is the only name source
+                                    // available without a contacts query.
+                                    let push_name = inbound.info.push_name.to_string();
+                                    if !push_name.is_empty() {
+                                        let _ = store.set_name(&message.sender, &push_name);
+                                        // A one-to-one chat is named after its
+                                        // contact, so the same name applies.
+                                        if !inbound.info.source.is_group {
+                                            let _ = store.set_name(&message.chat, &push_name);
+                                        }
+                                    }
                                     let _ = store.upsert(&message);
                                     let _ = events.send(ServiceEvent::Message(message));
                                 }
@@ -232,6 +307,7 @@ impl Service {
                                 }
                             }
                             Event::Disconnected(_) => {
+                                connected.store(false, Ordering::SeqCst);
                                 let _ = events.send(ServiceEvent::Disconnected);
                             }
                             _ => {}
@@ -252,12 +328,17 @@ impl Service {
             }
         });
 
-        Ok(Self {
-            client,
-            store,
-            events,
-            shutdown: shutdown_tx,
-        })
+        Ok((
+            Self {
+                client,
+                store,
+                events,
+                shutdown: shutdown_tx,
+                qr: qr_state,
+                connected: connected_state,
+            },
+            initial_rx,
+        ))
     }
 
     /// Subscribes to service events.
@@ -265,10 +346,62 @@ impl Service {
         self.events.subscribe()
     }
 
+    /// The current pairing code, if the account still needs pairing.
+    ///
+    /// Exposed separately from the event stream because the code is issued
+    /// during startup, before a UI subscriber may have attached.
+    pub fn current_qr(&self) -> Option<String> {
+        self.qr.lock().unwrap().clone()
+    }
+
+    /// Whether the account is currently connected.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
+    }
+
+    /// Resolves display names for chats that do not have one yet.
+    ///
+    /// Only groups need a query: a one-to-one chat is named after its contact,
+    /// whose name arrives with the message itself. Returns how many were
+    /// resolved, so the caller can refresh only when something changed.
+    pub async fn resolve_missing_names(&self) -> Result<usize> {
+        let mut resolved = 0;
+        for chat in self.store.chats()? {
+            if chat.display_name.is_some() || !chat.chat.ends_with("@g.us") {
+                continue;
+            }
+            if let Some(subject) = fetch_group_subject(&self.client, &chat.chat).await {
+                self.store.set_name(&chat.chat, &subject)?;
+                resolved += 1;
+            }
+        }
+        Ok(resolved)
+    }
+
     /// Sends a text message to a chat.
+    ///
+    /// The sent message is stored and dispatched locally. WhatsApp does not echo
+    /// a message back to the device that sent it, so without this the sender
+    /// would not see their own message until the store was next reloaded.
     pub async fn send_text(&self, chat: &str, text: impl Into<String>) -> Result<()> {
         let to: Jid = chat.parse()?;
-        self.client.send_text(to, text).await?;
+        let text = text.into();
+        let result = self.client.send_text(to, text.clone()).await?;
+
+        let message = StoredMessage {
+            chat: chat.to_string(),
+            id: result.message_id.clone(),
+            sender: chat.to_string(),
+            sender_name: None,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            from_me: true,
+            text,
+        };
+        self.store.upsert(&message)?;
+        let _ = self.events.send(ServiceEvent::Message(message));
         Ok(())
     }
 
@@ -299,6 +432,8 @@ fn to_stored(inbound: &InboundMessage) -> Option<StoredMessage> {
         chat: info.source.chat.to_string(),
         id: info.id.to_string(),
         sender: info.source.sender.to_string(),
+        // Names are resolved separately and joined by the store on read.
+        sender_name: None,
         timestamp: info.timestamp.timestamp(),
         from_me: info.source.is_from_me,
         text,

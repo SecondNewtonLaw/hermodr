@@ -28,18 +28,10 @@ mod sync_type {
 }
 
 /// Decides which history-sync chunks are accepted during pairing.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HistoryPolicy {
     /// Accept the deep `FULL` sync. Defaults to `false`: that is the 20 GB case.
     pub accept_full_history: bool,
-}
-
-impl Default for HistoryPolicy {
-    fn default() -> Self {
-        Self {
-            accept_full_history: false,
-        }
-    }
 }
 
 impl HistoryPolicy {

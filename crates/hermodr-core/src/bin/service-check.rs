@@ -39,8 +39,7 @@ async fn main() -> Result<()> {
         retention.max_age_hours, retention.max_messages_per_chat
     );
 
-    let service = Service::start(config).await?;
-    let mut events = service.subscribe();
+    let (service, mut events) = Service::start(config).await?;
 
     println!("[check] listening for events (Ctrl-C to stop)\n");
 

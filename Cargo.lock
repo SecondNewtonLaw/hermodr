@@ -765,6 +765,7 @@ dependencies = [
  "log",
  "qrcode",
  "rusqlite",
+ "serde",
  "tokio",
  "whatsapp-rust",
 ]

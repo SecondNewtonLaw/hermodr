@@ -1,17 +1,13 @@
 const COMMANDS: &[&str] = &[
-    "list_tabs",
-    "add_tab",
-    "select_tab",
-    "close_tab",
-    "rename_tab",
-    "reorder_tabs",
-    "set_zoom",
-    "zoom_by",
-    "reset_zoom",
+    "connection_state",
+    "connect",
+    "messages",
+    "chats",
+    "resolve_names",
+    "send_text",
+    "qr_svg",
     "get_settings",
     "set_settings",
-    "open_settings",
-    "shortcut",
 ];
 
 fn main() {

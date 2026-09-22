@@ -8,6 +8,23 @@ pub mod history;
 pub mod service;
 pub mod store;
 
+use anyhow::Result;
+
 pub use history::HistoryPolicy;
 pub use service::{Service, ServiceConfig, ServiceEvent};
 pub use store::{ChatSummary, MessageStore, Retention, StoredMessage};
+
+/// Renders a pairing code as an SVG string for the UI to display.
+///
+/// Done here rather than in the frontend so the QR encoder is shared with the
+/// terminal spike and the UI needs no JavaScript QR dependency.
+pub fn qr_svg(data: &str) -> Result<String> {
+    use qrcode::render::svg;
+    let code = qrcode::QrCode::new(data.as_bytes())?;
+    Ok(code
+        .render::<svg::Color<'_>>()
+        .min_dimensions(240, 240)
+        .dark_color(svg::Color("#e4e4e7"))
+        .light_color(svg::Color("#111214"))
+        .build())
+}

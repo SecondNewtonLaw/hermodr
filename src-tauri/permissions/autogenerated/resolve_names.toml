@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resolve-names"
+description = "Enables the resolve_names command without any pre-configured scope."
+commands.allow = ["resolve_names"]
+
+[[permission]]
+identifier = "deny-resolve-names"
+description = "Denies the resolve_names command without any pre-configured scope."
+commands.deny = ["resolve_names"]

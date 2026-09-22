@@ -12,11 +12,6 @@ const config = {
     adapter: adapter({
       fallback: "index.html",
     }),
-    prerender: {
-      // Both the tab bar and the settings dialog are loaded by Tauri directly,
-      // so they must exist as real files rather than client-side routes.
-      entries: ["*"],
-    },
   },
 };
 

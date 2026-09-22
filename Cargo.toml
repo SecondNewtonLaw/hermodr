@@ -1,5 +1,8 @@
 [workspace]
 members = ["crates/hermodr-core"]
+# The Tauri app has its own manifest that depends on a local Tauri checkout, so
+# it stays outside this workspace rather than nesting one inside the other.
+exclude = ["src-tauri"]
 resolver = "2"
 
 [workspace.package]

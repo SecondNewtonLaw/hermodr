@@ -4,7 +4,19 @@
     <meta charset="utf-8" />
     <link rel="icon" href="%sveltekit.assets%/favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Tauri + SvelteKit + Typescript App</title>
+    <title>Hermóðr</title>
+    <!-- Set on the document itself so the window never flashes white before the
+         app's styles load. -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #111214;
+        color: #e4e4e7;
+        font-family: system-ui, sans-serif;
+      }
+    </style>
     %sveltekit.head%
   </head>
   <body data-sveltekit-preload-data="hover">
