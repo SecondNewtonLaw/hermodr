@@ -14,3 +14,6 @@ vite.config.ts.timestamp-*
 spike.db
 *.db-wal
 *.db-shm
+
+# Phase 1 verification data
+service-data/

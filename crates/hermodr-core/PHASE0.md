@@ -47,3 +47,20 @@ $ cargo run -p hermodr-core --bin spike
 ```
 
 `SPIKE_HISTORY=accept` accepts the deep history sync, for comparison.
+
+---
+
+# Phase 1 verification
+
+Ran `service-check` against the same paired account, with retention set to
+24 hours and 20 messages per chat so the policy is observable within a run.
+
+| Check | Result |
+|---|---|
+| Connects using a stored session | yes |
+| Group messages stored with decoded senders | yes (43 chats) |
+| Retention prunes on write | yes (logged each removal) |
+| Per-chat cap enforced | yes (max 20 per chat, 0 chats over) |
+| RSS while receiving live traffic | 124 MB |
+
+Message bodies, chat ids, and LID senders all round-trip through the store.
