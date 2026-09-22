@@ -15,15 +15,19 @@ use std::{env, time::Duration};
 
 use anyhow::Result;
 use hermodr_core::HistoryPolicy;
+use qrcode::render::unicode;
+use qrcode::QrCode;
 use whatsapp_rust::prelude::*;
 use whatsapp_rust::wacore::types::events::Event;
 
 /// Pure Rust, no Go toolchain. `whatsapp-rust` persists protocol/crypto state
 /// only; message history is never stored unless we choose to.
-fn session_url() -> String {
+fn session_path() -> String {
+    // `SqliteStore` takes a filesystem path (or a `sqlite://` URL); a bare
+    // `sqlite:` prefix is treated as part of the filename.
     env::args()
         .nth(1)
-        .unwrap_or_else(|| "sqlite:spike.db".to_string())
+        .unwrap_or_else(|| "spike.db".to_string())
 }
 
 /// Whether to accept the deep history sync.
@@ -54,7 +58,7 @@ fn report_rss(phase: &str) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let db = session_url();
+    let db = session_path();
     let full_history = accept_full_history();
 
     println!("[spike] session: {db}");
@@ -78,7 +82,20 @@ async fn main() -> Result<()> {
         .with_backend(SqliteStore::new(&db).await?)
         .with_history_sync_admission(policy)
         .on_qr_code(|code, _timeout| async move {
-            println!("\n[spike] Scan to pair:\n{code}\n");
+            // Render as half-block Unicode so the QR is scannable straight from
+            // the terminal, with no system dependency.
+            match QrCode::new(code.as_bytes()) {
+                Ok(qr) => {
+                    let image = qr
+                        .render::<unicode::Dense1x2>()
+                        .dark_color(unicode::Dense1x2::Light)
+                        .light_color(unicode::Dense1x2::Dark)
+                        .quiet_zone(true)
+                        .build();
+                    println!("\n[spike] Scan to pair:\n\n{image}\n");
+                }
+                Err(e) => println!("[spike] failed to render QR: {e}\n{code}"),
+            }
         })
         .on_connected(|_client| async {
             println!("[spike] connected");
