@@ -64,3 +64,25 @@ Ran `service-check` against the same paired account, with retention set to
 | RSS while receiving live traffic | 124 MB |
 
 Message bodies, chat ids, and LID senders all round-trip through the store.
+
+---
+
+# Session database growth
+
+`msg_secrets` holds decryption keys so edits, reactions and poll votes can be
+applied to their parent message. The library default keeps them for 30 days
+(text) and 90 days (polls), which on a large account grows the session database
+into the hundreds of megabytes.
+
+| Profile state | Rows | File size |
+|---|---|---|
+| Library default horizon (30d) | 399,620 | 97 MB |
+| Retention-matched horizon (24h) | 17,062 | 5.8 MB |
+
+The cache configuration now caps the secret horizon at the message retention
+window, with a one-hour floor so an edit arriving just after its parent is
+never lost. Existing profiles are reclaimed on startup: secrets whose parent is
+already outside the window are deleted, remaining deadlines are shortened, and
+the file is compacted when a significant freelist has built up. SQLite reuses
+freed pages rather than releasing them, so without the compaction the file
+stays large even after the rows are gone.
