@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-zoom-by"
+description = "Enables the zoom_by command without any pre-configured scope."
+commands.allow = ["zoom_by"]
+
+[[permission]]
+identifier = "deny-zoom-by"
+description = "Denies the zoom_by command without any pre-configured scope."
+commands.deny = ["zoom_by"]
