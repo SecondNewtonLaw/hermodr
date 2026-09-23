@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
 
         match event {
             ServiceEvent::QrCode { .. } => {
-                println!("[check] QR issued — scan it (run the spike binary to see the image)");
+                println!("[check] QR issued; scan it (run the spike binary to see the image)");
             }
             ServiceEvent::Connected => {
                 println!("[check] connected");
@@ -111,7 +111,7 @@ fn report(service: &Service, stats: &Stats) {
             );
             for chat in chats.iter().take(5) {
                 println!(
-                    "         {} ({} msgs) — {}",
+                    "         {} ({} msgs): {}",
                     chat.chat, chat.message_count, chat.last_text
                 );
             }

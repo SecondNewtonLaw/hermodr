@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
         if full_history {
             "ACCEPTED (SPIKE_HISTORY set)"
         } else {
-            "REFUSED (default) — recent window and on-demand only"
+            "REFUSED (default): recent window and on-demand only"
         }
     );
     report_rss("startup");

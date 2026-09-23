@@ -3,19 +3,6 @@
 A native WhatsApp desktop client. It speaks the WhatsApp multi-device protocol
 directly instead of embedding WhatsApp Web in a browser engine.
 
-## The name
-
-**Hermóðr** (Old Norse `[ˈhermˌoːðz̠]`, anglicized *Hermod*, roughly
-**"HAIR-moth"**) - the `ð` is a voiced *th*, as in **"the"**, so the ending
-sounds like "moth" said with a *th* rather than a hard *t*.
-
-The name is Old Norse, from `herr` ("war, host") + `móðr` ("spirit, courage,
-mood"), literally **"war-spirit"**. In Norse mythology Hermóðr is a son of
-Odin and the brother of Baldr, and he is best known as *the messenger*: when
-Baldr is killed, Hermóðr rides Odin's horse Sleipnir for nine nights down to
-Hel to plead for his brother's return. A god whose job is to carry a message
-from one realm to another is a fitting namesake for a chat client.
-
 ## Why
 
 The obvious way to build a WhatsApp desktop client is to wrap WhatsApp Web in a
@@ -37,16 +24,38 @@ Hermóðr takes the other path. Because it implements the protocol itself:
   no compositing workarounds. The only webview is the one rendering this app's
   own UI.
 
+## The name
+
+**Hermóðr** (Old Norse `[ˈhermˌoːðz̠]`, anglicized *Hermod*, roughly
+**"HAIR-moth"**): the `ð` is a voiced *th*, as in **"the"**, so the ending
+sounds like "moth" said with a *th* rather than a hard *t*.
+
+The name is Old Norse, from `herr` ("war, host") + `móðr` ("spirit, courage,
+mood"), literally **"war-spirit"**. In Norse mythology Hermóðr is a son of
+Odin and the brother of Baldr, and he is best known as *the messenger*: when
+Baldr is killed, Hermóðr rides Odin's horse Sleipnir for nine nights down to
+Hel to plead for his brother's return. A god whose job is to carry a message
+from one realm to another is a fitting namesake for a chat client.
+
 ## Measured impact
 
 Against a real account, comparing the old webview approach with this one:
 
-| Metric | WhatsApp Web in a webview | Hermóðr |
+| Metric | Altus (WhatsApp Web in a webview) | Hermóðr |
 | --- | --- | --- |
-| Idle memory | ~2.2 GB | **35 MB** |
+| CPU, steady state | ~200% of one core, sustained | **2-4%** |
+| Memory | ~2.2 GB, climbing to ~23 GB | **35 MB** |
 | Memory under live traffic | 4.2 GB | **53 MB** |
 | History downloaded at pairing | entire account (~20 GB) | none |
 | Message history stored | 604k+ rows, 774 MB | bounded by retention |
+
+The memory figures are Hermóðr's protocol/service process. The window adds a
+small WebKit UI process on top; the point is that nothing history-sized ever
+accumulates in either.
+
+CPU was sampled with `pidstat` in 30-second windows. Altus held 130-220% of one
+core the entire time and its RSS kept climbing toward the full 23 GB history, so
+it never reaches a true idle. Hermóðr sat between 1.5% and 4.5%.
 
 The session database also needed bounding: decryption secrets for edits and
 reactions default to a 30-day horizon, which grew one profile to 97 MB across
