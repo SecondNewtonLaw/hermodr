@@ -57,6 +57,11 @@ CPU was sampled with `pidstat` in 30-second windows. Altus held 130-220% of one
 core the entire time and its RSS kept climbing toward the full 23 GB history, so
 it never reaches a true idle. Hermóðr sat between 1.5% and 4.5%.
 
+This is not a knock on Altus. It is a good project, and a fairly optimized one;
+the numbers above are a property of the approach, not of its authors. Any client
+that drives WhatsApp Web inherits the web app's behaviour: it has to pull the
+account's history in, and it has to keep the page holding that history alive.
+
 The session database also needed bounding: decryption secrets for edits and
 reactions default to a 30-day horizon, which grew one profile to 97 MB across
 399,620 rows. The horizon now tracks the message retention window, and existing
