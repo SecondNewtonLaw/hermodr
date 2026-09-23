@@ -21,6 +21,7 @@
     "allow-send-media",
     "allow-open-path",
     "allow-read-file",
-    "allow-participants"
+    "allow-participants",
+    "allow-group-info"
   ]
 }

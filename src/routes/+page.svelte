@@ -31,6 +31,18 @@
     message_count: number;
     unread_count: number;
   };
+  type GroupInfo = {
+    subject: string | null;
+    description: string | null;
+    created_at: number | null;
+    participants: {
+      jid: string;
+      name: string;
+      admin: boolean;
+      number: string | null;
+      username: string | null;
+    }[];
+  };
   type Retention = {
     max_age_hours: number | null;
     max_messages_per_chat: number | null;
@@ -100,6 +112,8 @@
     media_dir: null,
   });
   let showSettings = $state(false);
+  let showGroupInfo = $state(false);
+  let groupInfo: GroupInfo | null = $state(null);
   let error = $state<string | null>(null);
 
   let scroller: HTMLDivElement | undefined = $state();
@@ -192,6 +206,8 @@
     chosenMentions = [];
     mentionQuery = null;
     draft = drafts[chat] ?? "";
+    showGroupInfo = false;
+    groupInfo = null;
     try {
       messages = await invoke<StoredMessage[]>("messages", { chat, limit: 200 });
       // Opening a conversation is what marks it seen.
@@ -210,6 +226,20 @@
     // Opening a chat is the obvious moment to start typing.
     await tick();
     composerInput?.focus();
+  }
+
+  /** Opens the right sidebar with the group's subject, description and members. */
+  async function openGroupInfo() {
+    if (!selectedChat) return;
+    showGroupInfo = true;
+    groupInfo = null;
+    try {
+      groupInfo = await invoke<GroupInfo>("group_info", { chat: selectedChat });
+    } catch (e) {
+      // A group we cannot query should not leave an empty panel open.
+      showGroupInfo = false;
+      error = String(e);
+    }
   }
 
   /** Reloads the open conversation without touching the unread state. */
@@ -743,7 +773,7 @@
     {/if}
   </div>
 {:else}
-  <div class="layout">
+  <div class="layout" class:with-info={showGroupInfo}>
     <aside class="chats">
       <header>
         <span>Chats</span>
@@ -775,7 +805,15 @@
 
     <section class="conversation">
       {#if selectedChat}
-        <header>{chats.find((c) => c.chat === selectedChat)?.display_name ?? bareJid(selectedChat)}</header>
+        <header>
+          {#if selectedChat.endsWith("@g.us")}
+            <button class="chat-title" title="Group info" onclick={openGroupInfo}>
+              {chats.find((c) => c.chat === selectedChat)?.display_name ?? bareJid(selectedChat)}
+            </button>
+          {:else}
+            {chats.find((c) => c.chat === selectedChat)?.display_name ?? bareJid(selectedChat)}
+          {/if}
+        </header>
 
         <div class="messages" bind:this={scroller} onscroll={onScroll}>
           {#each messages.slice().reverse() as message (message.id)}
@@ -934,6 +972,46 @@
         <div class="placeholder">Select a conversation</div>
       {/if}
     </section>
+
+    {#if showGroupInfo}
+      <aside class="group-info">
+        <header>
+          <span>Group info</span>
+          <button class="icon" title="Close" onclick={() => (showGroupInfo = false)}>×</button>
+        </header>
+        {#if groupInfo}
+          <div class="group-body">
+            <h2>{groupInfo.subject ?? "Group"}</h2>
+            {#if groupInfo.description}
+              <p class="group-desc">{groupInfo.description}</p>
+            {/if}
+            {#if groupInfo.created_at}
+              <p class="hint">
+                Created {new Date(groupInfo.created_at * 1000).toLocaleDateString()}
+              </p>
+            {/if}
+            <h3>{groupInfo.participants.length} members</h3>
+            <ul>
+              {#each groupInfo.participants as person (person.jid)}
+                <li>
+                  <span class="member-name">
+                    {person.name}
+                    {#if person.admin}<span class="admin">admin</span>{/if}
+                  </span>
+                  <span class="member-meta">
+                    {person.number ?? ""}{person.number && person.username ? " · " : ""}{person.username
+                      ? `@${person.username}`
+                      : ""}
+                  </span>
+                </li>
+              {/each}
+            </ul>
+          </div>
+        {:else}
+          <p class="hint">Loading…</p>
+        {/if}
+      </aside>
+    {/if}
   </div>
 {/if}
 
@@ -1086,6 +1164,76 @@
     grid-template-columns: 300px 1fr;
     height: 100%;
   }
+  .layout.with-info {
+    grid-template-columns: 300px 1fr 320px;
+  }
+  .chat-title {
+    background: transparent;
+    border: 0;
+    color: inherit;
+    font: inherit;
+    font-weight: 600;
+    padding: 0;
+    cursor: pointer;
+    text-align: left;
+  }
+  .group-info {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    border-left: 1px solid #27272a;
+  }
+  .group-info header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 14px;
+    font-weight: 600;
+    border-bottom: 1px solid #27272a;
+  }
+  .group-body {
+    padding: 14px;
+    overflow-y: auto;
+  }
+  .group-body h2 {
+    margin: 0 0 8px;
+    font-size: 16px;
+  }
+  .group-body h3 {
+    margin: 16px 0 6px;
+    font-size: 13px;
+    color: #a1a1aa;
+  }
+  .group-desc {
+    margin: 0 0 8px;
+    color: #d4d4d8;
+    white-space: pre-wrap;
+  }
+  .group-body ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+  .group-body li {
+    padding: 6px 0;
+    border-bottom: 1px solid #1c1c1f;
+  }
+  .admin {
+    color: #86efac;
+    font-size: 11px;
+  }
+  .member-name {
+    display: block;
+  }
+  .member-meta {
+    display: block;
+    color: #71717a;
+    font-size: 11px;
+  }
+  /* Keep the newlines the sender typed. */
+  .text {
+    white-space: pre-wrap;
+  }
   .chats {
     border-right: 1px solid #27272a;
     display: flex;
@@ -1218,7 +1366,8 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    max-width: 40ch;
+    min-width: 0;
+    max-width: 100%;
   }
   .media {
     /* Cap both axes: width keeps it inside the bubble, height stops a tall

@@ -154,6 +154,21 @@ pub struct Participant {
     pub jid: String,
     /// Display name, from the address book when known.
     pub name: String,
+    /// Whether the member is a group admin.
+    pub admin: bool,
+    /// Phone number, when known.
+    pub number: Option<String>,
+    /// WhatsApp username, when the member has one.
+    pub username: Option<String>,
+}
+
+/// Everything the group info sidebar shows.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct GroupInfo {
+    pub subject: Option<String>,
+    pub description: Option<String>,
+    pub created_at: Option<u64>,
+    pub participants: Vec<Participant>,
 }
 
 /// How the service should behave for one account.
@@ -600,16 +615,17 @@ impl Service {
 
     /// Sends a text message to a chat.
     ///
-    /// Group members for mention autocomplete, named from the address book
-    /// where possible.
-    ///
-    /// A one-to-one chat has no one to mention, so it returns nothing rather
-    /// than a one-entry list.
+    /// Members of a group chat, for mention autocomplete.
     pub async fn participants(&self, chat: &str) -> Result<Vec<Participant>> {
-        let jid: Jid = chat.parse()?;
+        Ok(self.group_info(chat).await?.participants)
+    }
+
+    /// Everything the group info sidebar needs.
+    pub async fn group_info(&self, chat: &str) -> Result<GroupInfo> {
         if !chat.ends_with("@g.us") {
-            return Ok(Vec::new());
+            return Ok(GroupInfo::default());
         }
+        let jid: Jid = chat.parse()?;
         let metadata = self
             .client
             .groups()
@@ -629,15 +645,39 @@ impl Service {
                 member.lid.as_ref(),
                 Some(&member.jid),
             ];
+            // Phone number without the server, so it reads as a number.
+            let number = member
+                .phone_number
+                .as_ref()
+                .map(|j| j.to_non_ad().to_string())
+                .or_else(|| mention.ends_with("@s.whatsapp.net").then(|| mention.clone()))
+                .map(|j| j.split('@').next().unwrap_or(&j).to_string());
+            let username = member.username.as_ref().map(|u| u.to_string());
+            // A name someone can read: saved/push name, then username, then the
+            // phone number, and only last the LID.
             let name = candidates
                 .into_iter()
                 .flatten()
                 .find_map(|j| self.store.name_for(&j.to_string()).ok().flatten())
+                .or_else(|| username.clone())
+                .or_else(|| number.clone())
                 .unwrap_or_else(|| mention.split('@').next().unwrap_or(&mention).to_string());
-            participants.push(Participant { jid: mention, name });
+            participants.push(Participant {
+                jid: mention.clone(),
+                name,
+                admin: member.is_admin(),
+                number,
+                username,
+            });
         }
         participants.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        Ok(participants)
+
+        Ok(GroupInfo {
+            subject: metadata.subject.clone(),
+            description: metadata.description.clone(),
+            created_at: metadata.creation_time,
+            participants,
+        })
     }
 
     /// The sent message is stored and dispatched locally. WhatsApp does not echo

@@ -11,6 +11,7 @@ const COMMANDS: &[&str] = &[
     "open_path",
     "read_file",
     "participants",
+    "group_info",
     "qr_svg",
     "get_settings",
     "set_settings",

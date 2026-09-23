@@ -315,6 +315,19 @@ async fn participants(
         .map_err(|e| e.to_string())
 }
 
+/// Group subject, description and members, for the info sidebar.
+#[tauri::command]
+async fn group_info(
+    state: State<'_, AppState>,
+    chat: String,
+) -> Result<hermodr_core::GroupInfo, String> {
+    state
+        .service()?
+        .group_info(&chat)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Renders a pairing code as SVG for the UI to display.
 #[tauri::command]
 fn qr_svg(value: String) -> Result<String, String> {
@@ -376,6 +389,7 @@ pub fn run() {
             open_path,
             read_file,
             participants,
+            group_info,
             qr_svg,
             get_settings,
             set_settings
