@@ -260,16 +260,33 @@
     if (file) void stageFile(file);
   }
 
-  /** Pasting an image into the composer stages it, like attaching. */
+  /**
+   * Stages pasted image bytes and blocks the default paste otherwise.
+   *
+   * Pasting a *file* (copying it in the file manager) puts a `text/uri-list` on
+   * the clipboard rather than an image. Without `preventDefault` WebKit then
+   * navigates the whole webview to that URI. That navigation is fatal: wry's
+   * page-load handler does `webview.uri().unwrap()`, the URI is absent for such
+   * a load, and the panic aborts the process. So anything file-like is
+   * swallowed; only real image bytes are staged, and plain text stays native.
+   */
   function onPaste(event: ClipboardEvent) {
-    const items = event.clipboardData?.items;
-    if (!items) return;
-    const item = Array.from(items).find((i) => i.type.startsWith("image/"));
-    const file = item?.getAsFile();
-    if (!file) return;
-    // Only intercept when it is actually an image; text paste stays native.
+    const data = event.clipboardData;
+    if (!data) return;
+    const image = Array.from(data.items).find((i) => i.type.startsWith("image/"));
+    const isUriList = Array.from(data.types).includes("text/uri-list");
+    if (!image && !isUriList) return;
     event.preventDefault();
-    void stageFile(file);
+    const file = image?.getAsFile();
+    if (file) void stageFile(file);
+    else error = "To attach that, use the 📎 button.";
+  }
+
+  /** Dropping files stages them; dropping anything else must not navigate. */
+  function onDrop(event: DragEvent) {
+    event.preventDefault();
+    const file = event.dataTransfer?.files?.[0];
+    if (file) void stageFile(file);
   }
 
   function cancelPending() {
@@ -406,6 +423,13 @@
 </script>
 
 <svelte:head><title>Hermóðr</title></svelte:head>
+
+<!-- Window-level so a paste/drop anywhere cannot navigate the webview. -->
+<svelte:window
+  onpaste={onPaste}
+  ondragover={(e) => e.preventDefault()}
+  ondrop={onDrop}
+/>
 
 {#if error}
   <div class="error" role="alert">{error}</div>
@@ -562,7 +586,6 @@
             bind:value={draft}
             placeholder="Type a message"
             autocomplete="off"
-            onpaste={onPaste}
           />
           <button class="primary" type="submit" disabled={!draft.trim()}>Send</button>
         </form>
