@@ -114,6 +114,32 @@
   let showSettings = $state(false);
   let showGroupInfo = $state(false);
   let groupInfo: GroupInfo | null = $state(null);
+  let groupInfoError = $state<string | null>(null);
+  /** Sidebar widths, adjustable by dragging their edges. */
+  let leftWidth = $state(300);
+  let rightWidth = $state(320);
+  let layoutColumns = $derived(
+    showGroupInfo ? `${leftWidth}px 1fr ${rightWidth}px` : `${leftWidth}px 1fr`,
+  );
+
+  function startResize(side: "left" | "right", event: MouseEvent) {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = side === "left" ? leftWidth : rightWidth;
+    const onMove = (e: MouseEvent) => {
+      const delta = e.clientX - startX;
+      const next = side === "left" ? startWidth + delta : startWidth - delta;
+      const clamped = Math.max(180, Math.min(640, next));
+      if (side === "left") leftWidth = clamped;
+      else rightWidth = clamped;
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
   let error = $state<string | null>(null);
 
   let scroller: HTMLDivElement | undefined = $state();
@@ -233,12 +259,13 @@
     if (!selectedChat) return;
     showGroupInfo = true;
     groupInfo = null;
+    groupInfoError = null;
     try {
       groupInfo = await invoke<GroupInfo>("group_info", { chat: selectedChat });
     } catch (e) {
-      // A group we cannot query should not leave an empty panel open.
-      showGroupInfo = false;
-      error = String(e);
+      // The query can time out on a busy server; keep the panel open so the
+      // failure is visible and retryable rather than looking like a dead click.
+      groupInfoError = String(e);
     }
   }
 
@@ -773,7 +800,7 @@
     {/if}
   </div>
 {:else}
-  <div class="layout" class:with-info={showGroupInfo}>
+  <div class="layout" style="grid-template-columns: {layoutColumns}">
     <aside class="chats">
       <header>
         <span>Chats</span>
@@ -801,6 +828,7 @@
           <li class="empty">No conversations yet.</li>
         {/if}
       </ul>
+      <button type="button" class="resizer" aria-label="Resize chat list" onmousedown={(e) => startResize("left", e)}></button>
     </aside>
 
     <section class="conversation">
@@ -975,6 +1003,7 @@
 
     {#if showGroupInfo}
       <aside class="group-info">
+        <button type="button" class="resizer" aria-label="Resize group info" onmousedown={(e) => startResize("right", e)}></button>
         <header>
           <span>Group info</span>
           <button class="icon" title="Close" onclick={() => (showGroupInfo = false)}>×</button>
@@ -995,20 +1024,25 @@
               {#each groupInfo.participants as person (person.jid)}
                 <li>
                   <span class="member-name">
-                    {person.name}
+                    {person.number ?? person.name}{person.name && person.number && person.name !== person.number ? ` - ${person.name}` : ""}
                     {#if person.admin}<span class="admin">admin</span>{/if}
                   </span>
-                  <span class="member-meta">
-                    {person.number ?? ""}{person.number && person.username ? " · " : ""}{person.username
-                      ? `@${person.username}`
-                      : ""}
-                  </span>
+                  {#if person.username}
+                    <span class="member-meta">@{person.username}</span>
+                  {/if}
                 </li>
               {/each}
             </ul>
           </div>
         {:else}
-          <p class="hint">Loading…</p>
+          <div class="group-body">
+            {#if groupInfoError}
+              <p class="hint">Could not load group info: {groupInfoError}</p>
+              <button class="primary" onclick={openGroupInfo}>Retry</button>
+            {:else}
+              <p class="hint">Loading…</p>
+            {/if}
+          </div>
         {/if}
       </aside>
     {/if}
@@ -1164,8 +1198,34 @@
     grid-template-columns: 300px 1fr;
     height: 100%;
   }
-  .layout.with-info {
-    grid-template-columns: 300px 1fr 320px;
+  .chats,
+  .group-info {
+    position: relative;
+  }
+  .resizer {
+    border: 0;
+    background: transparent;
+    padding: 0;
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 6px;
+    cursor: col-resize;
+    z-index: 5;
+  }
+  .chats .resizer,
+  .group-info .resizer {
+    display: block;
+    width: 6px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+  }
+  .chats .resizer {
+    right: -3px;
+  }
+  .group-info .resizer {
+    left: -3px;
   }
   .chat-title {
     background: transparent;
@@ -1178,6 +1238,7 @@
     text-align: left;
   }
   .group-info {
+    position: relative;
     display: flex;
     flex-direction: column;
     min-height: 0;
@@ -1235,6 +1296,7 @@
     white-space: pre-wrap;
   }
   .chats {
+    position: relative;
     border-right: 1px solid #27272a;
     display: flex;
     flex-direction: column;

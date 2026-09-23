@@ -83,30 +83,25 @@ a pure-Rust implementation of the WhatsApp multi-device protocol.
 
 ## Building
 
-`whatsapp-rust` is pinned to a revision rather than the crates.io release,
-because per-chunk history control (`HistorySyncAdmission`) exists only there.
-
-**It is consumed from a local checkout**, expected at `../whatsapp-rust`:
-
 ```console
-git clone https://github.com/oxidezap/whatsapp-rust
-git -C whatsapp-rust checkout 9eb43b9bc2bc561cc34a672b4295528bf4c2d733
+./install.sh          # clone the dependencies and build a release
+./install.sh --dev    # clone the dependencies and start the dev server
 ```
 
-A git dependency is not used instead because that repository's own
-`.cargo/config.toml` injects nightly-only rustflags which a git dependency would
-inherit. As a path dependency those flags do not apply, and the pinned revision
-builds on stable Rust.
+The script pins and clones the two dependencies this project needs as local
+checkouts, as siblings of this repository:
 
-Then:
-
-```console
-pnpm install
-pnpm tauri dev
-```
+- `../whatsapp-rust`, at a revision where per-chunk history control
+  (`HistorySyncAdmission`) exists. A git dependency is not used instead because
+  that repository's own `.cargo/config.toml` injects nightly-only rustflags a
+  git dependency would inherit; as a path dependency they do not apply, and the
+  pinned revision builds on stable Rust.
+- `../tauri`, at a revision carrying `patches/tauri-gtk-fixed.patch`, which
+  mounts child webviews in a `GtkFixed` so the UI and the composer coexist.
 
 Requirements: Rust 1.94+ (stable), Node with pnpm, and the usual Tauri Linux
-dependencies (WebKitGTK 4.1, GTK 3).
+dependencies (WebKitGTK 4.1, GTK 3). The script does not install system
+packages; it prints what the build needs.
 
 On Wayland, WebKitGTK's DMA-BUF renderer fails with `Gdk Error 71`. The app sets
 `WEBKIT_DISABLE_DMABUF_RENDERER=1` itself, so no manual configuration is needed.

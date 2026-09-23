@@ -244,6 +244,10 @@ pub struct Service {
     /// a late subscriber would otherwise miss entirely.
     qr: Arc<Mutex<Option<String>>>,
     connected: Arc<AtomicBool>,
+    /// Group metadata for this run, so opening a chat does not re-query the
+    /// server and trip its rate limit. Group membership changes rarely enough
+    /// that a session-lifetime cache is fine.
+    group_cache: Mutex<std::collections::HashMap<String, GroupInfo>>,
 }
 
 impl Service {
@@ -428,6 +432,20 @@ impl Service {
                                     if !push_name.is_empty() {
                                         // Push names never override a saved one.
                                         let _ = store.set_name(&sender, &push_name);
+                                        // A participant's JID has no device suffix
+                                        // while a message's sender does, so store
+                                        // the bare form too or the group member
+                                        // list cannot find the name.
+                                        if let Some((user, server)) = sender.split_once('@') {
+                                            let bare = format!(
+                                                "{}@{}",
+                                                user.split(':').next().unwrap_or(user),
+                                                server
+                                            );
+                                            if bare != sender {
+                                                let _ = store.set_name(&bare, &push_name);
+                                            }
+                                        }
                                         // A one-to-one chat is named after its
                                         // contact. A group is named by its
                                         // subject, and a message we sent must
@@ -471,6 +489,14 @@ impl Service {
                                     if !mentions.is_empty() {
                                         message.text =
                                             replace_mentions(&message.text, &mentions, &store);
+                                    }
+                                    // A quote carries no mentioned_jid, and some
+                                    // senders omit it, so resolve bare @number
+                                    // tokens too.
+                                    message.text = resolve_mention_tokens(&message.text, &store);
+                                    if let Some(reply) = message.reply_to_text.take() {
+                                        message.reply_to_text =
+                                            Some(resolve_mention_tokens(&reply, &store));
                                     }
                                     let _ = store.upsert(&message);
                                     let _ = events.send(ServiceEvent::Message { message: Box::new(message) });
@@ -571,6 +597,7 @@ impl Service {
                 media_dir,
                 qr: qr_state,
                 connected: connected_state,
+                group_cache: Mutex::new(std::collections::HashMap::new()),
             },
             initial_rx,
         ))
@@ -625,13 +652,22 @@ impl Service {
         if !chat.ends_with("@g.us") {
             return Ok(GroupInfo::default());
         }
+        if let Some(info) = self.group_cache.lock().unwrap().get(chat).cloned() {
+            return Ok(info);
+        }
         let jid: Jid = chat.parse()?;
-        let metadata = self
+        let mut metadata = self
             .client
             .groups()
             .fetch_metadata(&jid)
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        // The server often omits the phone number on LID participants, so fill
+        // it from the client's LID/PN cache before naming them.
+        self.client
+            .groups()
+            .resolve_participant_addresses(&mut metadata)
+            .await;
 
         let mut seen = std::collections::HashSet::new();
         let mut participants = Vec::new();
@@ -672,12 +708,17 @@ impl Service {
         }
         participants.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
-        Ok(GroupInfo {
+        let info = GroupInfo {
             subject: metadata.subject.clone(),
             description: metadata.description.clone(),
             created_at: metadata.creation_time,
             participants,
-        })
+        };
+        self.group_cache
+            .lock()
+            .unwrap()
+            .insert(chat.to_string(), info.clone());
+        Ok(info)
     }
 
     /// The sent message is stored and dispatched locally. WhatsApp does not echo
@@ -1245,6 +1286,44 @@ fn replace_mentions(text: &str, mentions: &[String], store: &MessageStore) -> St
             .or_else(|| store.name_for(bare).ok().flatten())
             .unwrap_or_else(|| user.to_string());
         out = out.replace(&format!("@{user}"), &format!("@{name}"));
+    }
+    out
+}
+
+/// Rewrites `@<digits>` tokens to a known name.
+///
+/// Used where no `mentioned_jid` is available: quoted text, and messages from
+/// senders that omit it. The token is a bare number, so both the phone-number
+/// and the LID form are tried.
+fn resolve_mention_tokens(text: &str, store: &MessageStore) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'@' {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > start {
+                let number = &text[start..end];
+                let name = store
+                    .name_for(&format!("{number}@s.whatsapp.net"))
+                    .ok()
+                    .flatten()
+                    .or_else(|| store.name_for(&format!("{number}@lid")).ok().flatten());
+                if let Some(name) = name {
+                    out.push('@');
+                    out.push_str(&name);
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        let ch = text[i..].chars().next().unwrap_or('\u{fffd}');
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }

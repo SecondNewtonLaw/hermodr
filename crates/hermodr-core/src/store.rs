@@ -182,6 +182,18 @@ impl MessageStore {
         // Status updates were once stored as a chat. Drop them so the list stops
         // showing a "status" conversation.
         conn.execute("DELETE FROM messages WHERE chat = 'status@broadcast'", [])?;
+
+        // Names learned from messages are keyed with the sender's device suffix
+        // (`123:98@lid`), but participants are listed without one. Mirror every
+        // such name onto the bare form so lookups find it.
+        conn.execute(
+            "INSERT OR IGNORE INTO names (jid, name, saved)
+             SELECT substr(jid, 1, instr(jid, ':') - 1) || substr(jid, instr(jid, '@')),
+                    name, saved
+             FROM names
+             WHERE jid LIKE '%:%@%'",
+            [],
+        )?;
         if !existing.iter().any(|c| c == "read") {
             conn.execute(
                 "ALTER TABLE messages ADD COLUMN read INTEGER NOT NULL DEFAULT 0",
