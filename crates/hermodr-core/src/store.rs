@@ -71,10 +71,15 @@ pub struct StoredMessage {
     pub reply_to_id: Option<String>,
     /// Text of the quoted message, stored so a quote renders without a lookup.
     pub reply_to_text: Option<String>,
+    /// Author of the quoted message, so the quote can be attributed.
+    pub reply_to_sender: Option<String>,
     /// Whether the user has seen this message.
     pub read: bool,
     /// Whether the sender deleted the message for everyone.
     pub revoked: bool,
+    /// Delivery state of a message we sent: `pending`, `sent`, `delivered` or
+    /// `read`. `None` for incoming messages.
+    pub status: Option<String>,
 }
 
 /// A chat summary derived from stored messages.
@@ -122,8 +127,10 @@ impl MessageStore {
                  media_path   TEXT,
                  reply_to_id  TEXT,
                  reply_to_text TEXT,
+                 reply_to_sender TEXT,
                  read         INTEGER NOT NULL DEFAULT 0,
                  revoked      INTEGER NOT NULL DEFAULT 0,
+                 status       TEXT,
                  PRIMARY KEY (chat, id)
              );
              CREATE INDEX IF NOT EXISTS idx_messages_chat_time
@@ -144,7 +151,13 @@ impl MessageStore {
             let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        for column in ["media_kind", "media_path", "reply_to_id", "reply_to_text"] {
+        for column in [
+            "media_kind",
+            "media_path",
+            "reply_to_id",
+            "reply_to_text",
+            "reply_to_sender",
+        ] {
             if !existing.iter().any(|c| c == column) {
                 conn.execute(&format!("ALTER TABLE messages ADD COLUMN {column} TEXT"), [])?;
             }
@@ -161,6 +174,9 @@ impl MessageStore {
                 [],
             )?;
         }
+        if !existing.iter().any(|c| c == "status") {
+            conn.execute("ALTER TABLE messages ADD COLUMN status TEXT", [])?;
+        }
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -174,8 +190,9 @@ impl MessageStore {
         conn.execute(
             "INSERT INTO messages
                  (chat, id, sender, timestamp, from_me, text,
-                  media_kind, media_path, reply_to_id, reply_to_text, read, revoked)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                  media_kind, media_path, reply_to_id, reply_to_text, reply_to_sender,
+                  read, revoked, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(chat, id) DO UPDATE SET
                  sender = excluded.sender,
                  timestamp = excluded.timestamp,
@@ -196,8 +213,10 @@ impl MessageStore {
                 message.media_path,
                 message.reply_to_id,
                 message.reply_to_text,
+                message.reply_to_sender,
                 message.read as i32,
                 message.revoked as i32,
+                message.status,
             ],
         )?;
         Ok(())
@@ -238,7 +257,7 @@ impl MessageStore {
         let mut stmt = conn.prepare(
             "SELECT m.chat, m.id, m.sender, m.timestamp, m.from_me, m.text,
                     n.name, m.media_kind, m.media_path, m.reply_to_id, m.reply_to_text,
-                    m.read, m.revoked
+                    m.read, m.revoked, m.status, m.reply_to_sender
              FROM messages m
              LEFT JOIN names n ON n.jid = m.sender
              WHERE m.chat = ?1
@@ -259,6 +278,8 @@ impl MessageStore {
                 reply_to_text: row.get(10)?,
                 read: row.get::<_, i32>(11)? != 0,
                 revoked: row.get::<_, i32>(12)? != 0,
+                status: row.get(13)?,
+                reply_to_sender: row.get(14)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -270,7 +291,7 @@ impl MessageStore {
         let message = conn.query_row(
             "SELECT m.chat, m.id, m.sender, m.timestamp, m.from_me, m.text,
                     n.name, m.media_kind, m.media_path, m.reply_to_id, m.reply_to_text,
-                    m.read, m.revoked
+                    m.read, m.revoked, m.status, m.reply_to_sender
              FROM messages m
              LEFT JOIN names n ON n.jid = m.sender
              WHERE m.chat = ?1 AND m.id = ?2",
@@ -290,6 +311,8 @@ impl MessageStore {
                     reply_to_text: row.get(10)?,
                     read: row.get::<_, i32>(11)? != 0,
                     revoked: row.get::<_, i32>(12)? != 0,
+                    status: row.get(13)?,
+                    reply_to_sender: row.get(14)?,
                 })
             },
         )?;
@@ -342,6 +365,40 @@ impl MessageStore {
             });
         }
         Ok(summaries)
+    }
+
+    /// Advances an outgoing message's delivery state.
+    ///
+    /// Only moves forward: a late `delivered` receipt must not undo a `read`.
+    /// Returns whether anything changed so the caller can skip a refresh.
+    pub fn set_status(&self, chat: &str, id: &str, status: &str) -> Result<bool> {
+        let rank = |s: &str| match s {
+            "pending" => 0,
+            "sent" => 1,
+            "delivered" => 2,
+            "read" => 3,
+            _ => -1,
+        };
+        let conn = self.conn.lock().unwrap();
+        let current: Option<Option<String>> = conn
+            .query_row(
+                "SELECT status FROM messages WHERE chat = ?1 AND id = ?2 AND from_me = 1",
+                params![chat, id],
+                |row| row.get(0),
+            )
+            .ok();
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        let current_rank = current.as_deref().map(rank).unwrap_or(-1);
+        if rank(status) <= current_rank {
+            return Ok(false);
+        }
+        conn.execute(
+            "UPDATE messages SET status = ?1 WHERE chat = ?2 AND id = ?3",
+            params![status, chat, id],
+        )?;
+        Ok(true)
     }
 
     /// Marks a message as deleted by its sender, clearing its content.
@@ -435,9 +492,10 @@ mod tests {
                  chat TEXT NOT NULL, id TEXT NOT NULL, sender TEXT NOT NULL,
                  timestamp INTEGER NOT NULL, from_me INTEGER NOT NULL,
                  text TEXT NOT NULL, media_kind TEXT, media_path TEXT,
-                 reply_to_id TEXT, reply_to_text TEXT,
+                 reply_to_id TEXT, reply_to_text TEXT, reply_to_sender TEXT,
                  read INTEGER NOT NULL DEFAULT 0,
-                 revoked INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (chat, id));
+                 revoked INTEGER NOT NULL DEFAULT 0,
+                 status TEXT, PRIMARY KEY (chat, id));
              CREATE TABLE names (jid TEXT PRIMARY KEY, name TEXT NOT NULL);",
         ).unwrap();
         s
@@ -456,8 +514,10 @@ mod tests {
             media_path: None,
             reply_to_id: None,
             reply_to_text: None,
+            reply_to_sender: None,
             read: false,
             revoked: false,
+            status: None,
         }
     }
 
@@ -615,6 +675,29 @@ mod tests {
         let got = &s.messages_for("a@s", 1).unwrap()[0];
         assert_eq!(got.media_kind.as_deref(), Some("image"));
         assert_eq!(got.reply_to_text.as_deref(), Some("earlier"));
+    }
+
+    #[test]
+    fn status_advances_but_never_regresses() {
+        let s = store(Retention::unlimited());
+        let mut m = msg("a@s", "1", 0, "hi");
+        m.from_me = true;
+        m.status = Some("pending".into());
+        s.upsert(&m).unwrap();
+
+        assert!(s.set_status("a@s", "1", "sent").unwrap());
+        assert!(s.set_status("a@s", "1", "delivered").unwrap());
+        assert!(s.set_status("a@s", "1", "read").unwrap());
+        // A late duplicate must not undo the read state.
+        assert!(!s.set_status("a@s", "1", "delivered").unwrap());
+        assert_eq!(s.message("a@s", "1").unwrap().status.as_deref(), Some("read"));
+    }
+
+    #[test]
+    fn status_ignores_incoming_messages() {
+        let s = store(Retention::unlimited());
+        s.upsert(&msg("a@s", "1", 0, "hi")).unwrap();
+        assert!(!s.set_status("a@s", "1", "read").unwrap());
     }
 
     #[test]

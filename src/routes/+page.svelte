@@ -15,8 +15,10 @@
     media_path: string | null;
     reply_to_id: string | null;
     reply_to_text: string | null;
+    reply_to_sender: string | null;
     read: boolean;
     revoked: boolean;
+    status: string | null;
   };
   type ChatSummary = {
     chat: string;
@@ -65,6 +67,9 @@
   /** True while the user is reading older messages with new ones below. */
   let scrolledUp = $state(false);
   let filePicker: HTMLInputElement | undefined = $state();
+  /** Attachment staged for review before it is sent. */
+  let pending: { file: File; url: string; isImage: boolean; isVideo: boolean } | null = $state(null);
+  let caption = $state("");
 
   function bareJid(jid: string) {
     return jid.replace(/@.*$/, "");
@@ -75,6 +80,27 @@
   function senderLabel(message: StoredMessage) {
     return message.sender_name || bareJid(message.sender);
   }
+  /** Resolves a JID to a known name, falling back to the bare address. */
+  function senderName(jid: string) {
+    const known = messages.find((m) => m.sender === jid && m.sender_name);
+    return known?.sender_name || bareJid(jid);
+  }
+  /** Human-readable delivery state for a message we sent. */
+  function statusMark(status: string | null) {
+    switch (status) {
+      case "pending":
+        return "🕓";
+      case "sent":
+        return "✓";
+      case "delivered":
+        return "✓✓";
+      case "read":
+        return "✓✓";
+      default:
+        return "";
+    }
+  }
+
   function formatTime(seconds: number) {
     return new Date(seconds * 1000).toLocaleTimeString([], {
       hour: "2-digit",
@@ -171,12 +197,46 @@
     }
   }
 
-  async function attach(event: Event) {
+  /** Stages a file for review rather than sending it straight away. */
+  function stageFile(file: File) {
+    if (pending) URL.revokeObjectURL(pending.url);
+    pending = {
+      file,
+      url: URL.createObjectURL(file),
+      isImage: file.type.startsWith("image/"),
+      isVideo: file.type.startsWith("video/"),
+    };
+    caption = "";
+  }
+
+  function attach(event: Event) {
     const input = event.currentTarget as HTMLInputElement;
     const file = input.files?.[0];
     input.value = "";
-    if (!file || !selectedChat) return;
+    if (file) stageFile(file);
+  }
 
+  /** Pasting an image into the composer stages it, like attaching. */
+  function onPaste(event: ClipboardEvent) {
+    const item = Array.from(event.clipboardData?.items ?? []).find((i) =>
+      i.type.startsWith("image/"),
+    );
+    const file = item?.getAsFile();
+    if (!file) return;
+    // Only intercept when it is actually an image; text paste stays native.
+    event.preventDefault();
+    stageFile(file);
+  }
+
+  function cancelPending() {
+    if (pending) URL.revokeObjectURL(pending.url);
+    pending = null;
+    caption = "";
+  }
+
+  async function sendPending() {
+    if (!pending || !selectedChat) return;
+    const { file } = pending;
     try {
       const buffer = new Uint8Array(await file.arrayBuffer());
       // Base64 keeps the payload a single IPC value. Fine for the images and
@@ -189,7 +249,9 @@
         chat: selectedChat,
         name: file.name,
         data: btoa(binary),
+        caption: caption.trim() || null,
       });
+      cancelPending();
       await reloadMessages();
       await refreshChats();
       scrollToBottom();
@@ -352,7 +414,12 @@
                 <span class="revoked">This message was deleted</span>
               {:else}
                 {#if message.reply_to_text}
-                  <span class="quote">{message.reply_to_text}</span>
+                  <span class="quote">
+                    <span class="quote-author">
+                      {message.reply_to_sender ? senderName(message.reply_to_sender) : "Message"}
+                    </span>
+                    <span class="quote-text">{message.reply_to_text}</span>
+                  </span>
                 {/if}
 
                 {#if message.media_kind === "image" && message.media_path}
@@ -376,7 +443,11 @@
                 {/if}
                 {formatTime(message.timestamp)}
                 {#if message.from_me}
-                  <span class:read={message.read} class="dot" title={message.read ? "Read" : "Sent"}></span>
+                  <span
+                    class="ticks"
+                    class:read={message.status === "read"}
+                    title={message.status ?? "pending"}>{statusMark(message.status)}</span
+                  >
                 {/if}
               </span>
             </div>
@@ -394,6 +465,27 @@
           </div>
         {/if}
 
+        {#if pending}
+          <div class="attach-preview">
+            {#if pending.isImage}
+              <img src={pending.url} alt="Attachment preview" />
+            {:else if pending.isVideo}
+              <!-- svelte-ignore a11y_media_has_caption -->
+              <video src={pending.url} controls></video>
+            {:else}
+              <span class="file-name">{pending.file.name}</span>
+            {/if}
+            <input
+              class="caption"
+              bind:value={caption}
+              placeholder="Add a caption"
+              autocomplete="off"
+            />
+            <button class="primary" onclick={sendPending}>Send</button>
+            <button class="icon" title="Cancel" onclick={cancelPending}>×</button>
+          </div>
+        {/if}
+
         <form class="composer" onsubmit={(e) => (e.preventDefault(), send())}>
           <button
             type="button"
@@ -407,7 +499,12 @@
             bind:this={filePicker}
             onchange={attach}
           />
-          <input bind:value={draft} placeholder="Type a message" autocomplete="off" />
+          <input
+            bind:value={draft}
+            placeholder="Type a message"
+            autocomplete="off"
+            onpaste={onPaste}
+          />
           <button class="primary" type="submit" disabled={!draft.trim()}>Send</button>
         </form>
       {:else}
@@ -686,18 +783,6 @@
   .bubble:hover .reply-btn {
     opacity: 0.8;
   }
-  /* A tiny status dot: hollow while unread, filled once read. */
-  .dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    border: 1px solid #a1a1aa;
-    display: inline-block;
-  }
-  .dot.read {
-    background: #38bdf8;
-    border-color: #38bdf8;
-  }
   .placeholder {
     margin: auto;
     color: #71717a;
@@ -714,6 +799,52 @@
     cursor: pointer;
     font: inherit;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+  }
+  .attach-preview {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 14px;
+    background: #1c1c1f;
+    border-top: 1px solid #27272a;
+  }
+  .attach-preview img,
+  .attach-preview video {
+    max-height: 72px;
+    max-width: 120px;
+    border-radius: 6px;
+    display: block;
+  }
+  .attach-preview .caption {
+    flex: 1;
+    background: #111214;
+    border: 1px solid #3f3f46;
+    border-radius: 6px;
+    padding: 6px 10px;
+    color: inherit;
+    font: inherit;
+  }
+  .file-name {
+    color: #a1a1aa;
+    font-size: 13px;
+  }
+  .quote-author {
+    display: block;
+    font-weight: 600;
+    color: #a1a1aa;
+  }
+  .quote-text {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ticks {
+    font-size: 10px;
+    letter-spacing: -2px;
+  }
+  .ticks.read {
+    color: #38bdf8;
   }
   .reply-preview {
     display: flex;

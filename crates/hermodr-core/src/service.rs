@@ -21,6 +21,7 @@ use whatsapp_rust::{
     media::{self, DocumentOptions, ImageOptions},
     prelude::*,
     wacore::msg_secret::MsgSecretRetention,
+    wacore::types::presence::ReceiptType,
     wacore::types::events::Event,
     wacore_binary::builder::NodeBuilder,
     CacheConfig,
@@ -291,7 +292,12 @@ impl Service {
                 }
             })
             .on_event_for(
-                &[EventKind::Messages, EventKind::Disconnected],
+                &[
+                    EventKind::Messages,
+                    EventKind::Disconnected,
+                    EventKind::Receipt,
+                    EventKind::ServerAck,
+                ],
                 move |event, _client| {
                     let store = store_for_events.clone();
                     let events = events_for_events.clone();
@@ -360,6 +366,41 @@ impl Service {
                                 connected.store(false, Ordering::SeqCst);
                                 let _ = events.send(ServiceEvent::Disconnected);
                             }
+                            // A receipt names the messages it refers to, so the
+                            // outgoing row can move to delivered or read.
+                            Event::Receipt(receipt) => {
+                                let status = match receipt.r#type {
+                                    ReceiptType::Read | ReceiptType::ReadSelf => "read",
+                                    ReceiptType::Delivered => "delivered",
+                                    _ => "sent",
+                                };
+                                let chat = receipt.source.chat.to_string();
+                                for id in receipt.message_ids.iter() {
+                                    if let Ok(true) =
+                                        store.set_status(&chat, id.as_str(), status)
+                                    {
+                                        if let Ok(updated) = store.message(&chat, id.as_str()) {
+                                            let _ = events.send(ServiceEvent::Message {
+                                                message: Box::new(updated),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            // The server accepted our stanza, so it is at least sent.
+                            Event::ServerAck(ack) => {
+                                let accepted = ack.error.is_none();
+                                if let (true, Some(chat)) = (accepted, ack.from.as_ref()) {
+                                    let chat = chat.to_string();
+                                    if let Ok(true) = store.set_status(&chat, &ack.id, "sent") {
+                                        if let Ok(updated) = store.message(&chat, &ack.id) {
+                                            let _ = events.send(ServiceEvent::Message {
+                                                message: Box::new(updated),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -369,6 +410,11 @@ impl Service {
             .await?;
 
         let client = bot.client();
+
+        // Hand the client to the message handler, which needs it to download
+        // media. Without this the slot stays empty and every attachment is
+        // recorded with no file.
+        let _ = client_slot.set(client.clone());
 
         // `run()` only returns on logout or shutdown, so it lives in its own task.
         tokio::spawn(async move {
@@ -451,10 +497,12 @@ impl Service {
             media_path: None,
             reply_to_id: None,
             reply_to_text: None,
+            reply_to_sender: None,
             // Not `true`: we cannot know whether the recipient has read it, and
             // claiming so shows a read marker that is not true.
             read: false,
             revoked: false,
+            status: Some("pending".into()),
         };
         self.store.upsert(&message)?;
         let _ = self.events.send(ServiceEvent::Message { message: Box::new(message) });
@@ -511,8 +559,10 @@ impl Service {
             media_path: None,
             reply_to_id: Some(reply_to_id.to_string()),
             reply_to_text: Some(reply_to_text.to_string()),
+            reply_to_sender: Some(reply_to_sender.to_string()),
             read: false,
             revoked: false,
+            status: Some("pending".into()),
         };
         self.store.upsert(&stored)?;
         let _ = self.events.send(ServiceEvent::Message { message: Box::new(stored) });
@@ -597,8 +647,10 @@ impl Service {
             media_path: stored_path,
             reply_to_id: None,
             reply_to_text: None,
+            reply_to_sender: None,
             read: false,
             revoked: false,
+            status: Some("pending".into()),
         };
         self.store.upsert(&stored)?;
         let _ = self.events.send(ServiceEvent::Message { message: Box::new(stored) });
@@ -639,7 +691,7 @@ fn revoke_target(message: &wa::Message) -> Option<String> {
 ///
 /// `context_info` lives on each inner message type rather than on `Message`
 /// itself, so the carriers a reply can arrive on are checked in turn.
-fn quote_of(message: &wa::Message) -> Option<(String, String)> {
+fn quote_of(message: &wa::Message) -> Option<(String, String, String)> {
     let base = message.get_base_message();
     let context = base
         .extended_text_message
@@ -667,9 +719,14 @@ fn quote_of(message: &wa::Message) -> Option<(String, String)> {
         })?;
 
     let id = context.stanza_id.as_ref()?.to_string();
+    let author = context
+        .participant
+        .as_ref()
+        .map(|p| p.to_string())
+        .unwrap_or_default();
     let quoted = context.quoted_message.as_option()?;
     let text = quoted.text_content().unwrap_or("[media]").to_string();
-    Some((id, text))
+    Some((id, author, text))
 }
 
 /// Seconds since the Unix epoch.
@@ -745,9 +802,9 @@ async fn incoming_message(
 
     // A reply carries the quote in the message context. We do not keep the
     // original protobuf, so the text is copied out for display.
-    let (reply_to_id, reply_to_text) = quote_of(&inbound.message)
-        .map(|(id, text)| (Some(id), Some(text)))
-        .unwrap_or((None, None));
+    let (reply_to_id, reply_to_text, reply_to_sender) = quote_of(&inbound.message)
+        .map(|(id, sender, text)| (Some(id), Some(text), Some(sender)))
+        .unwrap_or((None, None, None));
 
     Some(StoredMessage {
         chat: info.source.chat.to_string(),
@@ -762,9 +819,11 @@ async fn incoming_message(
         media_path,
         reply_to_id,
         reply_to_text,
+        reply_to_sender,
         // Newly arrived, so unseen until the chat is opened.
         read: false,
         revoked: false,
+        status: None,
     })
 }
 
@@ -813,8 +872,10 @@ mod tests {
                 media_path: None,
                 reply_to_id: None,
                 reply_to_text: None,
+                reply_to_sender: None,
                 read: false,
                 revoked: false,
+                status: None,
             }),
         };
         let json = serde_json::to_string(&message).expect("message event must serialize");
