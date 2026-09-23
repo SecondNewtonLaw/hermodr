@@ -197,39 +197,83 @@
     }
   }
 
+  /**
+   * Builds a small preview image data URL.
+   *
+   * The full-size bitmap is never handed to the layout. Decoding a large photo
+   * into the render tree is what killed the webview: pasting a screenshot
+   * crashed the renderer and took the chat with it. Drawing a downscaled copy
+   * keeps the decoded surface small.
+   */
+  async function imagePreview(file: File): Promise<string> {
+    const bitmap = await createImageBitmap(file);
+    const maxSide = 480;
+    const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
+    const width = Math.max(1, Math.round(bitmap.width * scale));
+    const height = Math.max(1, Math.round(bitmap.height * scale));
+
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    if (!context) {
+      bitmap.close();
+      throw new Error("no 2d context for preview");
+    }
+    context.drawImage(bitmap, 0, 0, width, height);
+    bitmap.close();
+    return canvas.toDataURL("image/jpeg", 0.7);
+  }
+
   /** Stages a file for review rather than sending it straight away. */
-  function stageFile(file: File) {
-    if (pending) URL.revokeObjectURL(pending.url);
-    pending = {
-      file,
-      url: URL.createObjectURL(file),
-      isImage: file.type.startsWith("image/"),
-      isVideo: file.type.startsWith("video/"),
-    };
-    caption = "";
+  async function stageFile(file: File) {
+    try {
+      // Release the previous preview before replacing it.
+      if (pending?.url.startsWith("blob:")) URL.revokeObjectURL(pending.url);
+
+      const isImage = file.type.startsWith("image/");
+      const isVideo = file.type.startsWith("video/");
+
+      let url: string;
+      if (isImage) {
+        url = await imagePreview(file);
+      } else if (isVideo) {
+        // A video element needs a real URL; it is not decoded until played.
+        url = URL.createObjectURL(file);
+      } else {
+        url = "";
+      }
+
+      pending = { file, url, isImage, isVideo };
+      caption = "";
+    } catch (e) {
+      // Staging must never take the chat down with it.
+      pending = null;
+      error = `Could not preview that file: ${e}`;
+    }
   }
 
   function attach(event: Event) {
     const input = event.currentTarget as HTMLInputElement;
     const file = input.files?.[0];
     input.value = "";
-    if (file) stageFile(file);
+    if (file) void stageFile(file);
   }
 
   /** Pasting an image into the composer stages it, like attaching. */
   function onPaste(event: ClipboardEvent) {
-    const item = Array.from(event.clipboardData?.items ?? []).find((i) =>
-      i.type.startsWith("image/"),
-    );
+    const items = event.clipboardData?.items;
+    if (!items) return;
+    const item = Array.from(items).find((i) => i.type.startsWith("image/"));
     const file = item?.getAsFile();
     if (!file) return;
     // Only intercept when it is actually an image; text paste stays native.
     event.preventDefault();
-    stageFile(file);
+    void stageFile(file);
   }
 
   function cancelPending() {
-    if (pending) URL.revokeObjectURL(pending.url);
+    if (pending?.url.startsWith("blob:")) URL.revokeObjectURL(pending.url);
     pending = null;
     caption = "";
   }
@@ -295,6 +339,17 @@
   onMount(() => {
     let unlisten: (() => void) | undefined;
 
+    // Surface anything that escapes a handler, so a failure shows a message
+    // rather than leaving the interface silently unresponsive.
+    const onError = (event: ErrorEvent) => {
+      error = event.message || "Unexpected error";
+    };
+    const onRejection = (event: PromiseRejectionEvent) => {
+      error = String(event.reason ?? "Unexpected error");
+    };
+    window.addEventListener("error", onError);
+    window.addEventListener("unhandledrejection", onRejection);
+
     async function setup() {
       settings = await invoke<UiSettings>("get_settings");
 
@@ -342,7 +397,11 @@
 
     setup();
 
-    return () => unlisten?.();
+    return () => {
+      unlisten?.();
+      window.removeEventListener("error", onError);
+      window.removeEventListener("unhandledrejection", onRejection);
+    };
   });
 </script>
 
