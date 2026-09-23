@@ -63,6 +63,18 @@ pub struct StoredMessage {
     pub timestamp: i64,
     pub from_me: bool,
     pub text: String,
+    /// `image`, `video`, `audio` or `document`, when the message carries media.
+    pub media_kind: Option<String>,
+    /// Absolute path to the downloaded media, if it was kept.
+    pub media_path: Option<String>,
+    /// Id of the message this one quotes.
+    pub reply_to_id: Option<String>,
+    /// Text of the quoted message, stored so a quote renders without a lookup.
+    pub reply_to_text: Option<String>,
+    /// Whether the user has seen this message.
+    pub read: bool,
+    /// Whether the sender deleted the message for everyone.
+    pub revoked: bool,
 }
 
 /// A chat summary derived from stored messages.
@@ -74,6 +86,8 @@ pub struct ChatSummary {
     pub last_message_at: i64,
     pub last_text: String,
     pub message_count: i64,
+    /// Incoming messages the user has not seen yet.
+    pub unread_count: i64,
 }
 
 /// SQLite-backed message store.
@@ -98,12 +112,18 @@ impl MessageStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS messages (
-                 chat      TEXT NOT NULL,
-                 id        TEXT NOT NULL,
-                 sender    TEXT NOT NULL,
-                 timestamp INTEGER NOT NULL,
-                 from_me   INTEGER NOT NULL,
-                 text      TEXT NOT NULL,
+                 chat         TEXT NOT NULL,
+                 id           TEXT NOT NULL,
+                 sender       TEXT NOT NULL,
+                 timestamp    INTEGER NOT NULL,
+                 from_me      INTEGER NOT NULL,
+                 text         TEXT NOT NULL,
+                 media_kind   TEXT,
+                 media_path   TEXT,
+                 reply_to_id  TEXT,
+                 reply_to_text TEXT,
+                 read         INTEGER NOT NULL DEFAULT 0,
+                 revoked      INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY (chat, id)
              );
              CREATE INDEX IF NOT EXISTS idx_messages_chat_time
@@ -117,6 +137,31 @@ impl MessageStore {
              );",
         )?;
 
+        // Columns added after the first release. SQLite has no "ADD COLUMN IF
+        // NOT EXISTS", so the existing set is inspected first.
+        let existing: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for column in ["media_kind", "media_path", "reply_to_id", "reply_to_text"] {
+            if !existing.iter().any(|c| c == column) {
+                conn.execute(&format!("ALTER TABLE messages ADD COLUMN {column} TEXT"), [])?;
+            }
+        }
+        if !existing.iter().any(|c| c == "read") {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN read INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !existing.iter().any(|c| c == "revoked") {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+
         Ok(Self {
             conn: Mutex::new(conn),
             retention,
@@ -127,13 +172,19 @@ impl MessageStore {
     pub fn upsert(&self, message: &StoredMessage) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO messages (chat, id, sender, timestamp, from_me, text)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO messages
+                 (chat, id, sender, timestamp, from_me, text,
+                  media_kind, media_path, reply_to_id, reply_to_text, read, revoked)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(chat, id) DO UPDATE SET
                  sender = excluded.sender,
                  timestamp = excluded.timestamp,
                  from_me = excluded.from_me,
-                 text = excluded.text",
+                 text = excluded.text,
+                 media_kind = excluded.media_kind,
+                 media_path = excluded.media_path,
+                 reply_to_id = excluded.reply_to_id,
+                 reply_to_text = excluded.reply_to_text",
             params![
                 message.chat,
                 message.id,
@@ -141,6 +192,12 @@ impl MessageStore {
                 message.timestamp,
                 message.from_me as i32,
                 message.text,
+                message.media_kind,
+                message.media_path,
+                message.reply_to_id,
+                message.reply_to_text,
+                message.read as i32,
+                message.revoked as i32,
             ],
         )?;
         Ok(())
@@ -180,7 +237,8 @@ impl MessageStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT m.chat, m.id, m.sender, m.timestamp, m.from_me, m.text,
-                    n.name
+                    n.name, m.media_kind, m.media_path, m.reply_to_id, m.reply_to_text,
+                    m.read, m.revoked
              FROM messages m
              LEFT JOIN names n ON n.jid = m.sender
              WHERE m.chat = ?1
@@ -195,9 +253,47 @@ impl MessageStore {
                 timestamp: row.get(3)?,
                 from_me: row.get::<_, i32>(4)? != 0,
                 text: row.get(5)?,
+                media_kind: row.get(7)?,
+                media_path: row.get(8)?,
+                reply_to_id: row.get(9)?,
+                reply_to_text: row.get(10)?,
+                read: row.get::<_, i32>(11)? != 0,
+                revoked: row.get::<_, i32>(12)? != 0,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    /// A single stored message.
+    pub fn message(&self, chat: &str, id: &str) -> Result<StoredMessage> {
+        let conn = self.conn.lock().unwrap();
+        let message = conn.query_row(
+            "SELECT m.chat, m.id, m.sender, m.timestamp, m.from_me, m.text,
+                    n.name, m.media_kind, m.media_path, m.reply_to_id, m.reply_to_text,
+                    m.read, m.revoked
+             FROM messages m
+             LEFT JOIN names n ON n.jid = m.sender
+             WHERE m.chat = ?1 AND m.id = ?2",
+            params![chat, id],
+            |row| {
+                Ok(StoredMessage {
+                    chat: row.get(0)?,
+                    id: row.get(1)?,
+                    sender: row.get(2)?,
+                    sender_name: row.get(6)?,
+                    timestamp: row.get(3)?,
+                    from_me: row.get::<_, i32>(4)? != 0,
+                    text: row.get(5)?,
+                    media_kind: row.get(7)?,
+                    media_path: row.get(8)?,
+                    reply_to_id: row.get(9)?,
+                    reply_to_text: row.get(10)?,
+                    read: row.get::<_, i32>(11)? != 0,
+                    revoked: row.get::<_, i32>(12)? != 0,
+                })
+            },
+        )?;
+        Ok(message)
     }
 
     /// One summary per chat, most recently active first.
@@ -207,7 +303,9 @@ impl MessageStore {
             "SELECT m.chat,
                     MAX(m.timestamp) AS last_message_at,
                     COUNT(*) AS message_count,
-                    n.name
+                    n.name,
+                    SUM(CASE WHEN m.read = 0 AND m.from_me = 0 THEN 1 ELSE 0 END)
+                        AS unread_count
              FROM messages m
              LEFT JOIN names n ON n.jid = m.chat
              GROUP BY m.chat ORDER BY last_message_at DESC",
@@ -218,12 +316,13 @@ impl MessageStore {
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })?;
 
         let mut summaries = Vec::new();
         for row in rows {
-            let (chat, last_message_at, message_count, display_name) = row?;
+            let (chat, last_message_at, message_count, display_name, unread_count) = row?;
             // The preview is fetched separately so the aggregate query stays simple.
             let last_text = conn
                 .query_row(
@@ -239,9 +338,39 @@ impl MessageStore {
                 last_message_at,
                 last_text,
                 message_count,
+                unread_count,
             });
         }
         Ok(summaries)
+    }
+
+    /// Marks a message as deleted by its sender, clearing its content.
+    ///
+    /// The row is kept so the chat shows that something was removed rather than
+    /// silently losing a message. Returns whether a row was updated.
+    pub fn revoke(&self, chat: &str, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE messages
+             SET revoked = 1, text = '', media_kind = NULL, media_path = NULL,
+                 reply_to_id = NULL, reply_to_text = NULL
+             WHERE chat = ?1 AND id = ?2 AND revoked = 0",
+            params![chat, id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Marks every incoming message in a chat as read.
+    ///
+    /// Returns how many rows changed, so the caller can skip a refresh when
+    /// nothing was unread.
+    pub fn mark_chat_read(&self, chat: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE messages SET read = 1 WHERE chat = ?1 AND read = 0 AND from_me = 0",
+            params![chat],
+        )?;
+        Ok(changed)
     }
 
     /// Applies the retention policy, returning how many messages were dropped.
@@ -305,7 +434,10 @@ mod tests {
              CREATE TABLE messages (
                  chat TEXT NOT NULL, id TEXT NOT NULL, sender TEXT NOT NULL,
                  timestamp INTEGER NOT NULL, from_me INTEGER NOT NULL,
-                 text TEXT NOT NULL, PRIMARY KEY (chat, id));
+                 text TEXT NOT NULL, media_kind TEXT, media_path TEXT,
+                 reply_to_id TEXT, reply_to_text TEXT,
+                 read INTEGER NOT NULL DEFAULT 0,
+                 revoked INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (chat, id));
              CREATE TABLE names (jid TEXT PRIMARY KEY, name TEXT NOT NULL);",
         ).unwrap();
         s
@@ -320,6 +452,12 @@ mod tests {
             timestamp: now() - age_hours * 3600,
             from_me: false,
             text: text.into(),
+            media_kind: None,
+            media_path: None,
+            reply_to_id: None,
+            reply_to_text: None,
+            read: false,
+            revoked: false,
         }
     }
 
@@ -434,6 +572,62 @@ mod tests {
         s.enforce_retention().unwrap();
         assert_eq!(s.count().unwrap(), 0);
         assert_eq!(s.name_for("a@s").unwrap().as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn unread_counts_only_incoming_unread() {
+        let s = store(Retention::unlimited());
+        let mut incoming = msg("a@s", "1", 0, "hi");
+        incoming.read = false;
+        s.upsert(&incoming).unwrap();
+
+        let mut outgoing = msg("a@s", "2", 0, "hello");
+        outgoing.from_me = true;
+        outgoing.read = true;
+        s.upsert(&outgoing).unwrap();
+
+        let chats = s.chats().unwrap();
+        assert_eq!(chats[0].unread_count, 1);
+
+        assert_eq!(s.mark_chat_read("a@s").unwrap(), 1);
+        assert_eq!(s.chats().unwrap()[0].unread_count, 0);
+    }
+
+    #[test]
+    fn marking_read_is_idempotent() {
+        let s = store(Retention::unlimited());
+        s.upsert(&msg("a@s", "1", 0, "hi")).unwrap();
+        assert_eq!(s.mark_chat_read("a@s").unwrap(), 1);
+        // Nothing left to change the second time.
+        assert_eq!(s.mark_chat_read("a@s").unwrap(), 0);
+    }
+
+    #[test]
+    fn media_and_reply_fields_round_trip() {
+        let s = store(Retention::unlimited());
+        let mut m = msg("a@s", "1", 0, "look");
+        m.media_kind = Some("image".into());
+        m.media_path = Some("/tmp/pic.jpg".into());
+        m.reply_to_id = Some("0".into());
+        m.reply_to_text = Some("earlier".into());
+        s.upsert(&m).unwrap();
+
+        let got = &s.messages_for("a@s", 1).unwrap()[0];
+        assert_eq!(got.media_kind.as_deref(), Some("image"));
+        assert_eq!(got.reply_to_text.as_deref(), Some("earlier"));
+    }
+
+    #[test]
+    fn revoking_keeps_the_row_but_clears_content() {
+        let s = store(Retention::unlimited());
+        s.upsert(&msg("a@s", "1", 0, "oops")).unwrap();
+        assert!(s.revoke("a@s", "1").unwrap());
+
+        let got = &s.messages_for("a@s", 1).unwrap()[0];
+        assert!(got.revoked);
+        assert_eq!(got.text, "");
+        // Revoking twice changes nothing the second time.
+        assert!(!s.revoke("a@s", "1").unwrap());
     }
 
     #[test]

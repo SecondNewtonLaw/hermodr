@@ -17,6 +17,8 @@ use anyhow::Result;
 use serde::Serialize;
 use tokio::sync::broadcast;
 use whatsapp_rust::{
+    download::{Downloadable, MediaType},
+    media::{self, DocumentOptions, ImageOptions},
     prelude::*,
     wacore::msg_secret::MsgSecretRetention,
     wacore::types::events::Event,
@@ -124,11 +126,18 @@ fn reclaim_oversized_secrets(session_path: &Path, retention: &Retention) -> Resu
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ServiceEvent {
     /// A pairing QR is ready to display.
-    QrCode(String),
+    ///
+    /// Every variant uses named fields: an internally tagged enum cannot
+    /// represent a newtype variant holding a bare `String`, and serialization
+    /// failure would silently drop the event.
+    QrCode { code: String },
     Connected,
     Disconnected,
-    /// A message was received and stored.
-    Message(StoredMessage),
+    /// A message was received or sent and stored.
+    ///
+    /// Boxed because `StoredMessage` is far larger than the other variants, and
+    /// every clone of the enum is stored in the broadcast buffer.
+    Message { message: Box<StoredMessage> },
     /// Message history was changed by retention, so the UI should refresh.
     RetentionApplied { removed: usize },
 }
@@ -144,6 +153,8 @@ pub struct ServiceConfig {
     pub retention: Retention,
     /// Whether to pull the deep history sync during pairing.
     pub accept_full_history: bool,
+    /// Where downloaded media is written. `None` disables media downloads.
+    pub media_dir: Option<PathBuf>,
 }
 
 impl ServiceConfig {
@@ -155,6 +166,7 @@ impl ServiceConfig {
             messages_path: data_dir.join("messages.db"),
             retention: Retention::default(),
             accept_full_history: false,
+            media_dir: Some(data_dir.join("media")),
         }
     }
 }
@@ -196,6 +208,8 @@ pub struct Service {
     store: Arc<MessageStore>,
     events: broadcast::Sender<ServiceEvent>,
     shutdown: tokio::sync::oneshot::Sender<()>,
+    /// Where downloaded media is written; `None` disables media.
+    media_dir: Option<PathBuf>,
     /// Latest pairing code, kept so a subscriber that attaches after the code
     /// was issued can still display it. The QR is emitted during startup, which
     /// a late subscriber would otherwise miss entirely.
@@ -232,10 +246,17 @@ impl Service {
 
         let qr_state = Arc::new(Mutex::new(None));
         let connected_state = Arc::new(AtomicBool::new(false));
+        // The client only exists once the bot is built, but the message handler
+        // needs it to download media. A OnceLock bridges that ordering.
+        let client_slot: Arc<std::sync::OnceLock<Arc<Client>>> =
+            Arc::new(std::sync::OnceLock::new());
 
+        let media_dir = config.media_dir.clone();
         let store_for_events = store.clone();
         let events_for_events = events.clone();
         let connected_for_events = connected_state.clone();
+        let client_for_events = client_slot.clone();
+        let media_dir_for_events = media_dir.clone();
 
         let bot = Bot::builder()
             .with_backend(SqliteStore::new(config.session_path.to_string_lossy().as_ref()).await?)
@@ -249,7 +270,7 @@ impl Service {
                     let qr_state = qr_state.clone();
                     async move {
                         *qr_state.lock().unwrap() = Some(code.clone());
-                        let _ = events.send(ServiceEvent::QrCode(code));
+                        let _ = events.send(ServiceEvent::QrCode { code });
                     }
                 }
             })
@@ -275,27 +296,56 @@ impl Service {
                     let store = store_for_events.clone();
                     let events = events_for_events.clone();
                     let connected = connected_for_events.clone();
+                    let client_for_events = client_for_events.clone();
+                    let media_dir = media_dir_for_events.clone();
                     async move {
                         match event.as_ref() {
                             Event::Messages(batch) => {
+                                let client = client_for_events.get().cloned();
                                 for inbound in batch.messages.iter() {
-                                    let Some(message) = to_stored(inbound) else {
-                                        continue;
-                                    };
                                     // The envelope carries the sender's display
                                     // name, which is the only name source
                                     // available without a contacts query.
                                     let push_name = inbound.info.push_name.to_string();
+                                    let chat = inbound.info.source.chat.to_string();
+                                    let sender = inbound.info.source.sender.to_string();
                                     if !push_name.is_empty() {
-                                        let _ = store.set_name(&message.sender, &push_name);
+                                        let _ = store.set_name(&sender, &push_name);
                                         // A one-to-one chat is named after its
                                         // contact, so the same name applies.
                                         if !inbound.info.source.is_group {
-                                            let _ = store.set_name(&message.chat, &push_name);
+                                            let _ = store.set_name(&chat, &push_name);
                                         }
                                     }
+
+                                    // A revoke is a protocol message naming the
+                                    // original; mark it deleted rather than
+                                    // dropping the notice, so the chat shows
+                                    // that something was removed.
+                                    if let Some(target) = revoke_target(&inbound.message) {
+                                        if let Ok(true) = store.revoke(&chat, &target) {
+                                            if let Ok(updated) =
+                                                store.message(&chat, &target)
+                                            {
+                                                let _ = events.send(ServiceEvent::Message {
+                                                    message: Box::new(updated),
+                                                });
+                                            }
+                                        }
+                                        continue;
+                                    }
+
+                                    let Some(message) = incoming_message(
+                                        inbound,
+                                        client.as_deref(),
+                                        media_dir.as_deref(),
+                                    )
+                                    .await
+                                    else {
+                                        continue;
+                                    };
                                     let _ = store.upsert(&message);
-                                    let _ = events.send(ServiceEvent::Message(message));
+                                    let _ = events.send(ServiceEvent::Message { message: Box::new(message) });
                                 }
                                 // Bound the store right after writes so the
                                 // limit holds even if the process stops.
@@ -334,6 +384,7 @@ impl Service {
                 store,
                 events,
                 shutdown: shutdown_tx,
+                media_dir,
                 qr: qr_state,
                 connected: connected_state,
             },
@@ -393,15 +444,164 @@ impl Service {
             id: result.message_id.clone(),
             sender: chat.to_string(),
             sender_name: None,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0),
+            timestamp: unix_now(),
             from_me: true,
             text,
+            media_kind: None,
+            media_path: None,
+            reply_to_id: None,
+            reply_to_text: None,
+            // Not `true`: we cannot know whether the recipient has read it, and
+            // claiming so shows a read marker that is not true.
+            read: false,
+            revoked: false,
         };
         self.store.upsert(&message)?;
-        let _ = self.events.send(ServiceEvent::Message(message));
+        let _ = self.events.send(ServiceEvent::Message { message: Box::new(message) });
+        Ok(())
+    }
+
+    /// Where media is stored, if enabled.
+    pub fn media_dir(&self) -> Option<PathBuf> {
+        self.media_dir.clone()
+    }
+
+    /// Marks a chat's incoming messages as read. Returns how many changed.
+    pub fn mark_read(&self, chat: &str) -> Result<usize> {
+        self.store.mark_chat_read(chat)
+    }
+
+    /// Sends a text message quoting an earlier one.
+    ///
+    /// The quote is rebuilt from the stored message rather than the original
+    /// protobuf, which we do not keep; the recipient renders the quoted text.
+    pub async fn send_reply(
+        &self,
+        chat: &str,
+        text: impl Into<String>,
+        reply_to_id: &str,
+        reply_to_sender: &str,
+        reply_to_text: &str,
+    ) -> Result<()> {
+        let to: Jid = chat.parse()?;
+        // The quoted author must be the address without a device suffix: a
+        // participant like `123:98@lid` is not resolvable by recipients, who
+        // then attribute the quoted message to the sender of the reply.
+        let sender: Jid = reply_to_sender.parse::<Jid>()?.to_non_ad();
+        let text = text.into();
+
+        use whatsapp_rust::wacore::proto_helpers::build_quote_context_with_info;
+        let quoted = wa::Message::text(reply_to_text);
+        let context =
+            build_quote_context_with_info(reply_to_id, &sender, &to, &to, &quoted);
+
+        use whatsapp_rust::wacore::proto_helpers::MessageBuilderExt;
+        let message = wa::Message::text_with_context(text.clone(), context);
+        let result = self.client.send_message(to, message).await?;
+
+        let stored = StoredMessage {
+            chat: chat.to_string(),
+            id: result.message_id.clone(),
+            sender: chat.to_string(),
+            sender_name: None,
+            timestamp: unix_now(),
+            from_me: true,
+            text,
+            media_kind: None,
+            media_path: None,
+            reply_to_id: Some(reply_to_id.to_string()),
+            reply_to_text: Some(reply_to_text.to_string()),
+            read: false,
+            revoked: false,
+        };
+        self.store.upsert(&stored)?;
+        let _ = self.events.send(ServiceEvent::Message { message: Box::new(stored) });
+        Ok(())
+    }
+
+    /// Sends a file as an image or document, chosen from its extension.
+    ///
+    /// Images are sent as images so they render inline; everything else goes as
+    /// a document, which is what a file picker is usually for.
+    pub async fn send_media(
+        &self,
+        chat: &str,
+        file_name: &str,
+        bytes: Vec<u8>,
+        caption: Option<String>,
+    ) -> Result<()> {
+        let to: Jid = chat.parse()?;
+        let file_name = file_name.to_string();
+
+        let is_image = matches!(
+            std::path::Path::new(&file_name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .as_deref(),
+            Some("jpg" | "jpeg" | "png" | "gif" | "webp")
+        );
+
+        let upload = self
+            .client
+            .upload(bytes.clone(), if is_image { MediaType::Image } else { MediaType::Document }, Default::default())
+            .await?;
+
+        let (message, kind) = if is_image {
+            (
+                media::image_message(
+                    upload,
+                    ImageOptions {
+                        caption: caption.clone(),
+                        ..Default::default()
+                    },
+                ),
+                "image",
+            )
+        } else {
+            (
+                media::document_message(
+                    upload,
+                    DocumentOptions {
+                        file_name: Some(file_name.clone()),
+                        caption: caption.clone(),
+                        ..Default::default()
+                    },
+                ),
+                "document",
+            )
+        };
+
+        let result = self.client.send_message(to, message).await?;
+
+        // Keep our own copy so the sender sees what they sent.
+        let mut stored_path = None;
+        if let Some(dir) = &self.media_dir() {
+            if std::fs::create_dir_all(dir).is_ok() {
+                let dest = dir.join(format!("{}.{}", result.message_id, if is_image { "jpg" } else { "bin" }));
+                if std::fs::write(&dest, &bytes).is_ok() {
+                    stored_path = Some(dest.to_string_lossy().to_string());
+                }
+            }
+        }
+
+        let stored = StoredMessage {
+            chat: chat.to_string(),
+            id: result.message_id.clone(),
+            sender: chat.to_string(),
+            sender_name: None,
+            timestamp: unix_now(),
+            from_me: true,
+            text: caption.unwrap_or_default(),
+            media_kind: Some(kind.to_string()),
+            media_path: stored_path,
+            reply_to_id: None,
+            reply_to_text: None,
+            read: false,
+            revoked: false,
+        };
+        self.store.upsert(&stored)?;
+        let _ = self.events.send(ServiceEvent::Message { message: Box::new(stored) });
         Ok(())
     }
 
@@ -421,13 +621,134 @@ impl Service {
     }
 }
 
-/// Converts a protocol message into a storable one.
+/// The id of the message a revoke refers to, if this message is a revoke.
+fn revoke_target(message: &wa::Message) -> Option<String> {
+    use wa::message::protocol_message::Type;
+    let protocol = message.get_base_message().protocol_message.as_option()?;
+    if protocol.r#type != Some(Type::REVOKE) {
+        return None;
+    }
+    let key = protocol.key.as_option()?;
+    key.id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .map(|id| id.to_string())
+}
+
+/// Extracts the quoted message id and text from an incoming message.
 ///
-/// Returns `None` for messages with no text body: protocol traffic and media
-/// without a caption would otherwise fill the store with empty rows.
-fn to_stored(inbound: &InboundMessage) -> Option<StoredMessage> {
-    let text = inbound.message.text_content()?.to_string();
+/// `context_info` lives on each inner message type rather than on `Message`
+/// itself, so the carriers a reply can arrive on are checked in turn.
+fn quote_of(message: &wa::Message) -> Option<(String, String)> {
+    let base = message.get_base_message();
+    let context = base
+        .extended_text_message
+        .as_option()
+        .and_then(|m| m.context_info.as_option())
+        .or_else(|| {
+            base.image_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            base.video_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            base.audio_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            base.document_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })?;
+
+    let id = context.stanza_id.as_ref()?.to_string();
+    let quoted = context.quoted_message.as_option()?;
+    let text = quoted.text_content().unwrap_or("[media]").to_string();
+    Some((id, text))
+}
+
+/// Seconds since the Unix epoch.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The media carried by a message, if any.
+///
+/// Returns the kind and a boxed download reference: the four media protos are
+/// distinct types that each implement `Downloadable`.
+fn detect_media(message: &wa::Message) -> Option<(&'static str, MediaType, Box<dyn Downloadable + Send + Sync>)> {
+    if let Some(image) = message.image_message.as_option() {
+        return Some(("image", MediaType::Image, Box::new(image.clone())));
+    }
+    if let Some(video) = message.video_message.as_option() {
+        return Some(("video", MediaType::Video, Box::new(video.clone())));
+    }
+    if let Some(audio) = message.audio_message.as_option() {
+        return Some(("audio", MediaType::Audio, Box::new(audio.clone())));
+    }
+    if let Some(document) = message.document_message.as_option() {
+        return Some(("document", MediaType::Document, Box::new(document.clone())));
+    }
+    None
+}
+
+/// Converts a protocol message into a storable one, downloading any media.
+///
+/// Returns `None` for messages that carry neither text nor media, so protocol
+/// traffic does not fill the store with empty rows.
+async fn incoming_message(
+    inbound: &InboundMessage,
+    client: Option<&Client>,
+    media_dir: Option<&Path>,
+) -> Option<StoredMessage> {
     let info = &inbound.info;
+    let mut text = inbound.message.text_content().unwrap_or_default().to_string();
+
+    let mut media_kind = None;
+    let mut media_path = None;
+
+    if let Some((kind, media_type, downloadable)) = detect_media(&inbound.message) {
+        media_kind = Some(kind.to_string());
+
+        // Download when a destination and a client are available. A failure
+        // still records the message, so the text and metadata are not lost.
+        if let (Some(client), Some(dir)) = (client, media_dir) {
+            match client.download(downloadable.as_ref()).await {
+                Ok(bytes) => {
+                    if std::fs::create_dir_all(dir).is_ok() {
+                        let path = dir.join(format!("{}.{}", info.id, extension_for(kind, media_type)));
+                        if std::fs::write(&path, &bytes).is_ok() {
+                            media_path = Some(path.to_string_lossy().to_string());
+                        }
+                    }
+                }
+                Err(e) => log::warn!("failed to download {} media: {e}", info.id),
+            }
+        }
+
+        if text.is_empty() {
+            text = format!("[{kind}]");
+        }
+    }
+
+    if text.is_empty() && media_kind.is_none() {
+        return None;
+    }
+
+    // A reply carries the quote in the message context. We do not keep the
+    // original protobuf, so the text is copied out for display.
+    let (reply_to_id, reply_to_text) = quote_of(&inbound.message)
+        .map(|(id, text)| (Some(id), Some(text)))
+        .unwrap_or((None, None));
+
     Some(StoredMessage {
         chat: info.source.chat.to_string(),
         id: info.id.to_string(),
@@ -437,12 +758,68 @@ fn to_stored(inbound: &InboundMessage) -> Option<StoredMessage> {
         timestamp: info.timestamp.timestamp(),
         from_me: info.source.is_from_me,
         text,
+        media_kind,
+        media_path,
+        reply_to_id,
+        reply_to_text,
+        // Newly arrived, so unseen until the chat is opened.
+        read: false,
+        revoked: false,
     })
+}
+
+/// File extension for a downloaded media item.
+fn extension_for(kind: &str, media_type: MediaType) -> &'static str {
+    match kind {
+        "image" => "jpg",
+        "video" => "mp4",
+        "audio" => "ogg",
+        "document" => "bin",
+        _ => match media_type {
+            MediaType::Image => "jpg",
+            _ => "bin",
+        },
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn events_serialize_for_the_ui() {
+        // Regression guard: these are emitted with `app.emit`, which fails
+        // silently for a shape serde cannot represent.
+        for event in [
+            ServiceEvent::QrCode { code: "2@abc".into() },
+            ServiceEvent::Connected,
+            ServiceEvent::Disconnected,
+            ServiceEvent::RetentionApplied { removed: 3 },
+        ] {
+            let json = serde_json::to_string(&event).expect("event must serialize");
+            assert!(json.contains("\"kind\""), "missing tag: {json}");
+        }
+
+        let message = ServiceEvent::Message {
+            message: Box::new(StoredMessage {
+                chat: "a@s".into(),
+                id: "1".into(),
+                sender: "b@s".into(),
+                sender_name: None,
+                timestamp: 0,
+                from_me: false,
+                text: "hi".into(),
+                media_kind: None,
+                media_path: None,
+                reply_to_id: None,
+                reply_to_text: None,
+                read: false,
+                revoked: false,
+            }),
+        };
+        let json = serde_json::to_string(&message).expect("message event must serialize");
+        assert!(json.contains("\"message\""), "missing payload: {json}");
+    }
 
     #[test]
     fn default_config_targets_its_data_dir() {

@@ -96,6 +96,17 @@ cargo run -p hermodr-core --bin service-check  # store messages, show retention
 `spike` renders its pairing code as Unicode blocks, so it needs no image viewer.
 Set `SPIKE_HISTORY=accept` to compare behaviour when the full history is allowed.
 
+## Media
+
+Downloaded media is written to the folder set in Settings, which defaults to the
+app data directory. The asset protocol is scoped to whatever folder is
+configured, so a custom location is served to the UI as well.
+
+Attachments are read in the webview and sent base64-encoded, because a webview
+cannot hand out a real filesystem path. That is fine for the images and
+documents a picker is normally used for, but it is not a good fit for very large
+files.
+
 ## Testing
 
 ```console
@@ -104,8 +115,16 @@ cargo test -p hermodr-core
 
 ## Status
 
-Working: pairing, receiving and storing messages with decoded senders, sending
-text, retention enforcement, chat and message views.
+Working:
 
-Not yet implemented: media, group administration, calls, notifications, multiple
-accounts, and the tray icon.
+- Pairing by QR, reusing the stored session on later launches
+- Receiving and sending text, with quotes/replies
+- Images and documents received inline, and sent from the composer
+- Group and contact names, resolved from push names and group queries
+- Unread counts per chat, and a read indicator on messages
+- Replies in both directions, with the quoted author attributed correctly
+- Deleted messages kept and shown as removed rather than vanishing
+- Retention enforcement, and a configurable media folder
+
+Not yet implemented: audio/video playback, group administration, calls,
+notifications, multiple accounts, and the tray icon.

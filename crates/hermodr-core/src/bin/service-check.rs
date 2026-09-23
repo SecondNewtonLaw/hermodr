@@ -31,6 +31,7 @@ async fn main() -> Result<()> {
         messages_path: data_dir.join("messages.db"),
         retention,
         accept_full_history: false,
+        media_dir: Some(data_dir.join("media")),
     };
 
     println!("[check] data dir: {}", data_dir.display());
@@ -63,7 +64,7 @@ async fn main() -> Result<()> {
         };
 
         match event {
-            ServiceEvent::QrCode(_) => {
+            ServiceEvent::QrCode { .. } => {
                 println!("[check] QR issued — scan it (run the spike binary to see the image)");
             }
             ServiceEvent::Connected => {
@@ -79,7 +80,7 @@ async fn main() -> Result<()> {
                 }
             }
             ServiceEvent::Disconnected => println!("[check] disconnected"),
-            ServiceEvent::Message(message) => {
+            ServiceEvent::Message { message } => {
                 stats.received += 1;
                 println!("[check] stored [{}] {}: {}", message.chat, message.sender, message.text);
             }

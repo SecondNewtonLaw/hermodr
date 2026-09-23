@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { convertFileSrc, invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
 
   type StoredMessage = {
@@ -11,6 +11,12 @@
     timestamp: number;
     from_me: boolean;
     text: string;
+    media_kind: string | null;
+    media_path: string | null;
+    reply_to_id: string | null;
+    reply_to_text: string | null;
+    read: boolean;
+    revoked: boolean;
   };
   type ChatSummary = {
     chat: string;
@@ -18,50 +24,57 @@
     last_message_at: number;
     last_text: string;
     message_count: number;
+    unread_count: number;
   };
   type Retention = {
     max_age_hours: number | null;
     max_messages_per_chat: number | null;
   };
-  type UiSettings = { retention: Retention; accept_full_history: boolean };
+  type UiSettings = {
+    retention: Retention;
+    accept_full_history: boolean;
+    media_dir: string | null;
+  };
   type ConnectionState = { started: boolean; connected: boolean; qr: string | null };
 
   type ServiceEvent =
-    | { kind: "qrCode"; value: string }
+    | { kind: "qrCode"; code: string }
     | { kind: "connected" }
     | { kind: "disconnected" }
-    | { kind: "message"; value: StoredMessage }
+    | { kind: "message"; message: StoredMessage }
     | { kind: "retentionApplied"; removed: number };
 
   let connected = $state(false);
   let connecting = $state(false);
   let started = $state(false);
-  let qr = $state<string | null>(null);
   let qrSvg = $state<string | null>(null);
   let chats: ChatSummary[] = $state([]);
   let selectedChat = $state<string | null>(null);
   let messages: StoredMessage[] = $state([]);
   let draft = $state("");
+  let replyingTo: StoredMessage | null = $state(null);
   let settings: UiSettings = $state({
     retention: { max_age_hours: 24, max_messages_per_chat: 500 },
     accept_full_history: false,
+    media_dir: null,
   });
   let showSettings = $state(false);
   let error = $state<string | null>(null);
 
-  /** Strip the server suffix, used when no name has been resolved. */
+  let scroller: HTMLDivElement | undefined = $state();
+  /** True while the user is reading older messages with new ones below. */
+  let scrolledUp = $state(false);
+  let filePicker: HTMLInputElement | undefined = $state();
+
   function bareJid(jid: string) {
     return jid.replace(/@.*$/, "");
   }
-
   function chatLabel(chat: ChatSummary) {
     return chat.display_name || bareJid(chat.chat);
   }
-
   function senderLabel(message: StoredMessage) {
     return message.sender_name || bareJid(message.sender);
   }
-
   function formatTime(seconds: number) {
     return new Date(seconds * 1000).toLocaleTimeString([], {
       hour: "2-digit",
@@ -69,61 +82,126 @@
     });
   }
 
+  /** Chat list only: cheap, local, never blocks on the network. */
   async function refreshChats() {
     try {
       chats = await invoke<ChatSummary[]>("chats");
-
-      // Group subjects are not carried on messages, so ask the service to fill
-      // in any that are still missing, then refresh only if it found some.
-      // A failure here must not prevent the chat list from updating.
-      try {
-        const resolved = await invoke<number>("resolve_names");
-        if (resolved > 0) {
-          chats = await invoke<ChatSummary[]>("chats");
-        }
-      } catch {
-        // Names are cosmetic; leave them unresolved rather than breaking refresh.
-      }
     } catch (e) {
       error = String(e);
     }
   }
 
-  function selectedChatLabel() {
-    const found = chats.find((c) => c.chat === selectedChat);
-    return found ? chatLabel(found) : selectedChat ? bareJid(selectedChat) : "";
+  /**
+   * Group subjects need a network query. Runs after the list is already
+   * rendered so a slow query cannot delay showing new messages.
+   */
+  async function resolveNames() {
+    try {
+      const resolved = await invoke<number>("resolve_names");
+      if (resolved > 0) await refreshChats();
+    } catch {
+      // Names are cosmetic.
+    }
   }
 
   async function openChat(chat: string) {
     selectedChat = chat;
+    scrolledUp = false;
     try {
       messages = await invoke<StoredMessage[]>("messages", { chat, limit: 200 });
+      // Opening a conversation is what marks it seen.
+      await invoke("mark_read", { chat });
+      await refreshChats();
+      scrollToBottom();
     } catch (e) {
       error = String(e);
     }
+  }
+
+  /** Reloads the open conversation without touching the unread state. */
+  async function reloadMessages() {
+    if (!selectedChat) return;
+    try {
+      messages = await invoke<StoredMessage[]>("messages", {
+        chat: selectedChat,
+        limit: 200,
+      });
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  function scrollToBottom() {
+    // Wait for the new messages to render before measuring.
+    requestAnimationFrame(() => {
+      if (scroller) scroller.scrollTop = scroller.scrollHeight;
+      scrolledUp = false;
+    });
+  }
+
+  function onScroll() {
+    if (!scroller) return;
+    const distance = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+    scrolledUp = distance > 120;
   }
 
   async function send() {
     const text = draft.trim();
     if (!text || !selectedChat) return;
+    const reply = replyingTo;
     draft = "";
+    replyingTo = null;
     try {
-      await invoke("send_text", { chat: selectedChat, text });
-      // The store is authoritative; refetch rather than assuming.
-      await openChat(selectedChat);
+      if (reply) {
+        await invoke("send_reply", {
+          chat: selectedChat,
+          text,
+          replyToId: reply.id,
+          replyToSender: reply.sender,
+          replyToText: reply.text,
+        });
+      } else {
+        await invoke("send_text", { chat: selectedChat, text });
+      }
+      await reloadMessages();
       await refreshChats();
+      scrollToBottom();
     } catch (e) {
       error = String(e);
     }
   }
 
-  /** Renders a pairing code, if one is current. */
+  async function attach(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = "";
+    if (!file || !selectedChat) return;
+
+    try {
+      const buffer = new Uint8Array(await file.arrayBuffer());
+      // Base64 keeps the payload a single IPC value. Fine for the images and
+      // documents a picker is normally used for.
+      let binary = "";
+      for (let i = 0; i < buffer.length; i += 0x8000) {
+        binary += String.fromCharCode(...buffer.subarray(i, i + 0x8000));
+      }
+      await invoke("send_media", {
+        chat: selectedChat,
+        name: file.name,
+        data: btoa(binary),
+      });
+      await reloadMessages();
+      await refreshChats();
+      scrollToBottom();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   async function showQr(code: string | null) {
-    qr = code;
     qrSvg = code ? await invoke<string>("qr_svg", { value: code }) : null;
   }
 
-  /** Pulls the authoritative state, used after connecting and on mount. */
   async function syncState() {
     const state = await invoke<ConnectionState>("connection_state");
     started = state.started;
@@ -132,14 +210,14 @@
     if (connected) await refreshChats();
   }
 
+  /** Connects, reusing a stored session when there is one. */
   async function connect() {
     connecting = true;
     error = null;
     try {
       await invoke("connect");
-      // The service may have paired already, or emitted its code before the
-      // listener attached, so read the state rather than assuming.
       await syncState();
+      resolveNames();
     } catch (e) {
       error = String(e);
     } finally {
@@ -152,43 +230,52 @@
     showSettings = false;
   }
 
-  // `onMount` must return its cleanup synchronously, so the async setup runs in
-  // an inner function and the listener handle is captured for teardown.
   onMount(() => {
     let unlisten: (() => void) | undefined;
 
     async function setup() {
       settings = await invoke<UiSettings>("get_settings");
-      await syncState();
 
+      // The listener is attached before connecting so no event can be missed.
       unlisten = await listen<ServiceEvent>("service-event", async (event) => {
-      const payload = event.payload;
-      switch (payload.kind) {
-        case "qrCode":
-          await showQr(payload.value);
-          break;
-        case "connected":
-          connected = true;
-          await showQr(null);
-          await refreshChats();
-          break;
-        case "disconnected":
-          connected = false;
-          break;
-        case "message":
-          await refreshChats();
-          if (payload.value.chat === selectedChat) {
-            await openChat(payload.value.chat);
-          }
-          break;
-        case "retentionApplied":
-          if (payload.removed > 0) {
+        const payload = event.payload;
+        switch (payload.kind) {
+          case "qrCode":
+            await showQr(payload.code);
+            break;
+          case "connected":
+            connected = true;
+            await showQr(null);
             await refreshChats();
-            if (selectedChat) await openChat(selectedChat);
-          }
-          break;
+            resolveNames();
+            break;
+          case "disconnected":
+            connected = false;
+            break;
+          case "message":
+            // Refresh the list first (cheap), then the conversation, so the
+            // open chat updates immediately rather than after a network query.
+            await refreshChats();
+            if (payload.message.chat === selectedChat) {
+              await reloadMessages();
+              scrollToBottom();
+            }
+            // A group seen for the first time has no name yet; look it up in
+            // the background so the list stops showing a raw number.
+            if (!payload.message.from_me) resolveNames();
+            break;
+          case "retentionApplied":
+            if (payload.removed > 0) {
+              await refreshChats();
+              await reloadMessages();
+            }
+            break;
         }
       });
+
+      // Reuse a stored session automatically: pairing is only needed the very
+      // first time, so the button should never be shown to a paired account.
+      await connect();
     }
 
     setup();
@@ -214,13 +301,9 @@
       <div class="qr" aria-label="Pairing QR code">{@html qrSvg}</div>
       <p class="hint">The code refreshes automatically.</p>
     {:else if started || connecting}
-      <!-- The service is running but has not issued a code yet. Showing the
-           button again here would invite a second, pointless click. -->
-      <p class="hint">Waiting for a pairing code…</p>
+      <p class="hint">Connecting…</p>
     {:else}
-      <button class="primary" onclick={connect} disabled={connecting}>
-        Start pairing
-      </button>
+      <button class="primary" onclick={connect}>Start pairing</button>
     {/if}
   </div>
 {:else}
@@ -240,8 +323,11 @@
               onclick={() => openChat(chat.chat)}
             >
               <span class="name">{chatLabel(chat)}</span>
-              <span class="preview">{chat.last_text}</span>
               <span class="time">{formatTime(chat.last_message_at)}</span>
+              <span class="preview">{chat.last_text}</span>
+              {#if chat.unread_count > 0}
+                <span class="badge">{chat.unread_count > 99 ? "99+" : chat.unread_count}</span>
+              {/if}
             </button>
           </li>
         {/each}
@@ -253,19 +339,74 @@
 
     <section class="conversation">
       {#if selectedChat}
-        <header>{selectedChatLabel()}</header>
-        <div class="messages">
+        <header>{chats.find((c) => c.chat === selectedChat)?.display_name ?? bareJid(selectedChat)}</header>
+
+        <div class="messages" bind:this={scroller} onscroll={onScroll}>
           {#each messages.slice().reverse() as message (message.id)}
             <div class="bubble" class:mine={message.from_me}>
               {#if !message.from_me}
                 <span class="sender">{senderLabel(message)}</span>
               {/if}
-              <span class="text">{message.text}</span>
-              <span class="meta">{formatTime(message.timestamp)}</span>
+
+              {#if message.revoked}
+                <span class="revoked">This message was deleted</span>
+              {:else}
+                {#if message.reply_to_text}
+                  <span class="quote">{message.reply_to_text}</span>
+                {/if}
+
+                {#if message.media_kind === "image" && message.media_path}
+                <img class="media" src={convertFileSrc(message.media_path)} alt={message.text} />
+                {:else if message.media_kind && message.media_path}
+                  <a class="file" href={convertFileSrc(message.media_path)} target="_blank">
+                    {message.text || message.media_kind}
+                  </a>
+                {:else}
+                  <span class="text">{message.text}</span>
+                {/if}
+              {/if}
+
+              <span class="meta">
+                {#if !message.revoked}
+                  <button
+                    class="reply-btn"
+                    title="Reply"
+                    onclick={() => (replyingTo = message)}>↩</button
+                  >
+                {/if}
+                {formatTime(message.timestamp)}
+                {#if message.from_me}
+                  <span class:read={message.read} class="dot" title={message.read ? "Read" : "Sent"}></span>
+                {/if}
+              </span>
             </div>
           {/each}
         </div>
+
+        {#if scrolledUp}
+          <button class="jump" onclick={scrollToBottom}>Jump to latest ↓</button>
+        {/if}
+
+        {#if replyingTo}
+          <div class="reply-preview">
+            <span>Replying to {senderLabel(replyingTo)}: {replyingTo.text}</span>
+            <button class="icon" onclick={() => (replyingTo = null)}>×</button>
+          </div>
+        {/if}
+
         <form class="composer" onsubmit={(e) => (e.preventDefault(), send())}>
+          <button
+            type="button"
+            class="icon attach"
+            title="Attach a file"
+            onclick={() => filePicker?.click()}>📎</button
+          >
+          <input
+            class="file-input"
+            type="file"
+            bind:this={filePicker}
+            onchange={attach}
+          />
           <input bind:value={draft} placeholder="Type a message" autocomplete="off" />
           <button class="primary" type="submit" disabled={!draft.trim()}>Send</button>
         </form>
@@ -278,12 +419,8 @@
 
 {#if showSettings}
   <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <div
-    class="sheet-backdrop"
-    role="presentation"
-    onclick={() => (showSettings = false)}
-  >
-    <div class="sheet" role="dialog" aria-modal="true" aria-label="Retention settings">
+  <div class="sheet-backdrop" role="presentation" onclick={() => (showSettings = false)}>
+    <div class="sheet" role="dialog" aria-modal="true" aria-label="Settings">
       <h2>Retention</h2>
       <p class="hint">
         History is kept locally only for the window below. Nothing older is
@@ -316,10 +453,22 @@
         />
       </label>
 
+      <label class="stack">
+        <span>Media download folder</span>
+        <input
+          type="text"
+          placeholder="App data folder"
+          value={settings.media_dir ?? ""}
+          oninput={(e) => (settings.media_dir = e.currentTarget.value || null)}
+        />
+      </label>
+
       <label class="check">
         <input type="checkbox" bind:checked={settings.accept_full_history} />
         <span>Download full history on next pairing</span>
       </label>
+
+      <p class="hint">Retention and folder changes apply the next time Hermóðr starts.</p>
 
       <div class="actions">
         <button class="primary" onclick={saveSettings}>Save</button>
@@ -408,8 +557,8 @@
   .chats button {
     width: 100%;
     display: grid;
-    grid-template-columns: 1fr auto;
-    grid-template-areas: "name time" "preview preview";
+    grid-template-columns: 1fr auto auto;
+    grid-template-areas: "name time badge" "preview preview preview";
     gap: 2px 8px;
     text-align: left;
     background: transparent;
@@ -419,6 +568,7 @@
     cursor: pointer;
     border-bottom: 1px solid #1c1c1f;
     font: inherit;
+    align-items: center;
   }
   .chats button:hover {
     background: #1c1c1f;
@@ -446,6 +596,17 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .badge {
+    grid-area: badge;
+    background: #22c55e;
+    color: #052e16;
+    font-size: 11px;
+    font-weight: 700;
+    border-radius: 999px;
+    padding: 1px 7px;
+    min-width: 18px;
+    text-align: center;
+  }
   .empty {
     padding: 16px 14px;
     color: #71717a;
@@ -454,6 +615,7 @@
     display: flex;
     flex-direction: column;
     min-height: 0;
+    position: relative;
   }
   .messages {
     flex: 1;
@@ -471,7 +633,7 @@
     padding: 6px 10px;
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    gap: 3px;
     word-break: break-word;
   }
   .bubble.mine {
@@ -482,22 +644,101 @@
     font-size: 11px;
     color: #86efac;
   }
+  .revoked {
+    font-style: italic;
+    color: #71717a;
+  }
+  .quote {
+    font-size: 12px;
+    color: #a1a1aa;
+    border-left: 2px solid #52525b;
+    padding-left: 6px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 40ch;
+  }
+  .media {
+    max-width: 100%;
+    border-radius: 6px;
+    display: block;
+  }
+  .file {
+    color: #93c5fd;
+  }
   .meta {
     font-size: 10px;
     color: #a1a1aa;
     align-self: flex-end;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .reply-btn {
+    background: transparent;
+    border: 0;
+    color: inherit;
+    cursor: pointer;
+    font-size: 12px;
+    opacity: 0;
+    padding: 0 2px;
+  }
+  .bubble:hover .reply-btn {
+    opacity: 0.8;
+  }
+  /* A tiny status dot: hollow while unread, filled once read. */
+  .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    border: 1px solid #a1a1aa;
+    display: inline-block;
+  }
+  .dot.read {
+    background: #38bdf8;
+    border-color: #38bdf8;
   }
   .placeholder {
     margin: auto;
     color: #71717a;
   }
+  .jump {
+    position: absolute;
+    bottom: 74px;
+    right: 18px;
+    background: #3f3f46;
+    color: inherit;
+    border: 0;
+    border-radius: 999px;
+    padding: 6px 14px;
+    cursor: pointer;
+    font: inherit;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+  }
+  .reply-preview {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 14px;
+    background: #1c1c1f;
+    border-top: 1px solid #27272a;
+    font-size: 12px;
+    color: #a1a1aa;
+  }
+  .reply-preview span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .composer {
     display: flex;
+    align-items: center;
     gap: 8px;
     padding: 10px 14px;
     border-top: 1px solid #27272a;
   }
-  .composer input {
+  .composer > input:not(.file-input) {
     flex: 1;
     background: #1c1c1f;
     border: 1px solid #3f3f46;
@@ -505,6 +746,12 @@
     padding: 8px 10px;
     color: inherit;
     font: inherit;
+  }
+  .file-input {
+    display: none;
+  }
+  .attach {
+    font-size: 16px;
   }
   .primary {
     background: #2563eb;
@@ -539,7 +786,7 @@
     border: 1px solid #3f3f46;
     border-radius: 10px;
     padding: 18px 20px;
-    width: min(420px, 90vw);
+    width: min(460px, 90vw);
     display: flex;
     flex-direction: column;
     gap: 12px;
@@ -558,14 +805,22 @@
   .sheet label.check {
     justify-content: flex-start;
   }
-  .sheet input[type="number"] {
-    width: 100px;
+  .sheet label.stack {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+  }
+  .sheet input[type="number"],
+  .sheet input[type="text"] {
     background: #111214;
     border: 1px solid #3f3f46;
     border-radius: 4px;
     padding: 4px 8px;
     color: inherit;
     font: inherit;
+  }
+  .sheet input[type="number"] {
+    width: 100px;
   }
   .actions {
     display: flex;

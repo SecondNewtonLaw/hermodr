@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-send-media"
+description = "Enables the send_media command without any pre-configured scope."
+commands.allow = ["send_media"]
+
+[[permission]]
+identifier = "deny-send-media"
+description = "Denies the send_media command without any pre-configured scope."
+commands.deny = ["send_media"]

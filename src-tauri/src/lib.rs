@@ -4,7 +4,12 @@
 //! [`hermodr_core`]. There is no webview pointed at a remote site, so none of
 //! the history, memory, or compositing problems of that approach apply.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
+
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
 use hermodr_core::{ChatSummary, Retention, Service, ServiceConfig, StoredMessage};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -18,6 +23,8 @@ pub struct UiSettings {
     pub retention: Retention,
     /// Whether to pull the account's entire history during pairing.
     pub accept_full_history: bool,
+    /// Where downloaded media is stored. Empty disables downloads.
+    pub media_dir: Option<String>,
 }
 
 struct AppState {
@@ -43,11 +50,19 @@ fn data_dir(app: &AppHandle) -> std::path::PathBuf {
 }
 
 fn config_for(app: &AppHandle, settings: &UiSettings) -> ServiceConfig {
+    let default_media = data_dir(app).join("media");
     ServiceConfig {
         session_path: data_dir(app).join("session.db"),
         messages_path: data_dir(app).join("messages.db"),
         retention: settings.retention,
         accept_full_history: settings.accept_full_history,
+        // An unset or empty setting falls back to the app data directory.
+        media_dir: settings
+            .media_dir
+            .as_deref()
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+            .or(Some(default_media)),
     }
 }
 
@@ -117,6 +132,13 @@ async fn connect(app: AppHandle, state: State<'_, AppState>) -> Result<(), Strin
         }
     });
 
+    // A media folder outside the app data directory still has to be readable by
+    // the UI, so the asset scope is widened to whatever was configured.
+    if let Some(dir) = service.media_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = app.asset_protocol_scope().allow_directory(&dir, true);
+    }
+
     *state.service.lock().unwrap() = Some(service);
 
     Ok(())
@@ -148,6 +170,50 @@ fn chats(state: State<'_, AppState>) -> Result<Vec<ChatSummary>, String> {
 async fn resolve_names(state: State<'_, AppState>) -> Result<usize, String> {
     let service = state.service()?;
     service.resolve_missing_names().await.map_err(|e| e.to_string())
+}
+
+/// Marks a chat as read. Returns how many messages were newly marked.
+#[tauri::command]
+fn mark_read(state: State<'_, AppState>, chat: String) -> Result<usize, String> {
+    state.service()?.mark_read(&chat).map_err(|e| e.to_string())
+}
+
+/// Sends a text message quoting an earlier one.
+#[tauri::command]
+async fn send_reply(
+    state: State<'_, AppState>,
+    chat: String,
+    text: String,
+    reply_to_id: String,
+    reply_to_sender: String,
+    reply_to_text: String,
+) -> Result<(), String> {
+    let service = state.service()?;
+    service
+        .send_reply(&chat, text, &reply_to_id, &reply_to_sender, &reply_to_text)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Sends an attachment as an image or document.
+///
+/// The file arrives base64-encoded because the webview cannot hand out a real
+/// filesystem path, and the plugin that could is not usable alongside the
+/// pinned Tauri checkout.
+#[tauri::command]
+async fn send_media(
+    state: State<'_, AppState>,
+    chat: String,
+    name: String,
+    data: String,
+    caption: Option<String>,
+) -> Result<(), String> {
+    let bytes = BASE64.decode(data.as_bytes()).map_err(|e| e.to_string())?;
+    let service = state.service()?;
+    service
+        .send_media(&chat, &name, bytes, caption)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Sends a text message to a chat.
@@ -202,6 +268,9 @@ pub fn run() {
             messages,
             chats,
             resolve_names,
+            mark_read,
+            send_reply,
+            send_media,
             send_text,
             qr_svg,
             get_settings,

@@ -15,6 +15,9 @@
     "allow-set-settings",
     "allow-qr-svg",
     "allow-connection-state",
-    "allow-resolve-names"
+    "allow-resolve-names",
+    "allow-mark-read",
+    "allow-send-reply",
+    "allow-send-media"
   ]
 }
