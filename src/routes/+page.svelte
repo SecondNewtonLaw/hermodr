@@ -724,6 +724,9 @@
   }
   .bubble {
     max-width: 70%;
+    /* Without this a flex item refuses to shrink below its content, so a large
+       image stretches the bubble instead of being scaled down to fit it. */
+    min-width: 0;
     align-self: flex-start;
     background: #27272a;
     border-radius: 8px;
@@ -732,6 +735,7 @@
     flex-direction: column;
     gap: 3px;
     word-break: break-word;
+    overflow: hidden;
   }
   .bubble.mine {
     align-self: flex-end;
@@ -756,7 +760,13 @@
     max-width: 40ch;
   }
   .media {
+    /* Cap both axes: width keeps it inside the bubble, height stops a tall
+       photo from filling the viewport. */
     max-width: 100%;
+    max-height: 320px;
+    width: auto;
+    height: auto;
+    object-fit: contain;
     border-radius: 6px;
     display: block;
   }
