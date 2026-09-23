@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-participants"
+description = "Enables the participants command without any pre-configured scope."
+commands.allow = ["participants"]
+
+[[permission]]
+identifier = "deny-participants"
+description = "Denies the participants command without any pre-configured scope."
+commands.deny = ["participants"]

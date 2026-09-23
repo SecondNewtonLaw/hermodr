@@ -11,7 +11,7 @@ pub mod store;
 use anyhow::Result;
 
 pub use history::HistoryPolicy;
-pub use service::{Service, ServiceConfig, ServiceEvent};
+pub use service::{Participant, Service, ServiceConfig, ServiceEvent};
 pub use store::{ChatSummary, MessageStore, Retention, StoredMessage};
 
 /// Renders a pairing code as an SVG string for the UI to display.

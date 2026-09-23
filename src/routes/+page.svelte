@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { convertFileSrc, invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
@@ -67,6 +67,32 @@
   let selectedChat = $state<string | null>(null);
   let messages: StoredMessage[] = $state([]);
   let draft = $state("");
+  /** Per-chat composer text, so switching chats does not lose what was typed. */
+  let drafts: Record<string, string> = $state({});
+  let composerInput: HTMLTextAreaElement | undefined = $state();
+  /** Group members for the @ autocomplete. */
+  let participants: { jid: string; name: string }[] = $state([]);
+  /** Open mention query, or null while the autocomplete is closed. */
+  let mentionQuery = $state<string | null>(null);
+  let mentionIndex = $state(0);
+  /** Mentions picked from the autocomplete, used to convert the text on send. */
+  let chosenMentions: { name: string; jid: string }[] = $state([]);
+  let mentionMatches = $derived.by(() => {
+    const query = mentionQuery;
+    if (query === null) return [];
+    const needle = query.toLowerCase();
+    // `@all` is a group mention (respects mutes); `@all-override` also lists
+    // every member, which notifies them even with the chat muted.
+    const all = selectedChat?.endsWith("@g.us")
+      ? [
+          { jid: "@all", name: "all" },
+          { jid: "@all-override", name: "all-override" },
+        ]
+      : [];
+    return [...all, ...participants]
+      .filter((p) => p.name.toLowerCase().includes(needle))
+      .slice(0, 8);
+  });
   let replyingTo: StoredMessage | null = $state(null);
   let settings: UiSettings = $state({
     retention: { max_age_hours: 24, max_messages_per_chat: 500 },
@@ -108,6 +134,11 @@
   function senderName(jid: string) {
     const known = messages.find((m) => m.sender === jid && m.sender_name);
     return known?.sender_name || bareJid(jid);
+  }
+  /** Author shown on a quote; our own messages read "You". */
+  function quoteAuthor(jid: string | null) {
+    if (!jid) return "Message";
+    return jid === "@me" ? "You" : senderName(jid);
   }
   /** Human-readable delivery state for a message we sent. */
   function statusMark(status: string | null) {
@@ -157,6 +188,10 @@
   async function openChat(chat: string) {
     selectedChat = chat;
     scrolledUp = false;
+    participants = [];
+    chosenMentions = [];
+    mentionQuery = null;
+    draft = drafts[chat] ?? "";
     try {
       messages = await invoke<StoredMessage[]>("messages", { chat, limit: 200 });
       // Opening a conversation is what marks it seen.
@@ -166,6 +201,15 @@
     } catch (e) {
       error = String(e);
     }
+    // Group members power the @ autocomplete; a one-to-one chat returns none.
+    try {
+      participants = await invoke<{ jid: string; name: string }[]>("participants", { chat });
+    } catch {
+      participants = [];
+    }
+    // Opening a chat is the obvious moment to start typing.
+    await tick();
+    composerInput?.focus();
   }
 
   /** Reloads the open conversation without touching the unread state. */
@@ -195,12 +239,124 @@
     scrolledUp = distance > 120;
   }
 
+  /** The `@…` token immediately before the caret, if the user is typing one. */
+  function currentMentionQuery(): { query: string; start: number } | null {
+    const input = composerInput;
+    if (!input) return null;
+    const caret = input.selectionStart ?? draft.length;
+    const before = draft.slice(0, caret);
+    const at = before.lastIndexOf("@");
+    if (at === -1) return null;
+    if (at > 0 && !/\s/.test(before[at - 1])) return null;
+    const query = before.slice(at + 1);
+    if (/\s/.test(query)) return null;
+    return { query, start: at };
+  }
+
+  function onComposerInput(event: Event) {
+    draft = (event.currentTarget as HTMLTextAreaElement).value;
+    if (selectedChat) drafts[selectedChat] = draft;
+    const token = currentMentionQuery();
+    if (token && participants.length > 0) {
+      mentionQuery = token.query;
+      mentionIndex = 0;
+    } else {
+      mentionQuery = null;
+    }
+    autoGrow();
+  }
+
+  async function selectMention(person: { jid: string; name: string }) {
+    const input = composerInput;
+    const token = currentMentionQuery();
+    if (!input || !token) return;
+    const caret = input.selectionStart ?? draft.length;
+    draft = draft.slice(0, token.start) + `@${person.name} ` + draft.slice(caret);
+    mentionQuery = null;
+    if (!chosenMentions.some((m) => m.jid === person.jid)) {
+      chosenMentions = [...chosenMentions, { name: person.name, jid: person.jid }];
+    }
+    await tick();
+    const position = token.start + person.name.length + 2;
+    input.focus();
+    input.setSelectionRange(position, position);
+  }
+
+  function onComposerKey(event: KeyboardEvent) {
+    if (mentionQuery !== null && mentionMatches.length > 0) {
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        mentionIndex = (mentionIndex + 1) % mentionMatches.length;
+        return;
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        mentionIndex = (mentionIndex - 1 + mentionMatches.length) % mentionMatches.length;
+        return;
+      }
+      if (event.key === "Enter" || event.key === "Tab") {
+        event.preventDefault();
+        void selectMention(mentionMatches[mentionIndex]);
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        mentionQuery = null;
+        return;
+      }
+    }
+    // Enter sends; Shift+Enter keeps the newline the textarea just added.
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      void send();
+    }
+  }
+
+  /** Grows the composer with its content, up to a few lines. */
+  function autoGrow() {
+    const el = composerInput;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 140)}px`;
+  }
+
+  /** Turns the display text into wire text, naming mentions by number. */
+  function mentionPayload() {
+    let text = draft.trim();
+    const jids: string[] = [];
+    for (const mention of chosenMentions) {
+      const token = `@${mention.name}`;
+      if (!text.includes(token)) continue;
+      if (mention.jid === "@all") {
+        jids.push("@all");
+        continue;
+      }
+      if (mention.jid === "@all-override") {
+        // Everyone is also listed explicitly, which bypasses their mute.
+        text = text.replace("@all-override", "@all");
+        jids.push("@all");
+        for (const person of participants) jids.push(person.jid);
+        continue;
+      }
+      const user = mention.jid.split("@")[0].split(":")[0];
+      text = text.replace(token, `@${user}`);
+      jids.push(mention.jid);
+    }
+    return { text, jids };
+  }
+
   async function send() {
-    const text = draft.trim();
-    if (!text || !selectedChat) return;
+    if (!draft.trim() || !selectedChat) return;
+    const { text, jids } = mentionPayload();
     const reply = replyingTo;
     draft = "";
+    if (selectedChat) delete drafts[selectedChat];
     replyingTo = null;
+    chosenMentions = [];
+    mentionQuery = null;
+    await tick();
+    autoGrow();
+    composerInput?.focus();
     try {
       if (reply) {
         await invoke("send_reply", {
@@ -209,9 +365,10 @@
           replyToId: reply.id,
           replyToSender: reply.sender,
           replyToText: reply.text,
+          mentions: jids,
         });
       } else {
-        await invoke("send_text", { chat: selectedChat, text });
+        await invoke("send_text", { chat: selectedChat, text, mentions: jids });
       }
       await reloadMessages();
       await refreshChats();
@@ -319,7 +476,11 @@
         );
         if (media) {
           const blob = await item.getType(media);
-          return new File([blob], "pasted-media", { type: media });
+          // send_media classifies by file extension, so a pasted item needs a
+          // real one or a photo goes out as a document.
+          const sub = media.split("/")[1]?.split(";")[0] || "bin";
+          const extension = sub === "jpeg" ? "jpg" : sub;
+          return new File([blob], `pasted.${extension}`, { type: media });
         }
         if (item.types.includes("text/uri-list")) {
           const text = await (await item.getType("text/uri-list")).text();
@@ -473,6 +634,23 @@
     window.addEventListener("error", onError);
     window.addEventListener("unhandledrejection", onRejection);
 
+    // Typing anywhere lands in the composer, so a chat can be answered without
+    // clicking the field first.
+    const onAnyKey = (event: KeyboardEvent) => {
+      if (!selectedChat || !composerInput) return;
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      const target = event.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)
+      ) {
+        return;
+      }
+      if (event.key.length !== 1) return;
+      composerInput.focus();
+    };
+    window.addEventListener("keydown", onAnyKey);
+
     async function setup() {
       settings = await invoke<UiSettings>("get_settings");
 
@@ -530,6 +708,7 @@
       unlisten?.();
       window.removeEventListener("error", onError);
       window.removeEventListener("unhandledrejection", onRejection);
+      window.removeEventListener("keydown", onAnyKey);
     };
   });
 </script>
@@ -611,7 +790,7 @@
                 {#if message.reply_to_text}
                   <span class="quote">
                     <span class="quote-author">
-                      {message.reply_to_sender ? senderName(message.reply_to_sender) : "Message"}
+                      {quoteAuthor(message.reply_to_sender)}
                     </span>
                     <span class="quote-text">{message.reply_to_text}</span>
                   </span>
@@ -712,6 +891,21 @@
           </div>
         {/if}
 
+        {#if mentionQuery !== null && mentionMatches.length > 0}
+          <div class="mentions">
+            {#each mentionMatches as person, i (person.jid)}
+              <button
+                type="button"
+                class="mention"
+                class:active={i === mentionIndex}
+                onclick={() => selectMention(person)}
+                onmouseenter={() => (mentionIndex = i)}>
+                {person.name}
+              </button>
+            {/each}
+          </div>
+        {/if}
+
         <form class="composer" onsubmit={(e) => (e.preventDefault(), send())}>
           <button
             type="button"
@@ -726,11 +920,14 @@
             bind:this={filePicker}
             onchange={attach}
           />
-          <input
-            bind:value={draft}
+          <textarea
+            bind:this={composerInput}
+            value={draft}
+            oninput={onComposerInput}
+            onkeydown={onComposerKey}
+            rows="1"
             placeholder="Type a message"
-            autocomplete="off"
-          />
+          ></textarea>
           <button class="primary" type="submit" disabled={!draft.trim()}>Send</button>
         </form>
       {:else}
@@ -1245,6 +1442,27 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .mentions {
+    display: flex;
+    flex-direction: column;
+    max-height: 180px;
+    overflow-y: auto;
+    background: #1c1c1f;
+    border-top: 1px solid #27272a;
+  }
+  .mention {
+    text-align: left;
+    background: transparent;
+    border: 0;
+    color: inherit;
+    font: inherit;
+    padding: 7px 14px;
+    cursor: pointer;
+  }
+  .mention.active,
+  .mention:hover {
+    background: #27272a;
+  }
   .composer {
     display: flex;
     align-items: center;
@@ -1252,7 +1470,8 @@
     padding: 10px 14px;
     border-top: 1px solid #27272a;
   }
-  .composer > input:not(.file-input) {
+  .composer > input:not(.file-input),
+  .composer > textarea {
     flex: 1;
     background: #1c1c1f;
     border: 1px solid #3f3f46;
@@ -1260,6 +1479,11 @@
     padding: 8px 10px;
     color: inherit;
     font: inherit;
+  }
+  .composer > textarea {
+    resize: none;
+    line-height: 1.35;
+    max-height: 140px;
   }
   .file-input {
     display: none;

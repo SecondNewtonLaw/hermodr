@@ -147,6 +147,15 @@ pub enum ServiceEvent {
     NamesUpdated { count: usize },
 }
 
+/// A group member, as the mention autocomplete needs it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Participant {
+    /// JID to put in `mentioned_jid` and to mention in the text.
+    pub jid: String,
+    /// Display name, from the address book when known.
+    pub name: String,
+}
+
 /// How the service should behave for one account.
 #[derive(Debug, Clone)]
 pub struct ServiceConfig {
@@ -381,10 +390,22 @@ impl Service {
                                     if let Some(alt) =
                                         inbound.info.source.sender_alt.as_ref().map(|j| j.to_string())
                                     {
-                                        if let Ok(Some(name)) = store.name_for(&alt) {
+                                        let known = store.name_for(&alt).ok().flatten();
+                                        let is_saved = known.is_some();
+                                        // Fall back to the phone number, never
+                                        // the unreadable LID.
+                                        let name = known.unwrap_or_else(|| {
+                                            alt.split('@').next().unwrap_or(&alt).to_string()
+                                        });
+                                        if is_saved {
                                             let _ = store.set_saved_name(&sender, &name);
                                             if !is_group && !from_me {
                                                 let _ = store.set_saved_name(&chat, &name);
+                                            }
+                                        } else {
+                                            let _ = store.set_name(&sender, &name);
+                                            if !is_group && !from_me {
+                                                let _ = store.set_name(&chat, &name);
                                             }
                                         }
                                     }
@@ -419,7 +440,7 @@ impl Service {
                                         continue;
                                     }
 
-                                    let Some(message) = incoming_message(
+                                    let Some(mut message) = incoming_message(
                                         inbound,
                                         client.as_deref(),
                                         media_dir.as_deref(),
@@ -428,6 +449,14 @@ impl Service {
                                     else {
                                         continue;
                                     };
+                                    // The wire text names mentions by number;
+                                    // store the display form so the conversation
+                                    // shows the name.
+                                    let mentions = mentioned_jids(&inbound.message);
+                                    if !mentions.is_empty() {
+                                        message.text =
+                                            replace_mentions(&message.text, &mentions, &store);
+                                    }
                                     let _ = store.upsert(&message);
                                     let _ = events.send(ServiceEvent::Message { message: Box::new(message) });
                                 }
@@ -571,18 +600,91 @@ impl Service {
 
     /// Sends a text message to a chat.
     ///
+    /// Group members for mention autocomplete, named from the address book
+    /// where possible.
+    ///
+    /// A one-to-one chat has no one to mention, so it returns nothing rather
+    /// than a one-entry list.
+    pub async fn participants(&self, chat: &str) -> Result<Vec<Participant>> {
+        let jid: Jid = chat.parse()?;
+        if !chat.ends_with("@g.us") {
+            return Ok(Vec::new());
+        }
+        let metadata = self
+            .client
+            .groups()
+            .fetch_metadata(&jid)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+        let mut seen = std::collections::HashSet::new();
+        let mut participants = Vec::new();
+        for member in &metadata.participants {
+            let mention = member.jid.to_non_ad().to_string();
+            if !seen.insert(mention.clone()) {
+                continue;
+            }
+            let candidates = [
+                member.phone_number.as_ref(),
+                member.lid.as_ref(),
+                Some(&member.jid),
+            ];
+            let name = candidates
+                .into_iter()
+                .flatten()
+                .find_map(|j| self.store.name_for(&j.to_string()).ok().flatten())
+                .unwrap_or_else(|| mention.split('@').next().unwrap_or(&mention).to_string());
+            participants.push(Participant { jid: mention, name });
+        }
+        participants.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        Ok(participants)
+    }
+
     /// The sent message is stored and dispatched locally. WhatsApp does not echo
     /// a message back to the device that sent it, so without this the sender
     /// would not see their own message until the store was next reloaded.
-    pub async fn send_text(&self, chat: &str, text: impl Into<String>) -> Result<()> {
+    pub async fn send_text(
+        &self,
+        chat: &str,
+        text: impl Into<String>,
+        mentions: Vec<String>,
+    ) -> Result<()> {
         let to: Jid = chat.parse()?;
         let text = text.into();
-        let result = self.client.send_text(to, text.clone()).await?;
+        // `@all` is a group mention, carried separately from member mentions.
+        let mention_all = mentions.iter().any(|m| m == "@all");
+        let mentioned: Vec<String> = mentions.iter().filter(|m| *m != "@all").cloned().collect();
+        let result = if mentioned.is_empty() && !mention_all {
+            self.client.send_text(to, text.clone()).await?
+        } else {
+            use whatsapp_rust::wacore::proto_helpers::MessageBuilderExt;
+            let mut context = wa::ContextInfo {
+                mentioned_jid: mentioned.clone(),
+                ..Default::default()
+            };
+            if mention_all {
+                context.group_mentions = vec![wa::GroupMention {
+                    group_jid: Some(chat.to_string()),
+                    group_subject: self.store.name_for(chat).ok().flatten(),
+                }];
+            }
+            self.client
+                .send_message(to, wa::Message::text_with_context(text.clone(), context))
+                .await?
+        };
+
+        // The wire text names mentions by number; store the display form so the
+        // conversation reads the same as the rest of the UI.
+        let text = if mentioned.is_empty() {
+            text
+        } else {
+            replace_mentions(&text, &mentioned, &self.store)
+        };
 
         let message = StoredMessage {
             chat: chat.to_string(),
             id: result.message_id.clone(),
-            sender: chat.to_string(),
+            sender: self.own_jid(),
             sender_name: None,
             timestamp: unix_now(),
             from_me: true,
@@ -601,6 +703,15 @@ impl Service {
         self.store.upsert(&message)?;
         let _ = self.events.send(ServiceEvent::Message { message: Box::new(message) });
         Ok(())
+    }
+
+    /// Our own JID, used as the sender of messages we send.
+    fn own_jid(&self) -> String {
+        self.client
+            .pn()
+            .or_else(|| self.client.lid())
+            .map(|j| j.to_non_ad().to_string())
+            .unwrap_or_default()
     }
 
     /// Where media is stored, if enabled.
@@ -624,6 +735,7 @@ impl Service {
         reply_to_id: &str,
         reply_to_sender: &str,
         reply_to_text: &str,
+        mentions: Vec<String>,
     ) -> Result<()> {
         let to: Jid = chat.parse()?;
         // The quoted author must be the address without a device suffix: a
@@ -634,17 +746,33 @@ impl Service {
 
         use whatsapp_rust::wacore::proto_helpers::build_quote_context_with_info;
         let quoted = wa::Message::text(reply_to_text);
-        let context =
-            build_quote_context_with_info(reply_to_id, &sender, &to, &to, &quoted);
+        let mention_all = mentions.iter().any(|m| m == "@all");
+        let mentioned: Vec<String> = mentions.iter().filter(|m| *m != "@all").cloned().collect();
+        let mut context = build_quote_context_with_info(reply_to_id, &sender, &to, &to, &quoted);
+        if !mentioned.is_empty() {
+            context.mentioned_jid = mentioned.clone();
+        }
+        if mention_all {
+            context.group_mentions = vec![wa::GroupMention {
+                group_jid: Some(chat.to_string()),
+                group_subject: self.store.name_for(chat).ok().flatten(),
+            }];
+        }
 
         use whatsapp_rust::wacore::proto_helpers::MessageBuilderExt;
         let message = wa::Message::text_with_context(text.clone(), context);
         let result = self.client.send_message(to, message).await?;
 
+        let text = if mentioned.is_empty() {
+            text
+        } else {
+            replace_mentions(&text, &mentioned, &self.store)
+        };
+
         let stored = StoredMessage {
             chat: chat.to_string(),
             id: result.message_id.clone(),
-            sender: chat.to_string(),
+            sender: self.own_jid(),
             sender_name: None,
             timestamp: unix_now(),
             from_me: true,
@@ -653,7 +781,11 @@ impl Service {
             media_path: None,
             reply_to_id: Some(reply_to_id.to_string()),
             reply_to_text: Some(reply_to_text.to_string()),
-            reply_to_sender: Some(reply_to_sender.to_string()),
+            reply_to_sender: Some(if sender.to_string() == self.own_jid() {
+                "@me".to_string()
+            } else {
+                reply_to_sender.to_string()
+            }),
             read: false,
             revoked: false,
             status: Some("pending".into()),
@@ -749,7 +881,7 @@ impl Service {
         let stored = StoredMessage {
             chat: chat.to_string(),
             id: result.message_id.clone(),
-            sender: chat.to_string(),
+            sender: self.own_jid(),
             sender_name: None,
             timestamp: unix_now(),
             from_me: true,
@@ -914,7 +1046,19 @@ async fn incoming_message(
     // A reply carries the quote in the message context. We do not keep the
     // original protobuf, so the text is copied out for display.
     let (reply_to_id, reply_to_text, reply_to_sender) = quote_of(&inbound.message)
-        .map(|(id, sender, text)| (Some(id), Some(text), Some(sender)))
+        .map(|(id, sender, text)| {
+            // Quoting our own message should read "You", not our phone number.
+            let mine = client
+                .map(|c| {
+                    [c.pn(), c.lid()]
+                        .into_iter()
+                        .flatten()
+                        .any(|j| j.to_non_ad().to_string() == sender)
+                })
+                .unwrap_or(false);
+            let sender = if mine { "@me".to_string() } else { sender };
+            (Some(id), Some(text), Some(sender))
+        })
         .unwrap_or((None, None, None));
 
     Some(StoredMessage {
@@ -1003,12 +1147,66 @@ fn backfill_lid_names(session_path: &std::path::Path, store: &MessageStore) {
         let Some(phone) = by_lid.get(bare) else {
             continue;
         };
-        let Some(name) = by_phone.get(phone.as_str()) else {
-            continue;
-        };
-        let _ = store.set_saved_name(&address, name);
-        let _ = store.set_saved_name(&format!("{bare}@lid"), name);
+        match by_phone.get(phone.as_str()) {
+            Some(name) => {
+                let _ = store.set_saved_name(&address, name);
+                let _ = store.set_saved_name(&format!("{bare}@lid"), name);
+            }
+            // Without a saved name, show the phone number instead of the LID,
+            // which nobody can read.
+            None => {
+                let _ = store.set_name(&address, phone);
+                let _ = store.set_name(&format!("{bare}@lid"), phone);
+            }
+        }
     }
+}
+
+/// The JIDs a message mentions, from whichever message type carries them.
+fn mentioned_jids(message: &wa::Message) -> Vec<String> {
+    use whatsapp_rust::wacore::proto_helpers::MessageExt;
+    let base = message.get_base_message();
+    let context = base
+        .extended_text_message
+        .as_option()
+        .and_then(|m| m.context_info.as_option())
+        .or_else(|| {
+            base.image_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            base.video_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
+            base.document_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        });
+    context.map(|c| c.mentioned_jid.clone()).unwrap_or_default()
+}
+
+/// Rewrites `@<number>` mention tokens into the name we know for that JID.
+///
+/// The wire identifies a mention by its number; the UI shows the name, so the
+/// stored text is the display form.
+fn replace_mentions(text: &str, mentions: &[String], store: &MessageStore) -> String {
+    let mut out = text.to_string();
+    for jid in mentions {
+        let user = jid.split('@').next().unwrap_or(jid);
+        let user = user.split(':').next().unwrap_or(user);
+        let bare = jid.split(':').next().unwrap_or(jid);
+        let name = store
+            .name_for(jid)
+            .ok()
+            .flatten()
+            .or_else(|| store.name_for(bare).ok().flatten())
+            .unwrap_or_else(|| user.to_string());
+        out = out.replace(&format!("@{user}"), &format!("@{name}"));
+    }
+    out
 }
 
 /// MIME type for an outgoing attachment, from its file extension.

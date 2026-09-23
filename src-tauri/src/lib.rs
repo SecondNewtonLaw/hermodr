@@ -187,10 +187,18 @@ async fn send_reply(
     reply_to_id: String,
     reply_to_sender: String,
     reply_to_text: String,
+    mentions: Option<Vec<String>>,
 ) -> Result<(), String> {
     let service = state.service()?;
     service
-        .send_reply(&chat, text, &reply_to_id, &reply_to_sender, &reply_to_text)
+        .send_reply(
+            &chat,
+            text,
+            &reply_to_id,
+            &reply_to_sender,
+            &reply_to_text,
+            mentions.unwrap_or_default(),
+        )
         .await
         .map_err(|e| e.to_string())
 }
@@ -281,10 +289,28 @@ fn read_file(path: String) -> Result<String, String> {
 
 /// Sends a text message to a chat.
 #[tauri::command]
-async fn send_text(state: State<'_, AppState>, chat: String, text: String) -> Result<(), String> {
+async fn send_text(
+    state: State<'_, AppState>,
+    chat: String,
+    text: String,
+    mentions: Option<Vec<String>>,
+) -> Result<(), String> {
     let service = state.service()?;
     service
-        .send_text(&chat, text)
+        .send_text(&chat, text, mentions.unwrap_or_default())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Group members for mention autocomplete.
+#[tauri::command]
+async fn participants(
+    state: State<'_, AppState>,
+    chat: String,
+) -> Result<Vec<hermodr_core::Participant>, String> {
+    state
+        .service()?
+        .participants(&chat)
         .await
         .map_err(|e| e.to_string())
 }
@@ -349,6 +375,7 @@ pub fn run() {
             send_text,
             open_path,
             read_file,
+            participants,
             qr_svg,
             get_settings,
             set_settings

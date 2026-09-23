@@ -10,6 +10,7 @@ const COMMANDS: &[&str] = &[
     "send_text",
     "open_path",
     "read_file",
+    "participants",
     "qr_svg",
     "get_settings",
     "set_settings",

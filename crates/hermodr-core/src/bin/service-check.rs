@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
                 println!("[check] connected");
                 if let Some(chat) = &send_target {
                     if !sent {
-                        match service.send_text(chat, "test from hermodr-core").await {
+                        match service.send_text(chat, "test from hermodr-core", Vec::new()).await {
                             Ok(()) => println!("[check] sent test message to {chat}"),
                             Err(e) => println!("[check] send failed: {e}"),
                         }

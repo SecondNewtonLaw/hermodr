@@ -20,6 +20,7 @@
     "allow-send-reply",
     "allow-send-media",
     "allow-open-path",
-    "allow-read-file"
+    "allow-read-file",
+    "allow-participants"
   ]
 }
