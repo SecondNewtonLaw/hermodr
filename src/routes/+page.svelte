@@ -809,6 +809,10 @@
     /* Without this a flex item refuses to shrink below its content, so a large
        image stretches the bubble instead of being scaled down to fit it. */
     min-width: 0;
+    /* The message list is a flex column, so bubbles shrink by default. With a
+       few hundred of them they squash to one line and `overflow: hidden` clips
+       the text away, which looks like every message collapsing. */
+    flex-shrink: 0;
     align-self: flex-start;
     background: #27272a;
     border-radius: 8px;
