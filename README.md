@@ -6,7 +6,7 @@ directly instead of embedding WhatsApp Web in a browser engine.
 ## The name
 
 **Hermóðr** (Old Norse `[ˈhermˌoːðz̠]`, anglicized *Hermod*, roughly
-**"HAIR-moth"**) — the `ð` is a voiced *th*, as in **"the"**, so the ending
+**"HAIR-moth"**)- the `ð` is a voiced *th*, as in **"the"**, so the ending
 sounds like "moth" said with a *th* rather than a hard *t*.
 
 The name is Old Norse, from `herr` ("war, host") + `móðr` ("spirit, courage,
