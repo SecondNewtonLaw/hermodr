@@ -90,6 +90,10 @@ pub struct ChatSummary {
     pub display_name: Option<String>,
     pub last_message_at: i64,
     pub last_text: String,
+    /// Whether the last message was sent by the account owner.
+    pub last_from_me: bool,
+    /// Resolved name of the last message's sender, when known.
+    pub last_sender_name: Option<String>,
     pub message_count: i64,
     /// Incoming messages the user has not seen yet.
     pub unread_count: i64,
@@ -138,9 +142,12 @@ impl MessageStore {
              -- Display names, learned from message push names and group queries.
              -- Kept separately from messages because one JID has one name and
              -- it should survive pruning of the messages that revealed it.
+             -- `saved` marks a name that came from the account's address book,
+             -- which outranks the push name a contact sets for themselves.
              CREATE TABLE IF NOT EXISTS names (
-                 jid  TEXT PRIMARY KEY,
-                 name TEXT NOT NULL
+                 jid   TEXT PRIMARY KEY,
+                 name  TEXT NOT NULL,
+                 saved INTEGER NOT NULL DEFAULT 0
              );",
         )?;
 
@@ -162,6 +169,19 @@ impl MessageStore {
                 conn.execute(&format!("ALTER TABLE messages ADD COLUMN {column} TEXT"), [])?;
             }
         }
+
+        let existing_names: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(names)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if !existing_names.iter().any(|c| c == "saved") {
+            conn.execute("ALTER TABLE names ADD COLUMN saved INTEGER NOT NULL DEFAULT 0", [])?;
+        }
+
+        // Status updates were once stored as a chat. Drop them so the list stops
+        // showing a "status" conversation.
+        conn.execute("DELETE FROM messages WHERE chat = 'status@broadcast'", [])?;
         if !existing.iter().any(|c| c == "read") {
             conn.execute(
                 "ALTER TABLE messages ADD COLUMN read INTEGER NOT NULL DEFAULT 0",
@@ -222,10 +242,11 @@ impl MessageStore {
         Ok(())
     }
 
-    /// Records a display name for a JID.
+    /// Records a display name for a JID, from a push name or group query.
     ///
     /// Empty names are ignored: a message with no push name should not erase a
-    /// name learned earlier.
+    /// name learned earlier. A name from the address book is never overwritten
+    /// by one the contact chose for themselves.
     pub fn set_name(&self, jid: &str, name: &str) -> Result<()> {
         let name = name.trim();
         if name.is_empty() || jid.is_empty() {
@@ -233,11 +254,63 @@ impl MessageStore {
         }
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO names (jid, name) VALUES (?1, ?2)
-             ON CONFLICT(jid) DO UPDATE SET name = excluded.name",
+            "INSERT INTO names (jid, name, saved) VALUES (?1, ?2, 0)
+             ON CONFLICT(jid) DO UPDATE SET name = excluded.name WHERE saved = 0",
             params![jid, name],
         )?;
         Ok(())
+    }
+
+    /// Records a name from the account's address book, which takes priority
+    /// over any push name already stored.
+    pub fn set_saved_name(&self, jid: &str, name: &str) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() || jid.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO names (jid, name, saved) VALUES (?1, ?2, 1)
+             ON CONFLICT(jid) DO UPDATE SET name = excluded.name, saved = 1",
+            params![jid, name],
+        )?;
+        Ok(())
+    }
+
+    /// Drops the address-book flag when a contact is removed, so the name can
+    /// later be replaced by a push name.
+    pub fn clear_saved_name(&self, jid: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE names SET saved = 0 WHERE jid = ?1", params![jid])?;
+        Ok(())
+    }
+
+    /// How many address-book names are stored.
+    pub fn saved_name_count(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.query_row("SELECT COUNT(*) FROM names WHERE saved = 1", [], |r| {
+            r.get::<_, i64>(0)
+        })?;
+        Ok(count as usize)
+    }
+
+    /// Every JID that appears as a message sender or a chat.
+    pub fn known_addresses(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT sender FROM messages UNION SELECT DISTINCT chat FROM messages")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    /// Address-book names, as `(jid, name)` pairs.
+    pub fn saved_names(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT jid, name FROM names WHERE saved = 1")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
     /// The display name for a JID, if known.
@@ -347,12 +420,21 @@ impl MessageStore {
         for row in rows {
             let (chat, last_message_at, message_count, display_name, unread_count) = row?;
             // The preview is fetched separately so the aggregate query stays simple.
-            let last_text = conn
+            let (last_text, last_from_me, last_sender_name) = conn
                 .query_row(
-                    "SELECT text FROM messages WHERE chat = ?1
-                     ORDER BY timestamp DESC LIMIT 1",
+                    "SELECT m.text, m.from_me, n.name
+                     FROM messages m
+                     LEFT JOIN names n ON n.jid = m.sender
+                     WHERE m.chat = ?1
+                     ORDER BY m.timestamp DESC LIMIT 1",
                     params![chat],
-                    |r| r.get::<_, String>(0),
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i32>(1)? != 0,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
+                    },
                 )
                 .unwrap_or_default();
             summaries.push(ChatSummary {
@@ -360,6 +442,8 @@ impl MessageStore {
                 display_name,
                 last_message_at,
                 last_text,
+                last_from_me,
+                last_sender_name,
                 message_count,
                 unread_count,
             });
@@ -496,7 +580,9 @@ mod tests {
                  read INTEGER NOT NULL DEFAULT 0,
                  revoked INTEGER NOT NULL DEFAULT 0,
                  status TEXT, PRIMARY KEY (chat, id));
-             CREATE TABLE names (jid TEXT PRIMARY KEY, name TEXT NOT NULL);",
+             CREATE TABLE names (
+                 jid TEXT PRIMARY KEY, name TEXT NOT NULL,
+                 saved INTEGER NOT NULL DEFAULT 0);",
         ).unwrap();
         s
     }

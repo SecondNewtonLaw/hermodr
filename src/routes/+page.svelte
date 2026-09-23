@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { convertFileSrc, invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
+  import AudioPlayer from "$lib/AudioPlayer.svelte";
 
   type StoredMessage = {
     chat: string;
@@ -25,6 +26,8 @@
     display_name: string | null;
     last_message_at: number;
     last_text: string;
+    last_from_me: boolean;
+    last_sender_name: string | null;
     message_count: number;
     unread_count: number;
   };
@@ -39,12 +42,22 @@
   };
   type ConnectionState = { started: boolean; connected: boolean; qr: string | null };
 
+  /** A file staged in the composer, before it is sent. */
+  type PendingMedia = {
+    id: number;
+    file: File;
+    url: string;
+    kind: "image" | "video" | "other";
+    caption: string;
+  };
+
   type ServiceEvent =
     | { kind: "qrCode"; code: string }
     | { kind: "connected" }
     | { kind: "disconnected" }
     | { kind: "message"; message: StoredMessage }
-    | { kind: "retentionApplied"; removed: number };
+    | { kind: "retentionApplied"; removed: number }
+    | { kind: "namesUpdated"; count: number };
 
   let connected = $state(false);
   let connecting = $state(false);
@@ -67,15 +80,26 @@
   /** True while the user is reading older messages with new ones below. */
   let scrolledUp = $state(false);
   let filePicker: HTMLInputElement | undefined = $state();
-  /** Attachment staged for review before it is sent. */
-  let pending: { file: File; url: string; isImage: boolean; isVideo: boolean } | null = $state(null);
-  let caption = $state("");
+  /** Files staged for review before they are sent, shown above the composer. */
+  let pending: PendingMedia[] = $state([]);
+  /** Id of the staged file whose preview/caption sheet is open. */
+  let previewId = $state<number | null>(null);
+  let pendingSeq = 0;
+  let previewItem = $derived(pending.find((p) => p.id === previewId) ?? null);
 
   function bareJid(jid: string) {
     return jid.replace(/@.*$/, "");
   }
   function chatLabel(chat: ChatSummary) {
     return chat.display_name || bareJid(chat.chat);
+  }
+  /** Preview line: our own messages are prefixed "You", group peers by name. */
+  function chatPreview(chat: ChatSummary) {
+    if (chat.last_from_me) return `You: ${chat.last_text}`;
+    if (chat.chat.endsWith("@g.us") && chat.last_sender_name) {
+      return `${chat.last_sender_name}: ${chat.last_text}`;
+    }
+    return chat.last_text;
   }
   function senderLabel(message: StoredMessage) {
     return message.sender_name || bareJid(message.sender);
@@ -228,36 +252,93 @@
   /** Stages a file for review rather than sending it straight away. */
   async function stageFile(file: File) {
     try {
-      // Release the previous preview before replacing it.
-      if (pending?.url.startsWith("blob:")) URL.revokeObjectURL(pending.url);
+      const kind = file.type.startsWith("image/")
+        ? "image"
+        : file.type.startsWith("video/")
+          ? "video"
+          : "other";
 
-      const isImage = file.type.startsWith("image/");
-      const isVideo = file.type.startsWith("video/");
+      let url = "";
+      if (kind === "image") url = await imagePreview(file);
+      else if (kind === "video") url = URL.createObjectURL(file);
 
-      let url: string;
-      if (isImage) {
-        url = await imagePreview(file);
-      } else if (isVideo) {
-        // A video element needs a real URL; it is not decoded until played.
-        url = URL.createObjectURL(file);
-      } else {
-        url = "";
-      }
-
-      pending = { file, url, isImage, isVideo };
-      caption = "";
+      pending = [...pending, { id: pendingSeq++, file, url, kind, caption: "" }];
     } catch (e) {
       // Staging must never take the chat down with it.
-      pending = null;
       error = `Could not preview that file: ${e}`;
     }
   }
 
   function attach(event: Event) {
     const input = event.currentTarget as HTMLInputElement;
-    const file = input.files?.[0];
+    const files = Array.from(input.files ?? []);
     input.value = "";
-    if (file) void stageFile(file);
+    for (const file of files) void stageFile(file);
+  }
+
+  /** Media extensions that can be staged from a pasted file path. */
+  const PASTABLE = /\.(jpe?g|png|gif|webp|mp4|mov|m4v|webm|mkv|ogg|opus|mp3|m4a|aac|wav)$/i;
+
+  function mimeForName(name: string) {
+    const extension = name.slice(name.lastIndexOf(".") + 1).toLowerCase();
+    const table: Record<string, string> = {
+      jpg: "image/jpeg",
+      jpeg: "image/jpeg",
+      png: "image/png",
+      gif: "image/gif",
+      webp: "image/webp",
+      mp4: "video/mp4",
+      mov: "video/mp4",
+      m4v: "video/mp4",
+      webm: "video/webm",
+      mkv: "video/x-matroska",
+      ogg: "audio/ogg",
+      opus: "audio/ogg",
+      mp3: "audio/mpeg",
+      m4a: "audio/mp4",
+      aac: "audio/mp4",
+      wav: "audio/wav",
+    };
+    return table[extension] ?? "application/octet-stream";
+  }
+
+  /**
+   * Reads a pasted file, either as clipboard bytes or from a copied file path.
+   *
+   * WebKitGTK does not put clipboard images in the paste event's
+   * `clipboardData`; only the async clipboard API reaches them. Copying a file
+   * in the file manager usually exposes just a `text/uri-list`, so that path is
+   * read back through the shell (restricted to media extensions) instead.
+   */
+  async function clipboardFile(): Promise<File | null> {
+    try {
+      const items = await navigator.clipboard?.read();
+      for (const item of items ?? []) {
+        const media = item.types.find(
+          (t) => t.startsWith("image/") || t.startsWith("video/") || t.startsWith("audio/"),
+        );
+        if (media) {
+          const blob = await item.getType(media);
+          return new File([blob], "pasted-media", { type: media });
+        }
+        if (item.types.includes("text/uri-list")) {
+          const text = await (await item.getType("text/uri-list")).text();
+          const uri = text
+            .split("\n")
+            .map((line) => line.trim())
+            .find((line) => line.length > 0);
+          if (!uri?.startsWith("file://")) continue;
+          const path = decodeURIComponent(new URL(uri).pathname);
+          if (!PASTABLE.test(path)) continue;
+          const data = await invoke<string>("read_file", { path });
+          const bytes = Uint8Array.from(atob(data), (c) => c.charCodeAt(0));
+          return new File([bytes], path.split("/").pop() ?? "pasted", { type: mimeForName(path) });
+        }
+      }
+    } catch {
+      // Nothing readable; the caller falls back to a hint.
+    }
+    return null;
   }
 
   /**
@@ -270,52 +351,77 @@
    * a load, and the panic aborts the process. So anything file-like is
    * swallowed; only real image bytes are staged, and plain text stays native.
    */
-  function onPaste(event: ClipboardEvent) {
+  async function onPaste(event: ClipboardEvent) {
     const data = event.clipboardData;
-    if (!data) return;
-    const image = Array.from(data.items).find((i) => i.type.startsWith("image/"));
-    const isUriList = Array.from(data.types).includes("text/uri-list");
-    if (!image && !isUriList) return;
-    event.preventDefault();
-    const file = image?.getAsFile();
+    const item = data
+      ? Array.from(data.items).find(
+          (i) => i.type.startsWith("image/") || i.type.startsWith("video/"),
+        )
+      : undefined;
+    const isUriList = data ? Array.from(data.types).includes("text/uri-list") : false;
+    const isPlainText =
+      !item && !isUriList && !!data && Array.from(data.types).includes("text/plain");
+    if (isPlainText) return;
+    if (item || isUriList || data) event.preventDefault();
+
+    const file = item?.getAsFile() ?? (await clipboardFile());
     if (file) void stageFile(file);
-    else error = "To attach that, use the 📎 button.";
+    else if (isUriList) error = "Could not read that file. Try the 📎 button.";
   }
 
   /** Dropping files stages them; dropping anything else must not navigate. */
   function onDrop(event: DragEvent) {
     event.preventDefault();
-    const file = event.dataTransfer?.files?.[0];
-    if (file) void stageFile(file);
+    for (const file of Array.from(event.dataTransfer?.files ?? [])) void stageFile(file);
   }
 
-  function cancelPending() {
-    if (pending?.url.startsWith("blob:")) URL.revokeObjectURL(pending.url);
-    pending = null;
-    caption = "";
+  function removePending(id: number) {
+    const item = pending.find((p) => p.id === id);
+    if (item?.url.startsWith("blob:")) URL.revokeObjectURL(item.url);
+    pending = pending.filter((p) => p.id !== id);
+    if (previewId === id) previewId = null;
+  }
+
+  function clearPending() {
+    for (const item of pending) {
+      if (item.url.startsWith("blob:")) URL.revokeObjectURL(item.url);
+    }
+    pending = [];
+    previewId = null;
   }
 
   async function sendPending() {
-    if (!pending || !selectedChat) return;
-    const { file } = pending;
+    if (!selectedChat || pending.length === 0) return;
+    const items = [...pending];
     try {
-      const buffer = new Uint8Array(await file.arrayBuffer());
-      // Base64 keeps the payload a single IPC value. Fine for the images and
-      // documents a picker is normally used for.
-      let binary = "";
-      for (let i = 0; i < buffer.length; i += 0x8000) {
-        binary += String.fromCharCode(...buffer.subarray(i, i + 0x8000));
+      for (const item of items) {
+        const buffer = new Uint8Array(await item.file.arrayBuffer());
+        // Base64 keeps the payload a single IPC value. Fine for the images and
+        // documents a picker is normally used for.
+        let binary = "";
+        for (let i = 0; i < buffer.length; i += 0x8000) {
+          binary += String.fromCharCode(...buffer.subarray(i, i + 0x8000));
+        }
+        await invoke("send_media", {
+          chat: selectedChat,
+          name: item.file.name,
+          data: btoa(binary),
+          caption: item.caption.trim() || null,
+        });
       }
-      await invoke("send_media", {
-        chat: selectedChat,
-        name: file.name,
-        data: btoa(binary),
-        caption: caption.trim() || null,
-      });
-      cancelPending();
+      clearPending();
       await reloadMessages();
       await refreshChats();
       scrollToBottom();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  /** Opens a downloaded media file in the desktop's default application. */
+  async function openMedia(path: string) {
+    try {
+      await invoke("open_path", { path });
     } catch (e) {
       error = String(e);
     }
@@ -404,6 +510,12 @@
               await reloadMessages();
             }
             break;
+          case "namesUpdated":
+            // Address-book names arrived after the initial fetch, so the cached
+            // display names are stale until both lists reload.
+            await refreshChats();
+            await reloadMessages();
+            break;
         }
       });
 
@@ -469,7 +581,7 @@
             >
               <span class="name">{chatLabel(chat)}</span>
               <span class="time">{formatTime(chat.last_message_at)}</span>
-              <span class="preview">{chat.last_text}</span>
+              <span class="preview">{chatPreview(chat)}</span>
               {#if chat.unread_count > 0}
                 <span class="badge">{chat.unread_count > 99 ? "99+" : chat.unread_count}</span>
               {/if}
@@ -506,11 +618,28 @@
                 {/if}
 
                 {#if message.media_kind === "image" && message.media_path}
-                <img class="media" src={convertFileSrc(message.media_path)} alt={message.text} />
+                  <button
+                    class="media-button"
+                    title="Open in image viewer"
+                    onclick={() => openMedia(message.media_path!)}>
+                    <img class="media" src={convertFileSrc(message.media_path)} alt={message.text} />
+                  </button>
+                {:else if message.media_kind === "video" && message.media_path}
+                  <button
+                    class="media-button video"
+                    title="Open in video player"
+                    onclick={() => openMedia(message.media_path!)}>
+                    <span class="video-face">🎬</span>
+                    <span class="video-label">
+                      {message.text && !message.text.startsWith("[") ? message.text : "Video"}
+                    </span>
+                  </button>
+                {:else if message.media_kind === "audio" && message.media_path}
+                  <AudioPlayer path={message.media_path} />
                 {:else if message.media_kind && message.media_path}
-                  <a class="file" href={convertFileSrc(message.media_path)} target="_blank">
+                  <button class="file" onclick={() => openMedia(message.media_path!)}>
                     {message.text || message.media_kind}
-                  </a>
+                  </button>
                 {:else}
                   <span class="text">{message.text}</span>
                 {/if}
@@ -548,24 +677,38 @@
           </div>
         {/if}
 
-        {#if pending}
-          <div class="attach-preview">
-            {#if pending.isImage}
-              <img src={pending.url} alt="Attachment preview" />
-            {:else if pending.isVideo}
-              <!-- svelte-ignore a11y_media_has_caption -->
-              <video src={pending.url} controls></video>
-            {:else}
-              <span class="file-name">{pending.file.name}</span>
-            {/if}
-            <input
-              class="caption"
-              bind:value={caption}
-              placeholder="Add a caption"
-              autocomplete="off"
-            />
-            <button class="primary" onclick={sendPending}>Send</button>
-            <button class="icon" title="Cancel" onclick={cancelPending}>×</button>
+        {#if pending.length > 0}
+          <div class="pending">
+            {#each pending as item (item.id)}
+              <div class="pending-item">
+                <button
+                  class="pending-thumb"
+                  title="Preview and caption"
+                  onclick={() => (previewId = item.id)}>
+                  {#if item.kind === "image"}
+                    <img src={item.url} alt={item.file.name} />
+                  {:else if item.kind === "video"}
+                    <!-- svelte-ignore a11y_media_has_caption -->
+                    <video src={item.url} preload="metadata" muted></video>
+                    <span class="play-badge">▶</span>
+                  {:else}
+                    <span class="file-icon">📄</span>
+                  {/if}
+                </button>
+                <span class="pending-name" title={item.file.name}>{item.file.name}</span>
+                {#if item.caption}
+                  <span class="pending-caption">{item.caption}</span>
+                {/if}
+                <button
+                  class="icon remove"
+                  title="Remove"
+                  onclick={() => removePending(item.id)}>×</button
+                >
+              </div>
+            {/each}
+            <button class="primary" onclick={sendPending}>
+              Send{pending.length > 1 ? ` ${pending.length}` : ""}
+            </button>
           </div>
         {/if}
 
@@ -579,6 +722,7 @@
           <input
             class="file-input"
             type="file"
+            multiple
             bind:this={filePicker}
             onchange={attach}
           />
@@ -593,6 +737,40 @@
         <div class="placeholder">Select a conversation</div>
       {/if}
     </section>
+  </div>
+{/if}
+
+{#if previewItem}
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <div
+    class="sheet-backdrop"
+    role="presentation"
+    onclick={(e) => {
+      if (e.target === e.currentTarget) previewId = null;
+    }}>
+    <div
+      class="sheet preview-sheet"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Attachment preview">
+      {#if previewItem.kind === "image"}
+        <img class="preview-large" src={previewItem.url} alt={previewItem.file.name} />
+      {:else if previewItem.kind === "video"}
+        <!-- svelte-ignore a11y_media_has_caption -->
+        <video class="preview-large" src={previewItem.url} controls></video>
+      {:else}
+        <span class="file-icon large">📄</span>
+      {/if}
+      <span class="pending-name">{previewItem.file.name}</span>
+      <input
+        class="caption"
+        value={previewItem.caption}
+        oninput={(e) => previewItem && (previewItem.caption = e.currentTarget.value)}
+        placeholder="Add a caption"
+        autocomplete="off"
+      />
+      <button class="primary" onclick={() => (previewId = null)}>Done</button>
+    </div>
   </div>
 {/if}
 
@@ -857,7 +1035,64 @@
     display: block;
   }
   .file {
+    background: transparent;
+    border: 0;
+    padding: 0;
+    font: inherit;
     color: #93c5fd;
+    cursor: pointer;
+    text-align: left;
+  }
+  /* Media opens in the system viewer, so the whole preview is the button. */
+  .media-button {
+    position: relative;
+    display: block;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: zoom-in;
+    line-height: 0;
+  }
+  .media-button.video {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 14px 16px;
+    cursor: pointer;
+    background: #111214;
+    border-radius: 6px;
+    min-width: 180px;
+    min-height: 100px;
+  }
+  .video-face {
+    font-size: 28px;
+  }
+  .video-label {
+    font-size: 12px;
+    color: #a1a1aa;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .play-badge {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #e4e4e7;
+    font-size: 28px;
+    text-shadow: 0 1px 6px rgba(0, 0, 0, 0.8);
+    pointer-events: none;
+  }
+  .file-icon {
+    font-size: 28px;
+  }
+  .file-icon.large {
+    font-size: 56px;
   }
   .meta {
     font-size: 10px;
@@ -896,33 +1131,85 @@
     font: inherit;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
   }
-  .attach-preview {
+  .pending {
     display: flex;
-    align-items: center;
-    gap: 10px;
+    align-items: flex-end;
+    flex-wrap: wrap;
+    gap: 12px;
     padding: 8px 14px;
     background: #1c1c1f;
     border-top: 1px solid #27272a;
   }
-  .attach-preview img,
-  .attach-preview video {
-    max-height: 72px;
-    max-width: 120px;
-    border-radius: 6px;
-    display: block;
+  .pending-item {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: 120px;
   }
-  .attach-preview .caption {
-    flex: 1;
+  .pending-thumb {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    width: 120px;
+    height: 72px;
+    overflow: hidden;
+    border: 1px solid #3f3f46;
+    border-radius: 6px;
+    background: #111214;
+    color: #e4e4e7;
+    cursor: pointer;
+  }
+  .pending-thumb img,
+  .pending-thumb video {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+  .pending-name {
+    font-size: 11px;
+    color: #a1a1aa;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .pending-caption {
+    font-size: 11px;
+    color: #86efac;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .pending .remove {
+    position: absolute;
+    top: -6px;
+    right: -6px;
+    width: 18px;
+    height: 18px;
+    border-radius: 999px;
+    background: #3f3f46;
+    color: #e4e4e7;
+    font-size: 12px;
+    line-height: 1;
+  }
+  .caption {
     background: #111214;
     border: 1px solid #3f3f46;
     border-radius: 6px;
-    padding: 6px 10px;
+    padding: 8px 10px;
     color: inherit;
     font: inherit;
   }
-  .file-name {
-    color: #a1a1aa;
-    font-size: 13px;
+  .preview-sheet {
+    width: min(680px, 80vw);
+  }
+  .preview-large {
+    max-width: 100%;
+    max-height: 60vh;
+    border-radius: 8px;
+    object-fit: contain;
   }
   .quote-author {
     display: block;

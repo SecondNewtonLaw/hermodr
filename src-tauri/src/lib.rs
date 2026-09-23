@@ -12,7 +12,7 @@ use std::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
 use hermodr_core::{ChatSummary, Retention, Service, ServiceConfig, StoredMessage};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 /// Event name the frontend listens on for service updates.
 const SERVICE_EVENT: &str = "service-event";
@@ -216,6 +216,69 @@ async fn send_media(
         .map_err(|e| e.to_string())
 }
 
+/// Opens a downloaded media file with the desktop's default application.
+///
+/// The path is restricted to the configured media folder. The webview is the
+/// least trusted part of the app, and it must not be able to ask the shell to
+/// open arbitrary files.
+#[tauri::command]
+fn open_path(app: AppHandle, state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let configured = state
+        .service
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|service| service.media_dir())
+        .or_else(|| config_for(&app, &state.settings.lock().unwrap()).media_dir);
+
+    let dir = configured
+        .and_then(|dir| std::fs::canonicalize(dir).ok())
+        .ok_or("no media folder is configured")?;
+    let target = std::fs::canonicalize(&path).map_err(|e| e.to_string())?;
+    if !target.starts_with(&dir) {
+        return Err("refusing to open a file outside the media folder".into());
+    }
+
+    #[cfg(target_os = "linux")]
+    let spawned = std::process::Command::new("xdg-open").arg(&target).spawn();
+    #[cfg(target_os = "macos")]
+    let spawned = std::process::Command::new("open").arg(&target).spawn();
+    #[cfg(target_os = "windows")]
+    let spawned = std::process::Command::new("cmd")
+        .args(["/C", "start", ""])
+        .arg(&target)
+        .spawn();
+
+    spawned.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Media extensions the renderer may read.
+const READABLE_EXTENSIONS: &[&str] = &[
+    "jpg", "jpeg", "png", "gif", "webp", "mp4", "mov", "m4v", "webm", "mkv", "ogg", "opus", "mp3",
+    "m4a", "aac", "wav",
+];
+
+/// Reads a media file and returns it base64-encoded.
+///
+/// WebKitGTK's media pipeline cannot load the custom asset scheme, so audio and
+/// video have to arrive as bytes and be turned into a blob URL by the page. The
+/// extension allowlist keeps this from becoming a general file-read primitive,
+/// which matters because a pasted file can live anywhere on disk.
+#[tauri::command]
+fn read_file(path: String) -> Result<String, String> {
+    let extension = std::path::Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !READABLE_EXTENSIONS.contains(&extension.as_str()) {
+        return Err("unsupported file type".into());
+    }
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    Ok(BASE64.encode(bytes))
+}
+
 /// Sends a text message to a chat.
 #[tauri::command]
 async fn send_text(state: State<'_, AppState>, chat: String, text: String) -> Result<(), String> {
@@ -260,6 +323,18 @@ pub fn run() {
                 service: Mutex::new(None),
                 settings: Mutex::new(UiSettings::default()),
             });
+
+            // Built here rather than from the config so clipboard access can be
+            // turned on. WebKitGTK only hands pasted images to the page when
+            // `javascript_can_access_clipboard` is set, and it does not deliver
+            // them through the paste event's clipboardData.
+            WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
+                .title("Hermóðr")
+                .inner_size(1000.0, 720.0)
+                .min_inner_size(480.0, 360.0)
+                .enable_clipboard_access()
+                .build()?;
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -272,6 +347,8 @@ pub fn run() {
             send_reply,
             send_media,
             send_text,
+            open_path,
+            read_file,
             qr_svg,
             get_settings,
             set_settings

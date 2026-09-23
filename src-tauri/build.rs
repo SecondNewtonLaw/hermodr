@@ -8,6 +8,8 @@ const COMMANDS: &[&str] = &[
     "send_reply",
     "send_media",
     "send_text",
+    "open_path",
+    "read_file",
     "qr_svg",
     "get_settings",
     "set_settings",

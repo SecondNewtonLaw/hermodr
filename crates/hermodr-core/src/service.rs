@@ -18,13 +18,14 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 use whatsapp_rust::{
     download::{Downloadable, MediaType},
-    media::{self, DocumentOptions, ImageOptions},
+    media::{self, AudioOptions, DocumentOptions, ImageOptions, VideoOptions},
     prelude::*,
     wacore::msg_secret::MsgSecretRetention,
     wacore::types::presence::ReceiptType,
     wacore::types::events::Event,
     wacore_binary::builder::NodeBuilder,
     CacheConfig,
+    WAPatchName,
 };
 
 use crate::{
@@ -141,6 +142,9 @@ pub enum ServiceEvent {
     Message { message: Box<StoredMessage> },
     /// Message history was changed by retention, so the UI should refresh.
     RetentionApplied { removed: usize },
+    /// Address-book names were learned, so cached chats and messages now hold
+    /// stale display names and should be refetched.
+    NamesUpdated { count: usize },
 }
 
 /// How the service should behave for one account.
@@ -247,6 +251,8 @@ impl Service {
 
         let qr_state = Arc::new(Mutex::new(None));
         let connected_state = Arc::new(AtomicBool::new(false));
+        // Whether the address book has already been replayed this run.
+        let names_resynced = Arc::new(AtomicBool::new(false));
         // The client only exists once the bot is built, but the message handler
         // needs it to download media. A OnceLock bridges that ordering.
         let client_slot: Arc<std::sync::OnceLock<Arc<Client>>> =
@@ -279,15 +285,53 @@ impl Service {
                 let events = events.clone();
                 let qr_state = qr_state.clone();
                 let connected_state = connected_state.clone();
-                move |_client| {
+                let names_resynced = names_resynced.clone();
+                let store = store.clone();
+                let session_path = config.session_path.clone();
+                move |client| {
                     let events = events.clone();
                     let qr_state = qr_state.clone();
                     let connected_state = connected_state.clone();
+                    let names_resynced = names_resynced.clone();
+                    let store = store.clone();
+                    let session_path = session_path.clone();
                     async move {
                         connected_state.store(true, Ordering::SeqCst);
                         // The code is spent once paired.
                         *qr_state.lock().unwrap() = None;
                         let _ = events.send(ServiceEvent::Connected);
+
+                        // Saved contact names reach the client as app-state
+                        // patches, and an already-paired session has none left
+                        // to deliver. Replay the address book once per run so
+                        // the names are learned.
+                        if !names_resynced.swap(true, Ordering::SeqCst) {
+                            let client = client.clone();
+                            let events = events.clone();
+                            let session_path = session_path.clone();
+                            tokio::spawn(async move {
+                                match client
+                                    .resync_app_state_collection(WAPatchName::CriticalUnblockLow)
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        backfill_lid_names(&session_path, &store);
+                                        if let Ok(count) = store.saved_name_count() {
+                                            println!(
+                                                "[service] address book: {count} saved name(s)"
+                                            );
+                                            if count > 0 {
+                                                let _ =
+                                                    events.send(ServiceEvent::NamesUpdated { count });
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[service] contact resync failed: {e}");
+                                    }
+                                }
+                            });
+                        }
                     }
                 }
             })
@@ -297,6 +341,8 @@ impl Service {
                     EventKind::Disconnected,
                     EventKind::Receipt,
                     EventKind::ServerAck,
+                    EventKind::ContactUpdate,
+                    EventKind::ContactRemoved,
                 ],
                 move |event, _client| {
                     let store = store_for_events.clone();
@@ -315,11 +361,43 @@ impl Service {
                                     let push_name = inbound.info.push_name.to_string();
                                     let chat = inbound.info.source.chat.to_string();
                                     let sender = inbound.info.source.sender.to_string();
+                                    let is_group = inbound.info.source.is_group
+                                        || chat.ends_with("@g.us");
+                                    let from_me = inbound.info.source.is_from_me;
+
+                                    // Status updates are not a conversation; keep
+                                    // them out of the store so they never show up
+                                    // as a chat.
+                                    if chat == "status@broadcast" {
+                                        continue;
+                                    }
+
+                                    // Address-book names are keyed by phone
+                                    // number, but an LID-addressed chat names
+                                    // its sender with a LID, so the two never
+                                    // match on their own. The source carries
+                                    // the other form; copy the name across so
+                                    // the saved one is what gets shown.
+                                    if let Some(alt) =
+                                        inbound.info.source.sender_alt.as_ref().map(|j| j.to_string())
+                                    {
+                                        if let Ok(Some(name)) = store.name_for(&alt) {
+                                            let _ = store.set_saved_name(&sender, &name);
+                                            if !is_group && !from_me {
+                                                let _ = store.set_saved_name(&chat, &name);
+                                            }
+                                        }
+                                    }
+
                                     if !push_name.is_empty() {
+                                        // Push names never override a saved one.
                                         let _ = store.set_name(&sender, &push_name);
                                         // A one-to-one chat is named after its
-                                        // contact, so the same name applies.
-                                        if !inbound.info.source.is_group {
+                                        // contact. A group is named by its
+                                        // subject, and a message we sent must
+                                        // never name a chat after us, which is
+                                        // what turned a group into our own name.
+                                        if !is_group && !from_me {
                                             let _ = store.set_name(&chat, &push_name);
                                         }
                                     }
@@ -400,6 +478,22 @@ impl Service {
                                         }
                                     }
                                 }
+                            }
+                            // The name the user saved for a contact comes from
+                            // the address book and outranks the push name the
+                            // contact set for themselves.
+                            Event::ContactUpdate(update) => {
+                                let name = update
+                                    .action
+                                    .full_name
+                                    .as_deref()
+                                    .or(update.action.first_name.as_deref());
+                                if let Some(name) = name.filter(|n| !n.trim().is_empty()) {
+                                    let _ = store.set_saved_name(&update.jid.to_string(), name);
+                                }
+                            }
+                            Event::ContactRemoved(removed) => {
+                                let _ = store.clear_saved_name(&removed.jid.to_string());
                             }
                             _ => {}
                         }
@@ -582,44 +676,60 @@ impl Service {
     ) -> Result<()> {
         let to: Jid = chat.parse()?;
         let file_name = file_name.to_string();
+        let extension = std::path::Path::new(&file_name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
 
-        let is_image = matches!(
-            std::path::Path::new(&file_name)
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_ascii_lowercase())
-                .as_deref(),
-            Some("jpg" | "jpeg" | "png" | "gif" | "webp")
-        );
+        // The extension decides how the receiver renders the file, so a video
+        // only arrives as a video (not a document) if it is sent as one.
+        let (media_type, kind) = match extension.as_str() {
+            "jpg" | "jpeg" | "png" | "gif" | "webp" => (MediaType::Image, "image"),
+            "mp4" | "mov" | "m4v" | "webm" | "mkv" => (MediaType::Video, "video"),
+            "ogg" | "opus" | "mp3" | "m4a" | "aac" | "wav" => (MediaType::Audio, "audio"),
+            _ => (MediaType::Document, "document"),
+        };
 
-        let upload = self
-            .client
-            .upload(bytes.clone(), if is_image { MediaType::Image } else { MediaType::Document }, Default::default())
-            .await?;
+        let upload = self.client.upload(bytes.clone(), media_type, Default::default()).await?;
 
-        let (message, kind) = if is_image {
-            (
-                media::image_message(
-                    upload,
-                    ImageOptions {
-                        caption: caption.clone(),
-                        ..Default::default()
-                    },
-                ),
-                "image",
-            )
-        } else {
-            (
-                media::document_message(
-                    upload,
-                    DocumentOptions {
-                        file_name: Some(file_name.clone()),
-                        caption: caption.clone(),
-                        ..Default::default()
-                    },
-                ),
-                "document",
-            )
+        let mimetype = mime_for(&extension).map(str::to_string);
+        let message = match kind {
+            "image" => media::image_message(
+                upload,
+                ImageOptions {
+                    caption: caption.clone(),
+                    mimetype,
+                    ..Default::default()
+                },
+            ),
+            "video" => media::video_message(
+                upload,
+                VideoOptions {
+                    caption: caption.clone(),
+                    mimetype,
+                    ..Default::default()
+                },
+            ),
+            "audio" => media::audio_message(
+                upload,
+                AudioOptions {
+                    mimetype,
+                    // An ogg/opus attachment is a voice note, which is how
+                    // WhatsApp records and replays them.
+                    ptt: Some(extension == "ogg"),
+                    ..Default::default()
+                },
+            ),
+            _ => media::document_message(
+                upload,
+                DocumentOptions {
+                    file_name: Some(file_name.clone()),
+                    caption: caption.clone(),
+                    mimetype,
+                    ..Default::default()
+                },
+            ),
         };
 
         let result = self.client.send_message(to, message).await?;
@@ -628,7 +738,8 @@ impl Service {
         let mut stored_path = None;
         if let Some(dir) = &self.media_dir() {
             if std::fs::create_dir_all(dir).is_ok() {
-                let dest = dir.join(format!("{}.{}", result.message_id, if is_image { "jpg" } else { "bin" }));
+                let name = if extension.is_empty() { "bin".to_string() } else { extension.clone() };
+                let dest = dir.join(format!("{}.{}", result.message_id, name));
                 if std::fs::write(&dest, &bytes).is_ok() {
                     stored_path = Some(dest.to_string_lossy().to_string());
                 }
@@ -841,6 +952,83 @@ fn extension_for(kind: &str, media_type: MediaType) -> &'static str {
     }
 }
 
+/// Copies address-book names onto the LID form of the same address.
+///
+/// The address book is keyed by phone number, while messages in an
+/// LID-addressed chat carry the LID. The library's own mapping table bridges
+/// the two, so names already learned apply to existing history instead of only
+/// to messages that arrive after this point.
+fn backfill_lid_names(session_path: &std::path::Path, store: &MessageStore) {
+    use std::collections::HashMap;
+
+    let Ok(saved) = store.saved_names() else {
+        return;
+    };
+    let by_phone: HashMap<&str, &str> = saved
+        .iter()
+        .filter_map(|(jid, name)| {
+            jid.strip_suffix("@s.whatsapp.net")
+                .map(|phone| (phone, name.as_str()))
+        })
+        .collect();
+    if by_phone.is_empty() {
+        return;
+    }
+
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        session_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return;
+    };
+    let mut by_lid: HashMap<String, String> = HashMap::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT lid, phone_number FROM lid_pn_mapping") {
+        if let Ok(rows) = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        {
+            for (lid, phone) in rows.flatten() {
+                by_lid.insert(lid, phone);
+            }
+        }
+    }
+
+    for address in store.known_addresses().unwrap_or_default() {
+        let Some((user, server)) = address.split_once('@') else {
+            continue;
+        };
+        if server != "lid" {
+            continue;
+        }
+        let bare = user.split(':').next().unwrap_or(user);
+        let Some(phone) = by_lid.get(bare) else {
+            continue;
+        };
+        let Some(name) = by_phone.get(phone.as_str()) else {
+            continue;
+        };
+        let _ = store.set_saved_name(&address, name);
+        let _ = store.set_saved_name(&format!("{bare}@lid"), name);
+    }
+}
+
+/// MIME type for an outgoing attachment, from its file extension.
+fn mime_for(extension: &str) -> Option<&'static str> {
+    Some(match extension {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "mp4" | "mov" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "ogg" | "opus" => "audio/ogg; codecs=opus",
+        "mp3" => "audio/mpeg",
+        "m4a" | "aac" => "audio/mp4",
+        "wav" => "audio/wav",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,6 +1042,7 @@ mod tests {
             ServiceEvent::Connected,
             ServiceEvent::Disconnected,
             ServiceEvent::RetentionApplied { removed: 3 },
+            ServiceEvent::NamesUpdated { count: 2 },
         ] {
             let json = serde_json::to_string(&event).expect("event must serialize");
             assert!(json.contains("\"kind\""), "missing tag: {json}");

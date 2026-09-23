@@ -11,15 +11,7 @@
   },
   "app": {
     "withGlobalTauri": true,
-    "windows": [
-      {
-        "title": "Herm\u00f3\u00f0r",
-        "width": 1000,
-        "height": 720,
-        "minWidth": 480,
-        "minHeight": 360
-      }
-    ],
+    "windows": [],
     "trayIcon": {
       "iconPath": "icons/32x32.png",
       "iconAsTemplate": false

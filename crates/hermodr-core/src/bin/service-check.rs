@@ -88,6 +88,9 @@ async fn main() -> Result<()> {
                 stats.pruned += removed;
                 println!("[check] retention removed {removed} message(s)");
             }
+            ServiceEvent::NamesUpdated { count } => {
+                println!("[check] address book: {count} saved name(s)");
+            }
         }
     }
 
