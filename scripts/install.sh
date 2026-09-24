@@ -46,7 +46,7 @@ Icon=hermodr
 Terminal=false
 Categories=Network;InstantMessaging;Chat;
 Keywords=whatsapp;chat;messaging;hermodr;
-StartupWMClass=hermodr
+StartupWMClass=Hermodr
 DESKTOP
 
 if command -v update-desktop-database >/dev/null; then
