@@ -30,8 +30,13 @@ if [ "${1:-}" = "--dev" ]; then
   cd "$ROOT" && exec pnpm tauri dev
 fi
 
-say "building a release bundle"
-(cd "$ROOT" && pnpm tauri build)
+say "building the frontend"
+(cd "$ROOT" && pnpm build)
+
+# Built with cargo rather than `pnpm tauri build`, so no bundle (and no
+# AppImage tooling) is needed for a local install.
+say "building the binary"
+(cd "$ROOT/src-tauri" && cargo build --release)
 
 say "installing the desktop entry"
 BIN_DIR="$HOME/.local/bin"

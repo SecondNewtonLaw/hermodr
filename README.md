@@ -1,5 +1,7 @@
 # Hermóðr
 
+![Hermóðr](assets/banner.jpg)
+
 A native WhatsApp desktop client. It speaks the WhatsApp multi-device protocol
 directly instead of embedding WhatsApp Web in a browser engine.
 
@@ -30,19 +32,18 @@ Against a real account, comparing the old webview approach with this one:
 
 | Metric | Altus (WhatsApp Web in a webview) | Hermóðr |
 | --- | --- | --- |
-| CPU, steady state | ~200% of one core, sustained | **2-4%** |
-| Memory | ~2.2 GB, climbing to ~23 GB | **35 MB** |
-| Memory under live traffic | 4.2 GB | **53 MB** |
+| CPU, idle | ~200% of one core, sustained | **~0.3%** |
+| Memory, whole app | ~2.2 GB, climbing to ~23 GB | **~600 MB** |
 | History downloaded at pairing | entire account (~20 GB) | none |
 | Message history stored | 604k+ rows, 774 MB | bounded by retention |
 
-The memory figures are Hermóðr's protocol/service process. The window adds a
-small WebKit UI process on top; the point is that nothing history-sized ever
-accumulates in either.
+Memory is the whole app. The protocol core is around 35 MB; the rest is the one
+WebKit webview that renders the UI, the only place a browser engine is used. The
+point is that nothing history-sized accumulates either way.
 
 CPU was sampled with `pidstat` in 30-second windows. Altus held 130-220% of one
 core the entire time and its RSS kept climbing toward the full 23 GB history, so
-it never reaches a true idle. Hermóðr sat between 1.5% and 4.5%.
+it never reaches a true idle. Hermóðr sits under 1% when idle.
 
 This is not a knock on Altus. It is a good project, and a fairly optimized one;
 the numbers above are a property of the approach, not of its authors. Any client
