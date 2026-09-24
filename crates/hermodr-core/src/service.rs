@@ -844,6 +844,10 @@ impl Service {
             read: false,
             revoked: false,
             mentioned: false,
+            preview_url: None,
+            preview_title: None,
+            preview_desc: None,
+            preview_thumb: None,
             status: Some("pending".into()),
         };
         self.store.upsert(&message)?;
@@ -1039,6 +1043,10 @@ impl Service {
             read: false,
             revoked: false,
             mentioned: false,
+            preview_url: None,
+            preview_title: None,
+            preview_desc: None,
+            preview_thumb: None,
             status: Some("pending".into()),
         };
         self.store.upsert(&stored)?;
@@ -1145,6 +1153,10 @@ impl Service {
             read: false,
             revoked: false,
             mentioned: false,
+            preview_url: None,
+            preview_title: None,
+            preview_desc: None,
+            preview_thumb: None,
             status: Some("pending".into()),
         };
         self.store.upsert(&stored)?;
@@ -1324,6 +1336,10 @@ async fn incoming_message(
         })
         .unwrap_or((None, None, None));
 
+    // A link preview rides on the extended text message.
+    let (preview_url, preview_title, preview_desc, preview_thumb) =
+        link_preview(&inbound.message, media_dir, &info.id.to_string());
+
     Some(StoredMessage {
         chat: info.source.chat.to_string(),
         id: info.id.to_string(),
@@ -1342,8 +1358,41 @@ async fn incoming_message(
         read: false,
         revoked: false,
         mentioned: false,
+        preview_url,
+        preview_title,
+        preview_desc,
+        preview_thumb,
         status: None,
     })
+}
+
+/// The link preview a message carries, with its thumbnail written next to the
+/// other media so the UI can show it.
+fn link_preview(
+    message: &wa::Message,
+    media_dir: Option<&std::path::Path>,
+    id: &str,
+) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+    use whatsapp_rust::wacore::proto_helpers::MessageExt;
+    let Some(text) = message
+        .get_base_message()
+        .extended_text_message
+        .as_option()
+    else {
+        return (None, None, None, None);
+    };
+    // `matched_text` is the URL as it appeared in the message.
+    let Some(url) = text.matched_text.clone() else {
+        return (None, None, None, None);
+    };
+    let thumb = text.jpeg_thumbnail.as_ref().and_then(|bytes| {
+        let dir = media_dir?;
+        std::fs::create_dir_all(dir).ok()?;
+        let path = dir.join(format!("{id}_thumb.jpg"));
+        std::fs::write(&path, bytes).ok()?;
+        Some(path.to_string_lossy().to_string())
+    });
+    (Some(url), text.title.clone(), text.description.clone(), thumb)
 }
 
 /// File extension for a downloaded media item.
@@ -1591,6 +1640,10 @@ mod tests {
                 read: false,
                 revoked: false,
                 mentioned: false,
+                preview_url: None,
+                preview_title: None,
+                preview_desc: None,
+                preview_thumb: None,
                 status: None,
             }),
         };

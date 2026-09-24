@@ -14,6 +14,7 @@ const COMMANDS: &[&str] = &[
     "group_info",
     "set_pinned",
     "search",
+    "open_url",
     "unread_mentions",
     "qr_svg",
     "get_settings",

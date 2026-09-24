@@ -343,6 +343,25 @@ async fn group_info(
         .map_err(|e| e.to_string())
 }
 
+/// Opens an http(s) URL in the desktop's default browser.
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("only http(s) links are opened".into());
+    }
+    #[cfg(target_os = "linux")]
+    let spawned = std::process::Command::new("xdg-open").arg(&url).spawn();
+    #[cfg(target_os = "macos")]
+    let spawned = std::process::Command::new("open").arg(&url).spawn();
+    #[cfg(target_os = "windows")]
+    let spawned = std::process::Command::new("cmd")
+        .args(["/C", "start", ""])
+        .arg(&url)
+        .spawn();
+    spawned.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Chats, contacts and groups matching a query.
 #[tauri::command]
 async fn search(
@@ -436,6 +455,7 @@ pub fn run() {
             set_pinned,
             unread_mentions,
             search,
+            open_url,
             qr_svg,
             get_settings,
             set_settings

@@ -79,6 +79,11 @@ pub struct StoredMessage {
     pub revoked: bool,
     /// Whether the message mentions us (directly or via @all).
     pub mentioned: bool,
+    /// Link preview: canonical URL, title, description and thumbnail path.
+    pub preview_url: Option<String>,
+    pub preview_title: Option<String>,
+    pub preview_desc: Option<String>,
+    pub preview_thumb: Option<String>,
     /// Delivery state of a message we sent: `pending`, `sent`, `delivered` or
     /// `read`. `None` for incoming messages.
     pub status: Option<String>,
@@ -170,6 +175,10 @@ impl MessageStore {
             "reply_to_id",
             "reply_to_text",
             "reply_to_sender",
+            "preview_url",
+            "preview_title",
+            "preview_desc",
+            "preview_thumb",
         ] {
             if !existing.iter().any(|c| c == column) {
                 conn.execute(&format!("ALTER TABLE messages ADD COLUMN {column} TEXT"), [])?;
@@ -239,8 +248,10 @@ impl MessageStore {
             "INSERT INTO messages
                  (chat, id, sender, timestamp, from_me, text,
                   media_kind, media_path, reply_to_id, reply_to_text, reply_to_sender,
-                  read, revoked, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                  read, revoked, mentioned, status,
+                  preview_url, preview_title, preview_desc, preview_thumb)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                     ?15, ?16, ?17, ?18, ?19)
              ON CONFLICT(chat, id) DO UPDATE SET
                  sender = excluded.sender,
                  timestamp = excluded.timestamp,
@@ -249,7 +260,16 @@ impl MessageStore {
                  media_kind = excluded.media_kind,
                  media_path = excluded.media_path,
                  reply_to_id = excluded.reply_to_id,
-                 reply_to_text = excluded.reply_to_text",
+                 reply_to_text = excluded.reply_to_text,
+                 reply_to_sender = excluded.reply_to_sender,
+                 read = excluded.read,
+                 revoked = excluded.revoked,
+                 mentioned = excluded.mentioned,
+                 status = excluded.status,
+                 preview_url = excluded.preview_url,
+                 preview_title = excluded.preview_title,
+                 preview_desc = excluded.preview_desc,
+                 preview_thumb = excluded.preview_thumb",
             params![
                 message.chat,
                 message.id,
@@ -264,7 +284,12 @@ impl MessageStore {
                 message.reply_to_sender,
                 message.read as i32,
                 message.revoked as i32,
+                message.mentioned as i32,
                 message.status,
+                message.preview_url,
+                message.preview_title,
+                message.preview_desc,
+                message.preview_thumb,
             ],
         )?;
         Ok(())
@@ -389,7 +414,8 @@ impl MessageStore {
         let mut stmt = conn.prepare(
             "SELECT m.chat, m.id, m.sender, m.timestamp, m.from_me, m.text,
                     n.name, m.media_kind, m.media_path, m.reply_to_id, m.reply_to_text,
-                    m.read, m.revoked, m.status, m.reply_to_sender, m.mentioned
+                    m.read, m.revoked, m.status, m.reply_to_sender, m.mentioned,
+                    m.preview_url, m.preview_title, m.preview_desc, m.preview_thumb
              FROM messages m
              LEFT JOIN names n ON n.jid = m.sender
              WHERE m.chat = ?1
@@ -413,6 +439,10 @@ impl MessageStore {
                 status: row.get(13)?,
                 reply_to_sender: row.get(14)?,
                 mentioned: row.get::<_, i32>(15)? != 0,
+                preview_url: row.get(16)?,
+                preview_title: row.get(17)?,
+                preview_desc: row.get(18)?,
+                preview_thumb: row.get(19)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -455,7 +485,8 @@ impl MessageStore {
         let message = conn.query_row(
             "SELECT m.chat, m.id, m.sender, m.timestamp, m.from_me, m.text,
                     n.name, m.media_kind, m.media_path, m.reply_to_id, m.reply_to_text,
-                    m.read, m.revoked, m.status, m.reply_to_sender, m.mentioned
+                    m.read, m.revoked, m.status, m.reply_to_sender, m.mentioned,
+                    m.preview_url, m.preview_title, m.preview_desc, m.preview_thumb
              FROM messages m
              LEFT JOIN names n ON n.jid = m.sender
              WHERE m.chat = ?1 AND m.id = ?2",
@@ -478,6 +509,10 @@ impl MessageStore {
                     status: row.get(13)?,
                     reply_to_sender: row.get(14)?,
                     mentioned: row.get::<_, i32>(15)? != 0,
+                    preview_url: row.get(16)?,
+                    preview_title: row.get(17)?,
+                    preview_desc: row.get(18)?,
+                    preview_thumb: row.get(19)?,
                 })
             },
         )?;
@@ -704,6 +739,10 @@ mod tests {
             read: false,
             revoked: false,
             mentioned: false,
+            preview_url: None,
+            preview_title: None,
+            preview_desc: None,
+            preview_thumb: None,
             status: None,
         }
     }

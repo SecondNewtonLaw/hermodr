@@ -25,6 +25,7 @@
     "allow-group-info",
     "allow-set-pinned",
     "allow-search",
+    "allow-open-url",
     "allow-unread-mentions"
   ]
 }

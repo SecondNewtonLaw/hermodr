@@ -20,6 +20,10 @@
     read: boolean;
     revoked: boolean;
     mentioned: boolean;
+    preview_url: string | null;
+    preview_title: string | null;
+    preview_desc: string | null;
+    preview_thumb: string | null;
     status: string | null;
   };
   type ChatSummary = {
@@ -289,6 +293,37 @@
       scrollToMessage(mentionQueue[0]);
     }
     composerInput?.focus();
+  }
+
+  /** Splits text into plain runs and http(s) links, for rendering. */
+  function linkParts(text: string): { text: string; url?: string }[] {
+    const pattern = /(https?:\/\/[^\s<>()\[\]{}"']+)/g;
+    const parts: { text: string; url?: string }[] = [];
+    let last = 0;
+    for (const match of text.matchAll(pattern)) {
+      const at = match.index ?? 0;
+      if (at > last) parts.push({ text: text.slice(last, at) });
+      parts.push({ text: match[0], url: match[0] });
+      last = at + match[0].length;
+    }
+    if (last < text.length) parts.push({ text: text.slice(last) });
+    return parts;
+  }
+
+  function hostOf(url: string) {
+    try {
+      return new URL(url).hostname;
+    } catch {
+      return url;
+    }
+  }
+
+  async function openUrl(url: string) {
+    try {
+      await invoke("open_url", { url });
+    } catch (e) {
+      error = String(e);
+    }
   }
 
   /** Runs the chat/contact/group search. */
@@ -1065,7 +1100,40 @@
                     {message.text || message.media_kind}
                   </button>
                 {:else}
-                  <span class="text">{message.text}</span>
+                  <span class="text"
+                    >{#each linkParts(message.text) as part}{#if part.url}<a
+                          class="link"
+                          href={part.url}
+                          onclick={(e) => {
+                            e.preventDefault();
+                            openUrl(part.url!);
+                          }}>{part.text}</a
+                        >{:else}{part.text}{/if}{/each}</span
+                  >
+                {/if}
+
+                {#if message.preview_url}
+                  <button
+                    class="preview-card"
+                    title="Open link"
+                    onclick={() => openUrl(message.preview_url!)}>
+                    {#if message.preview_thumb}
+                      <img
+                        class="preview-thumb"
+                        src={convertFileSrc(message.preview_thumb)}
+                        alt=""
+                      />
+                    {/if}
+                    <span class="preview-body">
+                      {#if message.preview_title}
+                        <span class="preview-title">{message.preview_title}</span>
+                      {/if}
+                      {#if message.preview_desc}
+                        <span class="preview-desc">{message.preview_desc}</span>
+                      {/if}
+                      <span class="preview-host">{hostOf(message.preview_url)}</span>
+                    </span>
+                  </button>
                 {/if}
               {/if}
 
@@ -1470,6 +1538,54 @@
     display: block;
     color: #71717a;
     font-size: 11px;
+  }
+  .link {
+    color: #93c5fd;
+    cursor: pointer;
+  }
+  .preview-card {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    text-align: left;
+    background: #1c1c1f;
+    border: 0;
+    border-radius: 6px;
+    padding: 8px;
+    margin-top: 4px;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+    max-width: 100%;
+  }
+  .preview-thumb {
+    width: 64px;
+    height: 64px;
+    object-fit: cover;
+    border-radius: 4px;
+    flex: none;
+  }
+  .preview-body {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .preview-title {
+    font-weight: 500;
+  }
+  .preview-desc {
+    font-size: 12px;
+    color: #a1a1aa;
+    overflow: hidden;
+    display: -webkit-box;
+    line-clamp: 2;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }
+  .preview-host {
+    font-size: 11px;
+    color: #71717a;
   }
   /* Keep the newlines the sender typed, and wrap long tokens. */
   .text {
