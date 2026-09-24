@@ -1013,6 +1013,22 @@
       Link this device from WhatsApp &rsaquo; Linked devices &rsaquo; Link a device.
     </p>
 
+    {#if accountList.length > 0}
+      <div class="account-bar">
+        {#each accountList as account (account.id)}
+          <button
+            class="account"
+            class:active={account.id === activeAccount}
+            title={account.label}
+            onclick={() => switchTo(account.id)}>{account.label}</button>
+        {/each}
+        <button
+          class="account add"
+          title="Manage accounts"
+          onclick={() => (showAccounts = true)}>⋯</button>
+      </div>
+    {/if}
+
     {#if qrSvg}
       <div class="qr" aria-label="Pairing QR code">{@html qrSvg}</div>
       <p class="hint">The code refreshes automatically.</p>
