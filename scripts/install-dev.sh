@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 #
-# Builds Hermóðr from a clean checkout.
+# Builds and installs Hermóðr from the current checkout.
 #
-# Dependencies are declared in Cargo.toml: tauri comes from crates.io, and
+# Dependencies are declared in Cargo.toml: Tauri comes from crates.io, and
 # whatsapp-rust is pinned to a git revision (the per-chunk history-sync control
-# it needs is newer than the last release). Nothing needs to be cloned by hand.
+# it needs is newer than the last release). Cargo fetches both, so there is
+# nothing to clone by hand.
 #
 # Usage:
-#   ./install.sh          # build a release and install it
-#   ./install.sh --dev    # start the dev server
+#   scripts/install-dev.sh          # build a release and install it
+#   scripts/install-dev.sh --dev    # start the dev server
 #
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 say() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -26,11 +27,11 @@ say "installing node dependencies"
 
 if [ "${1:-}" = "--dev" ]; then
   say "starting the dev server"
-  exec pnpm tauri dev
+  cd "$ROOT" && exec pnpm tauri dev
 fi
 
 say "building a release bundle"
-pnpm tauri build
+(cd "$ROOT" && pnpm tauri build)
 
 say "installing the desktop entry"
 BIN_DIR="$HOME/.local/bin"

@@ -81,11 +81,21 @@ src/                    Svelte 5 UI (chat list, conversation, pairing)
 `hermodr-core` is built on [`whatsapp-rust`](https://github.com/oxidezap/whatsapp-rust),
 a pure-Rust implementation of the WhatsApp multi-device protocol.
 
-## Building
+## Installing
+
+Releases ship an AppImage. Download it from the releases page, or run:
 
 ```console
-./install.sh          # build a release and install it
-./install.sh --dev    # start the dev server
+curl -fsSL https://raw.githubusercontent.com/emiliano-go/hermodr/master/scripts/install.sh | sh
+```
+
+## Building
+
+To build from a clone:
+
+```console
+scripts/install-dev.sh          # build a release and install it
+scripts/install-dev.sh --dev    # start the dev server
 ```
 
 Dependencies are declared in `Cargo.toml`: Tauri comes from crates.io, and
@@ -95,7 +105,7 @@ there is nothing to clone by hand. `.cargo/config.toml` has Cargo use the system
 `git`, so a global HTTPS-to-SSH rewrite still works.
 
 Requirements: Rust 1.94+ (stable), Node with pnpm, and the usual Tauri Linux
-dependencies (WebKitGTK 4.1, GTK 3). The script does not install system
+dependencies (WebKitGTK 4.1, GTK 3). The dev script does not install system
 packages; it prints what the build needs.
 
 On Wayland, WebKitGTK's DMA-BUF renderer fails with `Gdk Error 71`. The app sets
