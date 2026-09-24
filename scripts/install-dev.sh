@@ -22,6 +22,12 @@ for tool in cargo node pnpm; do
   command -v "$tool" >/dev/null || die "$tool is required but not on PATH"
 done
 
+say "stopping any running instance"
+pkill -9 -f 'target/debug/hermodr' 2>/dev/null || true
+pkill -9 -f 'local/bin/hermodr' 2>/dev/null || true
+pkill -9 -f 'WebKitWebProcess' 2>/dev/null || true
+sleep 1
+
 say "installing node dependencies"
 (cd "$ROOT" && pnpm install)
 
