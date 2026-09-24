@@ -84,20 +84,15 @@ a pure-Rust implementation of the WhatsApp multi-device protocol.
 ## Building
 
 ```console
-./install.sh          # clone the dependencies and build a release
-./install.sh --dev    # clone the dependencies and start the dev server
+./install.sh          # build a release and install it
+./install.sh --dev    # start the dev server
 ```
 
-The script pins and clones the two dependencies this project needs as local
-checkouts, as siblings of this repository:
-
-- `../whatsapp-rust`, at a revision where per-chunk history control
-  (`HistorySyncAdmission`) exists. A git dependency is not used instead because
-  that repository's own `.cargo/config.toml` injects nightly-only rustflags a
-  git dependency would inherit; as a path dependency they do not apply, and the
-  pinned revision builds on stable Rust.
-- `../tauri`, at a revision carrying `patches/tauri-gtk-fixed.patch`, which
-  mounts child webviews in a `GtkFixed` so the UI and the composer coexist.
+Dependencies are declared in `Cargo.toml`: Tauri comes from crates.io, and
+`whatsapp-rust` is pinned to a git revision because per-chunk history control
+(`HistorySyncAdmission`) is newer than its last release. Cargo fetches both, so
+there is nothing to clone by hand. `.cargo/config.toml` has Cargo use the system
+`git`, so a global HTTPS-to-SSH rewrite still works.
 
 Requirements: Rust 1.94+ (stable), Node with pnpm, and the usual Tauri Linux
 dependencies (WebKitGTK 4.1, GTK 3). The script does not install system
