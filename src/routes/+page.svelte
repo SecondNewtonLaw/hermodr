@@ -1068,12 +1068,16 @@
                 <span class="revoked">This message was deleted</span>
               {:else}
                 {#if message.reply_to_text}
-                  <span class="quote">
+                  <button
+                    type="button"
+                    class="quote"
+                    title="Go to message"
+                    onclick={() => message.reply_to_id && scrollToMessage(message.reply_to_id)}>
                     <span class="quote-author">
                       {quoteAuthor(message.reply_to_sender)}
                     </span>
                     <span class="quote-text">{message.reply_to_text}</span>
-                  </span>
+                  </button>
                 {/if}
 
                 {#if message.media_kind === "image" && message.media_path}
@@ -1791,6 +1795,13 @@
     color: #71717a;
   }
   .quote {
+    background: transparent;
+    border: 0;
+    border-left: 2px solid #52525b;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
     font-size: 12px;
     color: #a1a1aa;
     border-left: 2px solid #52525b;
