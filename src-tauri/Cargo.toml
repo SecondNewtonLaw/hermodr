@@ -3,6 +3,7 @@ name = "hermodr"
 version = "0.1.0"
 description = "Hermóðr: a native WhatsApp client"
 authors = ["emiliano-go"]
+license = "MIT"
 edition = "2021"
 
 [lib]

@@ -156,3 +156,8 @@ Working:
 
 Not yet implemented: audio/video playback, group administration, calls,
 notifications, multiple accounts, and the tray icon.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Third party dependencies keep their own
+licenses, listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

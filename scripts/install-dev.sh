@@ -23,9 +23,17 @@ for tool in cargo node pnpm; do
 done
 
 say "stopping any running instance"
-pkill -9 -f 'target/debug/hermodr' 2>/dev/null || true
-pkill -9 -f 'local/bin/hermodr' 2>/dev/null || true
-pkill -9 -f 'WebKitWebProcess' 2>/dev/null || true
+# Scoped to this project: never the shared WebKitWebProcess name, which would
+# kill every other WebKit app (Zuno, opencode, and so on).
+stop_app() {
+  pkill -9 -f "$ROOT/node_modules" 2>/dev/null || true
+  local pid
+  for pid in $(pgrep -f "$ROOT/src-tauri/target/(debug|release)/hermodr|$HOME/.local/bin/hermodr|/\.mount_[^/]*/(AppRun|usr/bin/hermodr)" 2>/dev/null); do
+    pkill -9 -P "$pid" 2>/dev/null || true
+    kill -9 "$pid" 2>/dev/null || true
+  done
+}
+stop_app
 sleep 1
 
 say "installing node dependencies"
