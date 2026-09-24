@@ -343,6 +343,15 @@ async fn group_info(
         .map_err(|e| e.to_string())
 }
 
+/// Chats, contacts and groups matching a query.
+#[tauri::command]
+async fn search(
+    state: State<'_, AppState>,
+    query: String,
+) -> Result<Vec<hermodr_core::SearchResult>, String> {
+    state.service()?.search(&query).await.map_err(|e| e.to_string())
+}
+
 /// Pins or unpins a chat, mirroring it to the account.
 #[tauri::command]
 async fn set_pinned(state: State<'_, AppState>, chat: String, pinned: bool) -> Result<(), String> {
@@ -426,6 +435,7 @@ pub fn run() {
             group_info,
             set_pinned,
             unread_mentions,
+            search,
             qr_svg,
             get_settings,
             set_settings

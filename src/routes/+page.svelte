@@ -34,6 +34,14 @@
     mention_count: number;
     pinned: boolean;
   };
+  type SearchResult = {
+    jid: string;
+    name: string;
+    number: string;
+    kind: string;
+    saved: boolean;
+    has_messages: boolean;
+  };
   type GroupInfo = {
     subject: string | null;
     description: string | null;
@@ -98,6 +106,9 @@
   /** Open mention query, or null while the autocomplete is closed. */
   let mentionQuery = $state<string | null>(null);
   /** Unread mentions in the open chat, oldest first, for jump-to-mention. */
+  let searchQuery = $state("");
+  let searchResults: SearchResult[] = $state([]);
+  let titleOverride = $state<string | null>(null);
   let mentionQueue: string[] = $state([]);
   let mentionCursor = $state(0);
   let mentionIndex = $state(0);
@@ -239,8 +250,9 @@
     }
   }
 
-  async function openChat(chat: string, jumpToMention = false) {
+  async function openChat(chat: string, jumpToMention = false, label: string | null = null) {
     selectedChat = chat;
+    titleOverride = label;
     scrolledUp = false;
     participants = [];
     chosenMentions = [];
@@ -277,6 +289,27 @@
       scrollToMessage(mentionQueue[0]);
     }
     composerInput?.focus();
+  }
+
+  /** Runs the chat/contact/group search. */
+  async function runSearch() {
+    const query = searchQuery.trim();
+    if (!query) {
+      searchResults = [];
+      return;
+    }
+    try {
+      searchResults = await invoke<SearchResult[]>("search", { query });
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  /** Opens a search result, even one with no local history. */
+  function openFromSearch(result: SearchResult) {
+    searchQuery = "";
+    searchResults = [];
+    openChat(result.jid, false, result.name);
   }
 
   /** Scrolls a message into view by its id. */
@@ -784,6 +817,11 @@
             if (payload.message.chat === selectedChat) {
               await reloadMessages();
               scrollToBottom();
+              // Seen while open, but only if the window is actually focused.
+              if (!payload.message.from_me && document.hasFocus()) {
+                await invoke("mark_read", { chat: selectedChat });
+                await refreshChats();
+              }
             }
             // A group seen for the first time has no name yet; look it up in
             // the background so the list stops showing a raw number.
@@ -870,6 +908,45 @@
           ⚙
         </button>
       </header>
+      <input
+        class="search"
+        placeholder="Search chats and contacts"
+        bind:value={searchQuery}
+        oninput={runSearch}
+        autocomplete="off"
+      />
+      {#if searchQuery.trim()}
+        <ul class="results">
+          {#each searchResults as result (result.jid)}
+            <li>
+              <div
+                class="chat-row"
+                role="button"
+                tabindex="0"
+                onclick={() => openFromSearch(result)}
+                onkeydown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    openFromSearch(result);
+                  }
+                }}>
+                <span class="name">
+                  {#if result.kind === "group" || result.saved}
+                    {result.name}
+                  {:else}
+                    {result.number}{result.name && result.name !== result.number
+                      ? ` - ${result.name}`
+                      : ""}
+                  {/if}
+                </span>
+                <span class="preview">
+                  {result.kind}{result.has_messages ? "" : " · no messages yet"}
+                </span>
+              </div>
+            </li>
+          {/each}
+        </ul>
+      {:else}
       <ul>
         {#each chats as chat (chat.chat)}
           <li>
@@ -913,6 +990,7 @@
           <li class="empty">No conversations yet.</li>
         {/if}
       </ul>
+      {/if}
       <button type="button" class="resizer" aria-label="Resize chat list" onmousedown={(e) => startResize("left", e)}></button>
     </aside>
 
@@ -924,7 +1002,9 @@
               {chats.find((c) => c.chat === selectedChat)?.display_name ?? bareJid(selectedChat)}
             </button>
           {:else}
-            {chats.find((c) => c.chat === selectedChat)?.display_name ?? bareJid(selectedChat)}
+            {chats.find((c) => c.chat === selectedChat)?.display_name ??
+              titleOverride ??
+              bareJid(selectedChat)}
           {/if}
           {#if mentionQueue.length > 0}
             <button class="icon jump-mention" title="Jump to mention" onclick={jumpNextMention}>
@@ -1411,6 +1491,18 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
+  }
+  .search {
+    margin: 8px 14px;
+    background: #1c1c1f;
+    border: 1px solid #3f3f46;
+    border-radius: 6px;
+    padding: 6px 10px;
+    color: inherit;
+    font: inherit;
+  }
+  .results .preview {
+    color: #71717a;
   }
   .chats ul {
     list-style: none;

@@ -341,6 +341,37 @@ impl MessageStore {
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
+    /// Whether the stored name for a JID came from the address book.
+    pub fn name_is_saved(&self, jid: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT saved FROM names WHERE jid = ?1",
+            params![jid],
+            |r| r.get::<_, i32>(0),
+        )
+        .map(|v| v != 0)
+        .unwrap_or(false)
+    }
+
+    /// Names matching a query, for the search box.
+    pub fn search_names(&self, query: &str, limit: u32) -> Result<Vec<(String, String, bool)>> {
+        let conn = self.conn.lock().unwrap();
+        let pattern = format!("%{}%", query.to_lowercase());
+        let mut stmt = conn.prepare(
+            "SELECT jid, name, saved FROM names
+             WHERE lower(name) LIKE ?1 OR lower(jid) LIKE ?1
+             ORDER BY saved DESC, name LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![pattern, limit], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i32>(2)? != 0,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
     /// The display name for a JID, if known.
     pub fn name_for(&self, jid: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();

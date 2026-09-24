@@ -13,6 +13,7 @@ const COMMANDS: &[&str] = &[
     "participants",
     "group_info",
     "set_pinned",
+    "search",
     "unread_mentions",
     "qr_svg",
     "get_settings",

@@ -24,6 +24,7 @@
     "allow-participants",
     "allow-group-info",
     "allow-set-pinned",
+    "allow-search",
     "allow-unread-mentions"
   ]
 }

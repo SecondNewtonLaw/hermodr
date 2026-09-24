@@ -167,6 +167,21 @@ pub struct Participant {
     pub username: Option<String>,
 }
 
+/// One row of the chat/contact search.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchResult {
+    pub jid: String,
+    pub name: String,
+    /// The JID's user part, so the UI can show "number - name".
+    pub number: String,
+    /// `contact` or `group`.
+    pub kind: String,
+    /// Whether the name came from the address book.
+    pub saved: bool,
+    /// Whether the chat already has messages locally.
+    pub has_messages: bool,
+}
+
 /// Everything the group info sidebar shows.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct GroupInfo {
@@ -253,6 +268,8 @@ pub struct Service {
     /// server and trip its rate limit. Group membership changes rarely enough
     /// that a session-lifetime cache is fine.
     group_cache: Mutex<std::collections::HashMap<String, GroupInfo>>,
+    /// Every group the account is in, `(jid, subject)`, filled on first search.
+    groups_cache: Mutex<Vec<(String, String)>>,
 }
 
 impl Service {
@@ -644,6 +661,7 @@ impl Service {
                 qr: qr_state,
                 connected: connected_state,
                 group_cache: Mutex::new(std::collections::HashMap::new()),
+                groups_cache: Mutex::new(Vec::new()),
             },
             initial_rx,
         ))
@@ -840,6 +858,92 @@ impl Service {
             .or_else(|| self.client.lid())
             .map(|j| j.to_non_ad().to_string())
             .unwrap_or_default()
+    }
+
+    /// Chats, contacts and groups matching a query.
+    pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
+        use std::collections::HashSet;
+
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let local = self.store.chats()?;
+        let local_jids: HashSet<String> = local.iter().map(|c| c.chat.clone()).collect();
+        let mut results: Vec<SearchResult> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        // Local chats first: they have history and are what a search usually
+        // means.
+        for chat in &local {
+            let number = user_part(&chat.chat);
+            let name = chat.display_name.clone().unwrap_or_else(|| number.clone());
+            if name.to_lowercase().contains(&needle) || number.contains(&needle) {
+                seen.insert(chat.chat.clone());
+                results.push(SearchResult {
+                    kind: if chat.chat.ends_with("@g.us") { "group".to_string() } else { "contact".to_string() },
+                    saved: self.store.name_is_saved(&chat.chat),
+                    jid: chat.chat.clone(),
+                    name,
+                    number,
+                    has_messages: true,
+                });
+            }
+        }
+
+        // Address book and learned names.
+        for (jid, name, saved) in self.store.search_names(&needle, 50)? {
+            if !seen.insert(jid.clone()) {
+                continue;
+            }
+            results.push(SearchResult {
+                kind: if jid.ends_with("@g.us") { "group".to_string() } else { "contact".to_string() },
+                saved,
+                jid: jid.clone(),
+                name,
+                number: user_part(&jid),
+                has_messages: local_jids.contains(&jid),
+            });
+        }
+
+        // Groups from the account, including ones with no local history.
+        for (jid, subject) in self.group_overviews().await {
+            if subject.to_lowercase().contains(&needle) && seen.insert(jid.clone()) {
+                results.push(SearchResult {
+                    jid: jid.clone(),
+                    name: subject,
+                    number: String::new(),
+                    kind: "group".into(),
+                    saved: false,
+                    has_messages: local_jids.contains(&jid),
+                });
+            }
+        }
+
+        results.truncate(50);
+        Ok(results)
+    }
+
+    /// Every group the account is in, fetched once and cached.
+    async fn group_overviews(&self) -> Vec<(String, String)> {
+        {
+            let cache = self.groups_cache.lock().unwrap();
+            if !cache.is_empty() {
+                return cache.clone();
+            }
+        }
+        match self.client.groups().list_participating().await {
+            Ok(groups) => {
+                let pairs: Vec<(String, String)> = groups
+                    .into_iter()
+                    .filter_map(|g| g.subject.map(|s| (g.id.to_string(), s)))
+                    .collect();
+                *self.groups_cache.lock().unwrap() = pairs.clone();
+                pairs
+            }
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Pins or unpins a chat, mirroring it to the account.
@@ -1118,6 +1222,17 @@ fn quote_of(message: &wa::Message) -> Option<(String, String, String)> {
     let quoted = context.quoted_message.as_option()?;
     let text = quoted.text_content().unwrap_or("[media]").to_string();
     Some((id, author, text))
+}
+
+/// The user part of a JID, without the device suffix or server.
+fn user_part(jid: &str) -> String {
+    jid.split('@')
+        .next()
+        .unwrap_or(jid)
+        .split(':')
+        .next()
+        .unwrap_or(jid)
+        .to_string()
 }
 
 /// Seconds since the Unix epoch.
