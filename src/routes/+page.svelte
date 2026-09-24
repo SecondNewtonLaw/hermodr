@@ -1753,6 +1753,8 @@
   }
   .chats header,
   .conversation header {
+    min-width: 0;
+    overflow: hidden;
     padding: 12px 14px;
     font-weight: 600;
     border-bottom: 1px solid #27272a;
@@ -1817,10 +1819,13 @@
     margin: 0;
     padding: 0;
     overflow-y: auto;
+    overflow-x: hidden;
     flex: 1;
   }
   .chat-row {
     width: 100%;
+    min-width: 0;
+    overflow: hidden;
     display: grid;
     grid-template-columns: 1fr auto auto;
     grid-template-areas: "name time badge" "preview preview preview";
@@ -1875,6 +1880,7 @@
   }
   .name {
     grid-area: name;
+    min-width: 0;
     font-weight: 500;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1887,6 +1893,7 @@
   }
   .preview {
     grid-area: preview;
+    min-width: 0;
     color: #a1a1aa;
     font-size: 12px;
     overflow: hidden;
