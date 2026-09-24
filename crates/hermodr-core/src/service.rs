@@ -799,10 +799,23 @@ impl Service {
         // `@all` is a group mention, carried separately from member mentions.
         let mention_all = mentions.iter().any(|m| m == "@all");
         let mentioned: Vec<String> = mentions.iter().filter(|m| *m != "@all").cloned().collect();
-        let result = if mentioned.is_empty() && !mention_all {
+
+        // A link in the text gets an Open Graph preview, fetched off the runtime.
+        let preview = if mentioned.is_empty() {
+            match first_url(&text) {
+                Some(url) => tokio::task::spawn_blocking(move || fetch_link_preview(&url))
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        let result = if mentioned.is_empty() && !mention_all && preview.is_none() {
             self.client.send_text(to, text.clone()).await?
         } else {
-            use whatsapp_rust::wacore::proto_helpers::MessageBuilderExt;
             let mut context = wa::ContextInfo {
                 mentioned_jid: mentioned.clone(),
                 ..Default::default()
@@ -813,10 +826,31 @@ impl Service {
                     group_subject: self.store.name_for(chat).ok().flatten(),
                 }];
             }
-            self.client
-                .send_message(to, wa::Message::text_with_context(text.clone(), context))
-                .await?
+            let extended = wa::message::ExtendedTextMessage {
+                text: Some(text.clone()),
+                matched_text: preview.as_ref().map(|p| p.url.clone()),
+                title: preview.as_ref().and_then(|p| p.title.clone()),
+                description: preview.as_ref().and_then(|p| p.description.clone()),
+                jpeg_thumbnail: preview.as_ref().and_then(|p| p.thumbnail.clone()),
+                context_info: MessageField::some(context),
+                ..Default::default()
+            };
+            let message = wa::Message {
+                extended_text_message: MessageField::some(extended),
+                ..Default::default()
+            };
+            self.client.send_message(to, message).await?
         };
+
+        // Keep the preview with our own copy, so the sender sees it too.
+        let thumbnail = preview.as_ref().and_then(|p| {
+            let bytes = p.thumbnail.as_ref()?;
+            let dir = self.media_dir()?;
+            std::fs::create_dir_all(&dir).ok()?;
+            let path = dir.join(format!("{}_thumb.jpg", result.message_id));
+            std::fs::write(&path, bytes).ok()?;
+            Some(path.to_string_lossy().to_string())
+        });
 
         // The wire text names mentions by number; store the display form so the
         // conversation reads the same as the rest of the UI.
@@ -826,7 +860,7 @@ impl Service {
             replace_mentions(&text, &mentioned, &self.store)
         };
 
-        let message = StoredMessage {
+        let mut message = StoredMessage {
             chat: chat.to_string(),
             id: result.message_id.clone(),
             sender: self.own_jid(),
@@ -850,6 +884,12 @@ impl Service {
             preview_thumb: None,
             status: Some("pending".into()),
         };
+        if let Some(p) = &preview {
+            message.preview_url = Some(p.url.clone());
+            message.preview_title = p.title.clone();
+            message.preview_desc = p.description.clone();
+            message.preview_thumb = thumbnail;
+        }
         self.store.upsert(&message)?;
         let _ = self.events.send(ServiceEvent::Message { message: Box::new(message) });
         Ok(())
@@ -1582,6 +1622,57 @@ fn resolve_mention_tokens(text: &str, store: &MessageStore) -> String {
         i += ch.len_utf8();
     }
     out
+}
+
+/// A link preview fetched from a URL.
+struct LinkPreview {
+    url: String,
+    title: Option<String>,
+    description: Option<String>,
+    thumbnail: Option<Vec<u8>>,
+}
+
+/// The first http(s) URL in a piece of text.
+fn first_url(text: &str) -> Option<String> {
+    let start = text.find("http://").or_else(|| text.find("https://"))?;
+    let rest = &text[start..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '<' || c == '>')
+        .unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+/// Fetches the Open Graph metadata for a URL, and its image when it is a JPEG.
+///
+/// Blocking; call it from `spawn_blocking`. The image is only attached when it
+/// is already a JPEG and reasonably small, since WhatsApp's thumbnail field
+/// takes JPEG bytes and we do not re-encode here.
+fn fetch_link_preview(url: &str) -> Option<LinkPreview> {
+    let mut response = ureq::get(url).call().ok()?;
+    let html = response.body_mut().read_to_string().ok()?;
+
+    let meta = |property: &str| -> Option<String> {
+        let needle = format!("property=\"{property}\"");
+        let rest = &html[html.find(&needle)?..];
+        let content_at = rest.find("content=\"")? + "content=\"".len();
+        let value = &rest[content_at..];
+        Some(value[..value.find('"')?].to_string())
+    };
+
+    let image = meta("og:image").filter(|src| src.starts_with("http"));
+    let thumbnail = image.and_then(|src| {
+        let mut response = ureq::get(&src).call().ok()?;
+        let bytes = response.body_mut().read_to_vec().ok()?;
+        let is_jpeg = bytes.starts_with(&[0xFF, 0xD8, 0xFF]);
+        (is_jpeg && bytes.len() < 300_000).then_some(bytes)
+    });
+
+    Some(LinkPreview {
+        url: url.to_string(),
+        title: meta("og:title"),
+        description: meta("og:description"),
+        thumbnail,
+    })
 }
 
 /// MIME type for an outgoing attachment, from its file extension.
