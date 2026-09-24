@@ -1,6 +1,10 @@
 const COMMANDS: &[&str] = &[
     "connection_state",
     "connect",
+    "accounts",
+    "add_account",
+    "switch_account",
+    "remove_account",
     "messages",
     "chats",
     "resolve_names",

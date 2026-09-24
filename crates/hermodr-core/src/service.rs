@@ -256,7 +256,8 @@ pub struct Service {
     client: Arc<Client>,
     store: Arc<MessageStore>,
     events: broadcast::Sender<ServiceEvent>,
-    shutdown: tokio::sync::oneshot::Sender<()>,
+    /// Fires the shutdown signal. `None` once it has been sent.
+    shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// Where downloaded media is written; `None` disables media.
     media_dir: Option<PathBuf>,
     /// Latest pairing code, kept so a subscriber that attaches after the code
@@ -656,7 +657,7 @@ impl Service {
                 client,
                 store,
                 events,
-                shutdown: shutdown_tx,
+                shutdown: Mutex::new(Some(shutdown_tx)),
                 media_dir,
                 qr: qr_state,
                 connected: connected_state,
@@ -1215,8 +1216,10 @@ impl Service {
     }
 
     /// Stops the background task.
-    pub fn shutdown(self) {
-        let _ = self.shutdown.send(());
+    pub fn shutdown(&self) {
+        if let Some(tx) = self.shutdown.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
     }
 }
 

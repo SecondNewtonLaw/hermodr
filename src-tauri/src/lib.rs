@@ -30,6 +30,27 @@ pub struct UiSettings {
 struct AppState {
     service: Mutex<Option<Arc<Service>>>,
     settings: Mutex<UiSettings>,
+    accounts: Mutex<AccountsFile>,
+}
+
+/// One signed-in account.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Account {
+    pub id: String,
+    pub label: String,
+}
+
+/// The account list, persisted next to the app config.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct AccountsFile {
+    accounts: Vec<Account>,
+    active: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AccountsView {
+    pub accounts: Vec<Account>,
+    pub active: Option<String>,
 }
 
 impl AppState {
@@ -49,11 +70,70 @@ fn data_dir(app: &AppHandle) -> std::path::PathBuf {
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
-fn config_for(app: &AppHandle, settings: &UiSettings) -> ServiceConfig {
-    let default_media = data_dir(app).join("media");
+/// Where an account's files live. The first account keeps the old layout so an
+/// existing single-account install is adopted in place.
+fn account_base(app: &AppHandle, id: &str) -> std::path::PathBuf {
+    if id == "default" {
+        data_dir(app)
+    } else {
+        data_dir(app).join("accounts").join(id)
+    }
+}
+
+fn accounts_path(app: &AppHandle) -> PathBuf {
+    app.path()
+        .app_config_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("accounts.json")
+}
+
+fn save_accounts(app: &AppHandle, file: &AccountsFile) {
+    let path = accounts_path(app);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(file) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// Loads the account list, adopting an existing single-account install the
+/// first time.
+fn load_accounts(app: &AppHandle) -> AccountsFile {
+    if let Ok(json) = std::fs::read_to_string(accounts_path(app)) {
+        if let Ok(file) = serde_json::from_str::<AccountsFile>(&json) {
+            return file;
+        }
+    }
+    let mut file = AccountsFile::default();
+    if data_dir(app).join("session.db").exists() {
+        file.accounts.push(Account {
+            id: "default".into(),
+            label: "WhatsApp".into(),
+        });
+        file.active = Some("default".into());
+        save_accounts(app, &file);
+    }
+    file
+}
+
+fn active_account(state: &AppState) -> Option<String> {
+    state.accounts.lock().unwrap().active.clone()
+}
+
+fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn config_for(app: &AppHandle, settings: &UiSettings, account: &str) -> ServiceConfig {
+    let base = account_base(app, account);
+    let default_media = base.join("media");
     ServiceConfig {
-        session_path: data_dir(app).join("session.db"),
-        messages_path: data_dir(app).join("messages.db"),
+        session_path: base.join("session.db"),
+        messages_path: base.join("messages.db"),
         retention: settings.retention,
         accept_full_history: settings.accept_full_history,
         // An unset or empty setting falls back to the app data directory.
@@ -110,14 +190,15 @@ fn connection_state(state: State<'_, AppState>) -> ConnectionState {
 ///
 /// Returns once the service is running; the QR code and connection state arrive
 /// as [`SERVICE_EVENT`] messages so the UI can render them as they happen.
-#[tauri::command]
-async fn connect(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    if state.service.lock().unwrap().is_some() {
-        return Ok(());
+/// Starts the service for an account, replacing any running one.
+async fn start_service(app: &AppHandle, state: &AppState, account: &str) -> Result<(), String> {
+    // Stop whatever is running first, so the old account disconnects.
+    if let Some(existing) = state.service.lock().unwrap().take() {
+        existing.shutdown();
     }
 
     let settings = state.settings.lock().unwrap().clone();
-    let config = config_for(&app, &settings);
+    let config = config_for(app, &settings, account);
 
     let (service, mut events) = Service::start(config)
         .await
@@ -155,7 +236,102 @@ async fn connect(app: AppHandle, state: State<'_, AppState>) -> Result<(), Strin
     }
 
     *state.service.lock().unwrap() = Some(service);
+    Ok(())
+}
 
+/// Connects the active account, pairing by QR the first time.
+#[tauri::command]
+async fn connect(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if state.service.lock().unwrap().is_some() {
+        return Ok(());
+    }
+    let account = match active_account(&state) {
+        Some(account) => account,
+        // First run: create the default account.
+        None => {
+            {
+                let mut file = state.accounts.lock().unwrap();
+                file.accounts.push(Account {
+                    id: "default".into(),
+                    label: "WhatsApp".into(),
+                });
+                file.active = Some("default".into());
+            }
+            save_accounts(&app, &state.accounts.lock().unwrap());
+            "default".to_string()
+        }
+    };
+    start_service(&app, &state, &account).await
+}
+
+/// The accounts and which one is active.
+#[tauri::command]
+fn accounts(state: State<'_, AppState>) -> AccountsView {
+    let file = state.accounts.lock().unwrap();
+    AccountsView {
+        accounts: file.accounts.clone(),
+        active: file.active.clone(),
+    }
+}
+
+/// Adds an account and switches to it, which starts pairing.
+#[tauri::command]
+async fn add_account(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    label: Option<String>,
+) -> Result<(), String> {
+    let id = format!("acct-{}", now_millis());
+    {
+        let mut file = state.accounts.lock().unwrap();
+        file.accounts.push(Account {
+            id: id.clone(),
+            label: label.unwrap_or_else(|| "WhatsApp".into()),
+        });
+        file.active = Some(id.clone());
+    }
+    save_accounts(&app, &state.accounts.lock().unwrap());
+    start_service(&app, &state, &id).await
+}
+
+/// Switches to another account, disconnecting the current one.
+#[tauri::command]
+async fn switch_account(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    {
+        let mut file = state.accounts.lock().unwrap();
+        if !file.accounts.iter().any(|a| a.id == id) {
+            return Err("unknown account".into());
+        }
+        file.active = Some(id.clone());
+    }
+    save_accounts(&app, &state.accounts.lock().unwrap());
+    start_service(&app, &state, &id).await
+}
+
+/// Removes an account and its data, switching to another if it was active.
+#[tauri::command]
+async fn remove_account(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
+    {
+        let mut file = state.accounts.lock().unwrap();
+        file.accounts.retain(|a| a.id != id);
+        if file.active.as_deref() == Some(id.as_str()) {
+            file.active = file.accounts.first().map(|a| a.id.clone());
+        }
+    }
+    save_accounts(&app, &state.accounts.lock().unwrap());
+    if let Some(existing) = state.service.lock().unwrap().take() {
+        existing.shutdown();
+    }
+    if id != "default" {
+        let _ = std::fs::remove_dir_all(account_base(&app, &id));
+    }
+    if let Some(next) = active_account(&state) {
+        start_service(&app, &state, &next).await?;
+    }
     Ok(())
 }
 
@@ -252,7 +428,11 @@ fn open_path(app: AppHandle, state: State<'_, AppState>, path: String) -> Result
         .unwrap()
         .as_ref()
         .and_then(|service| service.media_dir())
-        .or_else(|| config_for(&app, &state.settings.lock().unwrap()).media_dir);
+        .or_else(|| {
+            let account = active_account(&state)?;
+            let settings = state.settings.lock().unwrap().clone();
+            config_for(&app, &settings, &account).media_dir
+        });
 
     let dir = configured
         .and_then(|dir| std::fs::canonicalize(dir).ok())
@@ -423,6 +603,7 @@ pub fn run() {
             app.manage(AppState {
                 service: Mutex::new(None),
                 settings: Mutex::new(UiSettings::default()),
+                accounts: Mutex::new(load_accounts(app.handle())),
             });
 
             // Built here rather than from the config so clipboard access can be
@@ -441,6 +622,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             connection_state,
             connect,
+            accounts,
+            add_account,
+            switch_account,
+            remove_account,
             messages,
             chats,
             resolve_names,

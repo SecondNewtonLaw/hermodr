@@ -38,6 +38,7 @@
     mention_count: number;
     pinned: boolean;
   };
+  type Account = { id: string; label: string };
   type SearchResult = {
     jid: string;
     name: string;
@@ -110,10 +111,14 @@
   /** Open mention query, or null while the autocomplete is closed. */
   let mentionQuery = $state<string | null>(null);
   /** Unread mentions in the open chat, oldest first, for jump-to-mention. */
+  let accountList: Account[] = $state([]);
+  let activeAccount = $state<string | null>(null);
   let searchQuery = $state("");
   let searchResults: SearchResult[] = $state([]);
   let titleOverride = $state<string | null>(null);
   let mentionQueue: string[] = $state([]);
+  /** Message briefly outlined after a jump, so it is easy to spot. */
+  let highlightedId = $state<string | null>(null);
   let mentionCursor = $state(0);
   let mentionIndex = $state(0);
   /** Mentions picked from the autocomplete, used to convert the text on send. */
@@ -326,6 +331,55 @@
     }
   }
 
+  async function loadAccounts() {
+    const view = await invoke<{ accounts: Account[]; active: string | null }>("accounts");
+    accountList = view.accounts;
+    activeAccount = view.active;
+  }
+
+  /** Clears everything tied to the current account before switching. */
+  function resetUi() {
+    chats = [];
+    messages = [];
+    selectedChat = null;
+    draft = "";
+    drafts = {};
+    pending = [];
+    replyingTo = null;
+    participants = [];
+    chosenMentions = [];
+    mentionQueue = [];
+    groupInfo = null;
+    showGroupInfo = false;
+  }
+
+  async function switchTo(id: string) {
+    if (id === activeAccount) return;
+    try {
+      resetUi();
+      connected = false;
+      await showQr(null);
+      await invoke("switch_account", { id });
+      await loadAccounts();
+      await syncState();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function addAccount() {
+    try {
+      resetUi();
+      connected = false;
+      await showQr(null);
+      await invoke("add_account", {});
+      await loadAccounts();
+      await syncState();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   /** Runs the chat/contact/group search. */
   async function runSearch() {
     const query = searchQuery.trim();
@@ -347,9 +401,15 @@
     openChat(result.jid, false, result.name);
   }
 
-  /** Scrolls a message into view by its id. */
+  /** Scrolls a message into view by its id, and highlights it briefly. */
   function scrollToMessage(id: string) {
-    scroller?.querySelector(`[data-id="${id}"]`)?.scrollIntoView({ block: "center" });
+    const element = scroller?.querySelector(`[data-id="${id}"]`);
+    if (!element) return;
+    element.scrollIntoView({ block: "center" });
+    highlightedId = id;
+    window.setTimeout(() => {
+      if (highlightedId === id) highlightedId = null;
+    }, 1600);
   }
 
   /** Jumps to the next unread mention, oldest to newest, wrapping around. */
@@ -851,7 +911,8 @@
             await refreshChats();
             if (payload.message.chat === selectedChat) {
               await reloadMessages();
-              scrollToBottom();
+              // An incoming message must not yank the view down while reading.
+              if (payload.message.from_me) scrollToBottom();
               // Seen while open, but only if the window is actually focused.
               if (!payload.message.from_me && document.hasFocus()) {
                 await invoke("mark_read", { chat: selectedChat });
@@ -892,6 +953,7 @@
       // Reuse a stored session automatically: pairing is only needed the very
       // first time, so the button should never be shown to a paired account.
       await connect();
+      await loadAccounts();
     }
 
     setup();
@@ -939,6 +1001,16 @@
     <aside class="chats">
       <header>
         <span>Chats</span>
+        <span class="account-bar">
+          {#each accountList as account (account.id)}
+            <button
+              class="account"
+              class:active={account.id === activeAccount}
+              title={account.label}
+              onclick={() => switchTo(account.id)}>{account.label}</button>
+          {/each}
+          <button class="account add" title="Add account" onclick={addAccount}>+</button>
+        </span>
         <button class="icon" title="Settings" onclick={() => (showSettings = !showSettings)}>
           ⚙
         </button>
@@ -1059,8 +1131,12 @@
 
         <div class="messages" bind:this={scroller} onscroll={onScroll}>
           {#each messages.slice().reverse() as message (message.id)}
-            <div class="bubble" class:mine={message.from_me} data-id={message.id}>
-              {#if !message.from_me}
+            <div
+              class="bubble"
+              class:mine={message.from_me}
+              class:highlighted={message.id === highlightedId}
+              data-id={message.id}>
+              {#if !message.from_me && selectedChat?.endsWith("@g.us")}
                 <span class="sender">{senderLabel(message)}</span>
               {/if}
 
@@ -1598,6 +1674,7 @@
   }
   .chats {
     position: relative;
+    overflow: hidden;
     border-right: 1px solid #27272a;
     display: flex;
     flex-direction: column;
@@ -1611,6 +1688,31 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
+  }
+  .account-bar {
+    display: flex;
+    gap: 4px;
+    overflow: hidden;
+    flex: 1;
+    justify-content: center;
+  }
+  .account {
+    background: transparent;
+    border: 0;
+    color: #a1a1aa;
+    font: inherit;
+    font-size: 11px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    cursor: pointer;
+    max-width: 96px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .account.active {
+    background: #27272a;
+    color: #e4e4e7;
   }
   .search {
     margin: 8px 14px;
@@ -1781,6 +1883,10 @@
     word-break: break-word;
     overflow-wrap: anywhere;
     overflow: hidden;
+  }
+  .bubble.highlighted {
+    outline: 2px solid #22c55e;
+    outline-offset: 1px;
   }
   .bubble.mine {
     align-self: flex-end;

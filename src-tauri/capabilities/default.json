@@ -8,6 +8,10 @@
   "permissions": [
     "core:default",
     "allow-connect",
+    "allow-accounts",
+    "allow-add-account",
+    "allow-switch-account",
+    "allow-remove-account",
     "allow-messages",
     "allow-chats",
     "allow-send-text",
