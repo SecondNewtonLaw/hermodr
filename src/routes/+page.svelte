@@ -113,6 +113,7 @@
   /** Unread mentions in the open chat, oldest first, for jump-to-mention. */
   let accountList: Account[] = $state([]);
   let activeAccount = $state<string | null>(null);
+  let showAccounts = $state(false);
   let searchQuery = $state("");
   let searchResults: SearchResult[] = $state([]);
   let titleOverride = $state<string | null>(null);
@@ -360,6 +361,31 @@
       connected = false;
       await showQr(null);
       await invoke("switch_account", { id });
+      await loadAccounts();
+      await syncState();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function renameAccount(id: string, label: string) {
+    try {
+      await invoke("rename_account", { id, label });
+      await loadAccounts();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function removeAccount(id: string) {
+    if (!window.confirm("Remove this account and its local data?")) return;
+    try {
+      if (id === activeAccount) {
+        resetUi();
+        connected = false;
+        await showQr(null);
+      }
+      await invoke("remove_account", { id });
       await loadAccounts();
       await syncState();
     } catch (e) {
@@ -1010,6 +1036,9 @@
               onclick={() => switchTo(account.id)}>{account.label}</button>
           {/each}
           <button class="account add" title="Add account" onclick={addAccount}>+</button>
+          <button class="account add" title="Manage accounts" onclick={() => (showAccounts = true)}>
+            ⋯
+          </button>
         </span>
         <button class="icon" title="Settings" onclick={() => (showSettings = !showSettings)}>
           ⚙
@@ -1410,6 +1439,32 @@
   </div>
 {/if}
 
+{#if showAccounts}
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <div
+    class="sheet-backdrop"
+    role="presentation"
+    onclick={(e) => {
+      if (e.target === e.currentTarget) showAccounts = false;
+    }}>
+    <div class="sheet" role="dialog" aria-modal="true" aria-label="Accounts">
+      <h2>Accounts</h2>
+      {#each accountList as account (account.id)}
+        <div class="account-row">
+          <input
+            type="text"
+            value={account.label}
+            onchange={(e) => renameAccount(account.id, e.currentTarget.value)}
+          />
+          <button class="icon" title="Remove" onclick={() => removeAccount(account.id)}>×</button>
+        </div>
+      {/each}
+      <button class="primary" onclick={addAccount}>Add account</button>
+      <button class="primary" onclick={() => (showAccounts = false)}>Done</button>
+    </div>
+  </div>
+{/if}
+
 {#if showSettings}
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <div class="sheet-backdrop" role="presentation" onclick={() => (showSettings = false)}>
@@ -1688,6 +1743,15 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
+  }
+  .account-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+  .account-row input {
+    flex: 1;
   }
   .account-bar {
     display: flex;

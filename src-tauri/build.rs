@@ -5,6 +5,7 @@ const COMMANDS: &[&str] = &[
     "add_account",
     "switch_account",
     "remove_account",
+    "rename_account",
     "messages",
     "chats",
     "resolve_names",

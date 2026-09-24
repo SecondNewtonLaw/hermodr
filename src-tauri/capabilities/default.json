@@ -12,6 +12,7 @@
     "allow-add-account",
     "allow-switch-account",
     "allow-remove-account",
+    "allow-rename-account",
     "allow-messages",
     "allow-chats",
     "allow-send-text",

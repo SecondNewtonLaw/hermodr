@@ -312,6 +312,29 @@ async fn switch_account(
     start_service(&app, &state, &id).await
 }
 
+/// Renames an account.
+#[tauri::command]
+fn rename_account(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    label: String,
+) -> Result<(), String> {
+    let label = label.trim().to_string();
+    if label.is_empty() {
+        return Ok(());
+    }
+    {
+        let mut file = state.accounts.lock().unwrap();
+        match file.accounts.iter_mut().find(|a| a.id == id) {
+            Some(account) => account.label = label,
+            None => return Err("unknown account".into()),
+        }
+    }
+    save_accounts(&app, &state.accounts.lock().unwrap());
+    Ok(())
+}
+
 /// Removes an account and its data, switching to another if it was active.
 #[tauri::command]
 async fn remove_account(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
@@ -626,6 +649,7 @@ pub fn run() {
             add_account,
             switch_account,
             remove_account,
+            rename_account,
             messages,
             chats,
             resolve_names,
