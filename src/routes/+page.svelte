@@ -1006,6 +1006,15 @@
   <div class="error" role="alert">{error}</div>
 {/if}
 
+{#if syncPending > 0}
+  <div class="sync-banner">
+    <span class="sync-text">Loading messages… {syncPercent}%</span>
+    <div class="sync-track">
+      <div class="sync-bar" style="width: {syncPercent}%"></div>
+    </div>
+  </div>
+{/if}
+
 {#if !connected}
   <div class="pairing">
     <h1>Hermóðr</h1>
@@ -1164,15 +1173,6 @@
             </button>
           {/if}
         </header>
-
-        {#if syncPending > 0}
-          <div class="sync">
-            <span class="sync-text">Loading messages… {syncPercent}%</span>
-            <div class="sync-track">
-              <div class="sync-bar" style="width: {syncPercent}%"></div>
-            </div>
-          </div>
-        {/if}
 
         <div class="messages" bind:this={scroller} onscroll={onScroll}>
           {#each messages.slice().reverse() as message (message.id)}
@@ -1925,7 +1925,12 @@
     flex-direction: column;
     gap: 6px;
   }
-  .sync {
+  .sync-banner {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 100;
     display: flex;
     align-items: center;
     gap: 8px;
