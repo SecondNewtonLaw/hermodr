@@ -1,0 +1,5 @@
+# A global git config rewrites https://github.com/ to git@github.com:, and
+# Cargo's bundled git cannot authenticate over SSH. Shell out to the system git
+# instead, which uses the user's SSH agent.
+[net]
+git-fetch-with-cli = true
