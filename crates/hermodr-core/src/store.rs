@@ -77,6 +77,8 @@ pub struct StoredMessage {
     pub read: bool,
     /// Whether the sender deleted the message for everyone.
     pub revoked: bool,
+    /// Whether the message mentions us (directly or via @all).
+    pub mentioned: bool,
     /// Delivery state of a message we sent: `pending`, `sent`, `delivered` or
     /// `read`. `None` for incoming messages.
     pub status: Option<String>,
@@ -97,6 +99,10 @@ pub struct ChatSummary {
     pub message_count: i64,
     /// Incoming messages the user has not seen yet.
     pub unread_count: i64,
+    /// Unread messages that mention us.
+    pub mention_count: i64,
+    /// Whether the chat is pinned, mirrored from the account.
+    pub pinned: bool,
 }
 
 /// SQLite-backed message store.
@@ -169,6 +175,16 @@ impl MessageStore {
                 conn.execute(&format!("ALTER TABLE messages ADD COLUMN {column} TEXT"), [])?;
             }
         }
+
+        if !existing.iter().any(|c| c == "mentioned") {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN mentioned INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+
+        // Chat pins, mirrored from the account so they match the phone.
+        conn.execute("CREATE TABLE IF NOT EXISTS pins (jid TEXT PRIMARY KEY)", [])?;
 
         let existing_names: Vec<String> = {
             let mut stmt = conn.prepare("PRAGMA table_info(names)")?;
@@ -342,7 +358,7 @@ impl MessageStore {
         let mut stmt = conn.prepare(
             "SELECT m.chat, m.id, m.sender, m.timestamp, m.from_me, m.text,
                     n.name, m.media_kind, m.media_path, m.reply_to_id, m.reply_to_text,
-                    m.read, m.revoked, m.status, m.reply_to_sender
+                    m.read, m.revoked, m.status, m.reply_to_sender, m.mentioned
              FROM messages m
              LEFT JOIN names n ON n.jid = m.sender
              WHERE m.chat = ?1
@@ -365,8 +381,40 @@ impl MessageStore {
                 revoked: row.get::<_, i32>(12)? != 0,
                 status: row.get(13)?,
                 reply_to_sender: row.get(14)?,
+                mentioned: row.get::<_, i32>(15)? != 0,
             })
         })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    /// Unread messages in `chat` that mention us, oldest first.
+    pub fn unread_mentions(&self, chat: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM messages
+             WHERE chat = ?1 AND read = 0 AND from_me = 0 AND mentioned = 1
+             ORDER BY timestamp ASC",
+        )?;
+        let rows = stmt.query_map(params![chat], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    /// Mirrors a chat's pin state from the account.
+    pub fn set_pinned(&self, jid: &str, pinned: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        if pinned {
+            conn.execute("INSERT OR IGNORE INTO pins (jid) VALUES (?1)", params![jid])?;
+        } else {
+            conn.execute("DELETE FROM pins WHERE jid = ?1", params![jid])?;
+        }
+        Ok(())
+    }
+
+    /// The pinned chats.
+    pub fn pinned_chats(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT jid FROM pins")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
@@ -376,7 +424,7 @@ impl MessageStore {
         let message = conn.query_row(
             "SELECT m.chat, m.id, m.sender, m.timestamp, m.from_me, m.text,
                     n.name, m.media_kind, m.media_path, m.reply_to_id, m.reply_to_text,
-                    m.read, m.revoked, m.status, m.reply_to_sender
+                    m.read, m.revoked, m.status, m.reply_to_sender, m.mentioned
              FROM messages m
              LEFT JOIN names n ON n.jid = m.sender
              WHERE m.chat = ?1 AND m.id = ?2",
@@ -398,6 +446,7 @@ impl MessageStore {
                     revoked: row.get::<_, i32>(12)? != 0,
                     status: row.get(13)?,
                     reply_to_sender: row.get(14)?,
+                    mentioned: row.get::<_, i32>(15)? != 0,
                 })
             },
         )?;
@@ -413,10 +462,14 @@ impl MessageStore {
                     COUNT(*) AS message_count,
                     n.name,
                     SUM(CASE WHEN m.read = 0 AND m.from_me = 0 THEN 1 ELSE 0 END)
-                        AS unread_count
+                        AS unread_count,
+                    SUM(CASE WHEN m.read = 0 AND m.from_me = 0 AND m.mentioned = 1
+                        THEN 1 ELSE 0 END) AS mention_count,
+                    MAX(CASE WHEN p.jid IS NOT NULL THEN 1 ELSE 0 END) AS pinned
              FROM messages m
              LEFT JOIN names n ON n.jid = m.chat
-             GROUP BY m.chat ORDER BY last_message_at DESC",
+             LEFT JOIN pins p ON p.jid = m.chat
+             GROUP BY m.chat ORDER BY pinned DESC, last_message_at DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -425,12 +478,14 @@ impl MessageStore {
                 row.get::<_, i64>(2)?,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })?;
 
         let mut summaries = Vec::new();
         for row in rows {
-            let (chat, last_message_at, message_count, display_name, unread_count) = row?;
+            let (chat, last_message_at, message_count, display_name, unread_count, mention_count, pinned) = row?;
             // The preview is fetched separately so the aggregate query stays simple.
             let (last_text, last_from_me, last_sender_name) = conn
                 .query_row(
@@ -458,6 +513,8 @@ impl MessageStore {
                 last_sender_name,
                 message_count,
                 unread_count,
+                mention_count,
+                pinned: pinned != 0,
             });
         }
         Ok(summaries)
@@ -615,6 +672,7 @@ mod tests {
             reply_to_sender: None,
             read: false,
             revoked: false,
+            mentioned: false,
             status: None,
         }
     }

@@ -11,7 +11,7 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
-use hermodr_core::{ChatSummary, Retention, Service, ServiceConfig, StoredMessage};
+use hermodr_core::{ChatSummary, Retention, Service, ServiceConfig, ServiceEvent, StoredMessage};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 /// Event name the frontend listens on for service updates.
@@ -78,6 +78,17 @@ pub struct ConnectionState {
     pub qr: Option<String>,
 }
 
+/// The event that tells a fallen-behind UI what the current state is.
+fn resync_event(service: &Service) -> ServiceEvent {
+    if service.is_connected() {
+        ServiceEvent::Connected
+    } else if let Some(code) = service.current_qr() {
+        ServiceEvent::QrCode { code }
+    } else {
+        ServiceEvent::Disconnected
+    }
+}
+
 #[tauri::command]
 fn connection_state(state: State<'_, AppState>) -> ConnectionState {
     let service = state.service.lock().unwrap().clone();
@@ -116,6 +127,7 @@ async fn connect(app: AppHandle, state: State<'_, AppState>) -> Result<(), Strin
     // `events` was registered before the connection attempt, so the pairing code
     // cannot slip through the gap between starting and subscribing.
     let emitter = app.clone();
+    let service_for_events = service.clone();
     tauri::async_runtime::spawn(async move {
         loop {
             match events.recv().await {
@@ -123,9 +135,12 @@ async fn connect(app: AppHandle, state: State<'_, AppState>) -> Result<(), Strin
                     let _ = emitter.emit(SERVICE_EVENT, &event);
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
-                    // A slow consumer missed some events. Messages are in the
-                    // store regardless, so the UI can recover by refetching.
+                    // A slow consumer missed some events, and that can include
+                    // `Connected`: an offline-sync burst is larger than any
+                    // buffer. Re-announce the state so the UI catches up. The
+                    // messages themselves are in the store to be refetched.
                     eprintln!("[hermodr] dropped {dropped} service event(s)");
+                    let _ = emitter.emit(SERVICE_EVENT, &resync_event(&service_for_events));
                 }
                 Err(_) => break,
             }
@@ -328,6 +343,25 @@ async fn group_info(
         .map_err(|e| e.to_string())
 }
 
+/// Pins or unpins a chat, mirroring it to the account.
+#[tauri::command]
+async fn set_pinned(state: State<'_, AppState>, chat: String, pinned: bool) -> Result<(), String> {
+    state
+        .service()?
+        .set_pinned(&chat, pinned)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Unread messages that mention us, oldest first.
+#[tauri::command]
+fn unread_mentions(state: State<'_, AppState>, chat: String) -> Result<Vec<String>, String> {
+    state
+        .service()?
+        .unread_mentions(&chat)
+        .map_err(|e| e.to_string())
+}
+
 /// Renders a pairing code as SVG for the UI to display.
 #[tauri::command]
 fn qr_svg(value: String) -> Result<String, String> {
@@ -390,6 +424,8 @@ pub fn run() {
             read_file,
             participants,
             group_info,
+            set_pinned,
+            unread_mentions,
             qr_svg,
             get_settings,
             set_settings

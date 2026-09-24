@@ -22,6 +22,8 @@
     "allow-open-path",
     "allow-read-file",
     "allow-participants",
-    "allow-group-info"
+    "allow-group-info",
+    "allow-set-pinned",
+    "allow-unread-mentions"
   ]
 }

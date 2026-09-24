@@ -19,6 +19,7 @@
     reply_to_sender: string | null;
     read: boolean;
     revoked: boolean;
+    mentioned: boolean;
     status: string | null;
   };
   type ChatSummary = {
@@ -30,6 +31,8 @@
     last_sender_name: string | null;
     message_count: number;
     unread_count: number;
+    mention_count: number;
+    pinned: boolean;
   };
   type GroupInfo = {
     subject: string | null;
@@ -69,7 +72,9 @@
     | { kind: "disconnected" }
     | { kind: "message"; message: StoredMessage }
     | { kind: "retentionApplied"; removed: number }
-    | { kind: "namesUpdated"; count: number };
+    | { kind: "namesUpdated"; count: number }
+    | { kind: "syncing"; pending: number }
+    | { kind: "synced" };
 
   let connected = $state(false);
   let connecting = $state(false);
@@ -78,6 +83,12 @@
   let chats: ChatSummary[] = $state([]);
   let selectedChat = $state<string | null>(null);
   let messages: StoredMessage[] = $state([]);
+  /** Offline-backlog progress: how many were announced and how many arrived. */
+  let syncPending = $state(0);
+  let syncSeen = $state(0);
+  let syncPercent = $derived(
+    syncPending > 0 ? Math.min(100, Math.round((syncSeen / syncPending) * 100)) : 0,
+  );
   let draft = $state("");
   /** Per-chat composer text, so switching chats does not lose what was typed. */
   let drafts: Record<string, string> = $state({});
@@ -86,6 +97,9 @@
   let participants: { jid: string; name: string }[] = $state([]);
   /** Open mention query, or null while the autocomplete is closed. */
   let mentionQuery = $state<string | null>(null);
+  /** Unread mentions in the open chat, oldest first, for jump-to-mention. */
+  let mentionQueue: string[] = $state([]);
+  let mentionCursor = $state(0);
   let mentionIndex = $state(0);
   /** Mentions picked from the autocomplete, used to convert the text on send. */
   let chosenMentions: { name: string; jid: string }[] = $state([]);
@@ -225,7 +239,7 @@
     }
   }
 
-  async function openChat(chat: string) {
+  async function openChat(chat: string, jumpToMention = false) {
     selectedChat = chat;
     scrolledUp = false;
     participants = [];
@@ -234,6 +248,13 @@
     draft = drafts[chat] ?? "";
     showGroupInfo = false;
     groupInfo = null;
+    // Captured before the chat is marked read, since that clears them.
+    try {
+      mentionQueue = await invoke<string[]>("unread_mentions", { chat });
+    } catch {
+      mentionQueue = [];
+    }
+    mentionCursor = 0;
     try {
       messages = await invoke<StoredMessage[]>("messages", { chat, limit: 200 });
       // Opening a conversation is what marks it seen.
@@ -251,7 +272,35 @@
     }
     // Opening a chat is the obvious moment to start typing.
     await tick();
+    if (jumpToMention && mentionQueue.length > 0) {
+      mentionCursor = 1;
+      scrollToMessage(mentionQueue[0]);
+    }
     composerInput?.focus();
+  }
+
+  /** Scrolls a message into view by its id. */
+  function scrollToMessage(id: string) {
+    scroller?.querySelector(`[data-id="${id}"]`)?.scrollIntoView({ block: "center" });
+  }
+
+  /** Jumps to the next unread mention, oldest to newest, wrapping around. */
+  function jumpNextMention() {
+    if (mentionQueue.length === 0) return;
+    const id = mentionQueue[mentionCursor % mentionQueue.length];
+    mentionCursor = (mentionCursor + 1) % mentionQueue.length;
+    scrollToMessage(id);
+  }
+
+  /** Pins or unpins a chat, mirrored to the account. */
+  async function togglePin(chat: ChatSummary, event: MouseEvent) {
+    event.stopPropagation();
+    try {
+      await invoke("set_pinned", { chat: chat.chat, pinned: !chat.pinned });
+      await refreshChats();
+    } catch (e) {
+      error = String(e);
+    }
   }
 
   /** Opens the right sidebar with the group's subject, description and members. */
@@ -728,6 +777,7 @@
             connected = false;
             break;
           case "message":
+            if (syncPending > 0) syncSeen += 1;
             // Refresh the list first (cheap), then the conversation, so the
             // open chat updates immediately rather than after a network query.
             await refreshChats();
@@ -750,6 +800,18 @@
             // display names are stale until both lists reload.
             await refreshChats();
             await reloadMessages();
+            break;
+          case "syncing":
+            syncPending = payload.pending;
+            syncSeen = 0;
+            break;
+          case "synced":
+            // The backlog is in; refresh so the lists include everything the
+            // burst delivered.
+            await refreshChats();
+            await reloadMessages();
+            syncPending = 0;
+            syncSeen = 0;
             break;
         }
       });
@@ -811,17 +873,40 @@
       <ul>
         {#each chats as chat (chat.chat)}
           <li>
-            <button
+            <div
+              class="chat-row"
               class:active={chat.chat === selectedChat}
+              role="button"
+              tabindex="0"
               onclick={() => openChat(chat.chat)}
-            >
-              <span class="name">{chatLabel(chat)}</span>
+              onkeydown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  openChat(chat.chat);
+                }
+              }}>
+              <span class="name">{#if chat.pinned}<span class="pin">📌</span>{/if}{chatLabel(chat)}</span>
               <span class="time">{formatTime(chat.last_message_at)}</span>
               <span class="preview">{chatPreview(chat)}</span>
-              {#if chat.unread_count > 0}
-                <span class="badge">{chat.unread_count > 99 ? "99+" : chat.unread_count}</span>
-              {/if}
-            </button>
+              <span class="badges">
+                {#if chat.mention_count > 0}
+                  <button
+                    class="badge mention"
+                    title="Jump to mention"
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      openChat(chat.chat, true);
+                    }}>@</button>
+                {/if}
+                {#if chat.unread_count > 0}
+                  <span class="badge">{chat.unread_count > 99 ? "99+" : chat.unread_count}</span>
+                {/if}
+                <button
+                  class="badge pin-toggle"
+                  title={chat.pinned ? "Unpin" : "Pin"}
+                  onclick={(e) => togglePin(chat, e)}>📌</button>
+              </span>
+            </div>
           </li>
         {/each}
         {#if chats.length === 0}
@@ -841,11 +926,25 @@
           {:else}
             {chats.find((c) => c.chat === selectedChat)?.display_name ?? bareJid(selectedChat)}
           {/if}
+          {#if mentionQueue.length > 0}
+            <button class="icon jump-mention" title="Jump to mention" onclick={jumpNextMention}>
+              @ {mentionCursor}/{mentionQueue.length}
+            </button>
+          {/if}
         </header>
+
+        {#if syncPending > 0}
+          <div class="sync">
+            <span class="sync-text">Loading messages… {syncPercent}%</span>
+            <div class="sync-track">
+              <div class="sync-bar" style="width: {syncPercent}%"></div>
+            </div>
+          </div>
+        {/if}
 
         <div class="messages" bind:this={scroller} onscroll={onScroll}>
           {#each messages.slice().reverse() as message (message.id)}
-            <div class="bubble" class:mine={message.from_me}>
+            <div class="bubble" class:mine={message.from_me} data-id={message.id}>
               {#if !message.from_me}
                 <span class="sender">{senderLabel(message)}</span>
               {/if}
@@ -1197,6 +1296,7 @@
     display: grid;
     grid-template-columns: 300px 1fr;
     height: 100%;
+    overflow: hidden;
   }
   .chats,
   .group-info {
@@ -1291,9 +1391,10 @@
     color: #71717a;
     font-size: 11px;
   }
-  /* Keep the newlines the sender typed. */
+  /* Keep the newlines the sender typed, and wrap long tokens. */
   .text {
     white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
   .chats {
     position: relative;
@@ -1318,7 +1419,7 @@
     overflow-y: auto;
     flex: 1;
   }
-  .chats button {
+  .chat-row {
     width: 100%;
     display: grid;
     grid-template-columns: 1fr auto auto;
@@ -1334,11 +1435,43 @@
     font: inherit;
     align-items: center;
   }
-  .chats button:hover {
+  .chat-row:hover {
     background: #1c1c1f;
   }
-  .chats button.active {
+  .chat-row.active {
     background: #27272a;
+  }
+  .badges {
+    grid-area: badge;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .pin {
+    margin-right: 2px;
+  }
+  .badge.mention {
+    background: #2563eb;
+    color: #fff;
+    border: 0;
+    cursor: pointer;
+    font-weight: 700;
+  }
+  .badge.pin-toggle {
+    background: transparent;
+    border: 0;
+    color: inherit;
+    min-width: 0;
+    padding: 0;
+    cursor: pointer;
+    opacity: 0;
+    font-size: 11px;
+  }
+  .chat-row:hover .pin-toggle {
+    opacity: 0.7;
+  }
+  .jump-mention {
+    font-size: 12px;
   }
   .name {
     grid-area: name;
@@ -1379,15 +1512,43 @@
     display: flex;
     flex-direction: column;
     min-height: 0;
+    min-width: 0;
     position: relative;
   }
   .messages {
     flex: 1;
     overflow-y: auto;
+    overflow-x: hidden;
+    min-width: 0;
     padding: 14px;
     display: flex;
     flex-direction: column;
     gap: 6px;
+  }
+  .sync {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 14px;
+    background: #1c1c1f;
+    border-bottom: 1px solid #27272a;
+  }
+  .sync-text {
+    font-size: 11px;
+    color: #a1a1aa;
+    white-space: nowrap;
+  }
+  .sync-track {
+    flex: 1;
+    height: 4px;
+    border-radius: 2px;
+    background: #27272a;
+    overflow: hidden;
+  }
+  .sync-bar {
+    height: 100%;
+    background: #22c55e;
+    transition: width 0.2s ease;
   }
   .bubble {
     max-width: 70%;
@@ -1406,6 +1567,7 @@
     flex-direction: column;
     gap: 3px;
     word-break: break-word;
+    overflow-wrap: anywhere;
     overflow: hidden;
   }
   .bubble.mine {

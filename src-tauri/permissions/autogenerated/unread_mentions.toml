@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-unread-mentions"
+description = "Enables the unread_mentions command without any pre-configured scope."
+commands.allow = ["unread_mentions"]
+
+[[permission]]
+identifier = "deny-unread-mentions"
+description = "Denies the unread_mentions command without any pre-configured scope."
+commands.deny = ["unread_mentions"]

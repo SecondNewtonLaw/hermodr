@@ -77,7 +77,38 @@ fi
 
 say "building a release bundle"
 pnpm tauri build
-say "done: see src-tauri/target/release/bundle"
+
+say "installing the desktop entry"
+BIN_DIR="$HOME/.local/bin"
+APP_DIR="$HOME/.local/share/applications"
+ICON_DIR="$HOME/.local/share/icons/hicolor/256x256/apps"
+BIN="$ROOT/src-tauri/target/release/hermodr"
+[ -x "$BIN" ] || die "release binary not found at $BIN"
+mkdir -p "$BIN_DIR" "$APP_DIR" "$ICON_DIR"
+install -m 755 "$BIN" "$BIN_DIR/hermodr"
+# `whatsapp` is the name people look for, so provide it as an alias.
+ln -sf "$BIN_DIR/hermodr" "$BIN_DIR/whatsapp"
+install -m 644 "$ROOT/src-tauri/icons/icon.png" "$ICON_DIR/hermodr.png"
+cat > "$APP_DIR/hermodr.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Hermóðr
+GenericName=WhatsApp Client
+Comment=Native WhatsApp desktop client
+Exec=$BIN_DIR/hermodr
+Icon=hermodr
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+Keywords=whatsapp;chat;messaging;hermodr;
+StartupWMClass=hermodr
+DESKTOP
+if command -v update-desktop-database >/dev/null; then
+  update-desktop-database "$APP_DIR" || true
+fi
+
+say "done: hermodr installed (also as \"whatsapp\")"
+say "make sure $BIN_DIR is on your PATH"
 
 # System packages are not installed here on purpose: a script that quietly runs
 # a package manager is a script that quietly runs a package manager. What the

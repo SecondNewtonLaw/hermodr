@@ -145,6 +145,11 @@ pub enum ServiceEvent {
     /// Address-book names were learned, so cached chats and messages now hold
     /// stale display names and should be refetched.
     NamesUpdated { count: usize },
+    /// The offline backlog is draining; `pending` is how many messages the
+    /// server announced at the start of the drain.
+    Syncing { pending: usize },
+    /// The backlog finished draining.
+    Synced,
 }
 
 /// A group member, as the mention autocomplete needs it.
@@ -358,6 +363,13 @@ impl Service {
                                         eprintln!("[service] contact resync failed: {e}");
                                     }
                                 }
+                                // Pins live in a different collection.
+                                if let Err(e) = client
+                                    .resync_app_state_collection(WAPatchName::RegularLow)
+                                    .await
+                                {
+                                    eprintln!("[service] pin resync failed: {e}");
+                                }
                             });
                         }
                     }
@@ -371,6 +383,9 @@ impl Service {
                     EventKind::ServerAck,
                     EventKind::ContactUpdate,
                     EventKind::ContactRemoved,
+                    EventKind::OfflineSyncPreview,
+                    EventKind::OfflineSyncCompleted,
+                    EventKind::PinUpdate,
                 ],
                 move |event, _client| {
                     let store = store_for_events.clone();
@@ -382,6 +397,18 @@ impl Service {
                         match event.as_ref() {
                             Event::Messages(batch) => {
                                 let client = client_for_events.get().cloned();
+                                // Our own addresses, so a mention can be
+                                // recognised whichever form it uses.
+                                let own: Vec<String> = client
+                                    .as_deref()
+                                    .map(|c| {
+                                        [c.pn(), c.lid()]
+                                            .into_iter()
+                                            .flatten()
+                                            .map(|j| j.to_non_ad().to_string())
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
                                 for inbound in batch.messages.iter() {
                                     // The envelope carries the sender's display
                                     // name, which is the only name source
@@ -498,6 +525,7 @@ impl Service {
                                         message.reply_to_text =
                                             Some(resolve_mention_tokens(&reply, &store));
                                     }
+                                    message.mentioned = mentions_me(&inbound.message, &own);
                                     let _ = store.upsert(&message);
                                     let _ = events.send(ServiceEvent::Message { message: Box::new(message) });
                                 }
@@ -564,6 +592,24 @@ impl Service {
                             }
                             Event::ContactRemoved(removed) => {
                                 let _ = store.clear_saved_name(&removed.jid.to_string());
+                            }
+                            // Progress for the initial catch-up, so the UI can
+                            // show how much of the backlog is still arriving.
+                            Event::OfflineSyncPreview(preview) => {
+                                let pending = preview.messages.max(0) as usize;
+                                if pending > 0 {
+                                    let _ = events.send(ServiceEvent::Syncing { pending });
+                                }
+                            }
+                            Event::OfflineSyncCompleted(_) => {
+                                let _ = events.send(ServiceEvent::Synced);
+                            }
+                            // Chat pins are account state; mirror them so the
+                            // list matches the phone.
+                            Event::PinUpdate(pin) => {
+                                let pinned = pin.action.pinned.unwrap_or(false);
+                                let jid = pin.jid.to_non_ad().to_string();
+                                let _ = store.set_pinned(&jid, pinned);
                             }
                             _ => {}
                         }
@@ -779,6 +825,7 @@ impl Service {
             // claiming so shows a read marker that is not true.
             read: false,
             revoked: false,
+            mentioned: false,
             status: Some("pending".into()),
         };
         self.store.upsert(&message)?;
@@ -793,6 +840,24 @@ impl Service {
             .or_else(|| self.client.lid())
             .map(|j| j.to_non_ad().to_string())
             .unwrap_or_default()
+    }
+
+    /// Pins or unpins a chat, mirroring it to the account.
+    pub async fn set_pinned(&self, chat: &str, pinned: bool) -> Result<()> {
+        let jid: Jid = chat.parse()?;
+        self.store.set_pinned(&jid.to_non_ad().to_string(), pinned)?;
+        let actions = self.client.chat_actions();
+        let result = if pinned {
+            actions.pin_chat(&jid).await
+        } else {
+            actions.unpin_chat(&jid).await
+        };
+        result.map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+
+    /// Unread messages that mention us, oldest first.
+    pub fn unread_mentions(&self, chat: &str) -> Result<Vec<String>> {
+        self.store.unread_mentions(chat)
     }
 
     /// Where media is stored, if enabled.
@@ -869,6 +934,7 @@ impl Service {
             }),
             read: false,
             revoked: false,
+            mentioned: false,
             status: Some("pending".into()),
         };
         self.store.upsert(&stored)?;
@@ -974,6 +1040,7 @@ impl Service {
             reply_to_sender: None,
             read: false,
             revoked: false,
+            mentioned: false,
             status: Some("pending".into()),
         };
         self.store.upsert(&stored)?;
@@ -1159,6 +1226,7 @@ async fn incoming_message(
         // Newly arrived, so unseen until the chat is opened.
         read: false,
         revoked: false,
+        mentioned: false,
         status: None,
     })
 }
@@ -1244,11 +1312,10 @@ fn backfill_lid_names(session_path: &std::path::Path, store: &MessageStore) {
 }
 
 /// The JIDs a message mentions, from whichever message type carries them.
-fn mentioned_jids(message: &wa::Message) -> Vec<String> {
+fn message_context(message: &wa::Message) -> Option<&wa::ContextInfo> {
     use whatsapp_rust::wacore::proto_helpers::MessageExt;
     let base = message.get_base_message();
-    let context = base
-        .extended_text_message
+    base.extended_text_message
         .as_option()
         .and_then(|m| m.context_info.as_option())
         .or_else(|| {
@@ -1262,11 +1329,36 @@ fn mentioned_jids(message: &wa::Message) -> Vec<String> {
                 .and_then(|m| m.context_info.as_option())
         })
         .or_else(|| {
+            base.audio_message
+                .as_option()
+                .and_then(|m| m.context_info.as_option())
+        })
+        .or_else(|| {
             base.document_message
                 .as_option()
                 .and_then(|m| m.context_info.as_option())
-        });
-    context.map(|c| c.mentioned_jid.clone()).unwrap_or_default()
+        })
+}
+
+/// The JIDs a message mentions.
+fn mentioned_jids(message: &wa::Message) -> Vec<String> {
+    message_context(message)
+        .map(|c| c.mentioned_jid.clone())
+        .unwrap_or_default()
+}
+
+/// Whether a message mentions us: directly, or everyone through @all.
+fn mentions_me(message: &wa::Message, own: &[String]) -> bool {
+    let Some(context) = message_context(message) else {
+        return false;
+    };
+    if !context.group_mentions.is_empty() {
+        return true;
+    }
+    context.mentioned_jid.iter().any(|mention| {
+        let bare = mention.split(':').next().unwrap_or(mention);
+        own.iter().any(|me| me == mention || me == bare)
+    })
 }
 
 /// Rewrites `@<number>` mention tokens into the name we know for that JID.
@@ -1360,6 +1452,8 @@ mod tests {
             ServiceEvent::Disconnected,
             ServiceEvent::RetentionApplied { removed: 3 },
             ServiceEvent::NamesUpdated { count: 2 },
+            ServiceEvent::Syncing { pending: 5 },
+            ServiceEvent::Synced,
         ] {
             let json = serde_json::to_string(&event).expect("event must serialize");
             assert!(json.contains("\"kind\""), "missing tag: {json}");
@@ -1381,6 +1475,7 @@ mod tests {
                 reply_to_sender: None,
                 read: false,
                 revoked: false,
+                mentioned: false,
                 status: None,
             }),
         };

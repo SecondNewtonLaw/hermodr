@@ -12,6 +12,8 @@ const COMMANDS: &[&str] = &[
     "read_file",
     "participants",
     "group_info",
+    "set_pinned",
+    "unread_mentions",
     "qr_svg",
     "get_settings",
     "set_settings",
