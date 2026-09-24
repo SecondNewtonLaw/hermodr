@@ -1771,28 +1771,34 @@
   }
   .account-bar {
     display: flex;
+    align-items: center;
+    justify-content: center;
     gap: 4px;
     overflow: hidden;
+  }
+  /* Only the header bar fills the space between the title and the gear. */
+  .chats header .account-bar {
     flex: 1;
-    justify-content: center;
   }
   .account {
-    background: transparent;
-    border: 0;
+    background: #1c1c1f;
+    border: 1px solid #27272a;
     color: #a1a1aa;
     font: inherit;
     font-size: 11px;
-    padding: 2px 6px;
-    border-radius: 4px;
+    padding: 3px 10px;
+    border-radius: 999px;
     cursor: pointer;
-    max-width: 96px;
+    max-width: 110px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .account.active {
-    background: #27272a;
-    color: #e4e4e7;
+    background: #22c55e;
+    border-color: #22c55e;
+    color: #052e16;
+    font-weight: 600;
   }
   .search {
     margin: 8px 14px;
