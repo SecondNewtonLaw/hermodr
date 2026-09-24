@@ -406,6 +406,16 @@
     }
   }
 
+  /** Asks the phone for older messages in the open chat. */
+  async function loadOlder() {
+    if (!selectedChat) return;
+    try {
+      await invoke("load_older", { chat: selectedChat, count: 50 });
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   /** Runs the chat/contact/group search. */
   async function runSearch() {
     const query = searchQuery.trim();
@@ -1175,6 +1185,9 @@
         </header>
 
         <div class="messages" bind:this={scroller} onscroll={onScroll}>
+          {#if messages.length > 0}
+            <button class="load-older" onclick={loadOlder}>Load older messages</button>
+          {/if}
           {#each messages.slice().reverse() as message (message.id)}
             <div
               class="bubble"
@@ -1921,6 +1934,17 @@
     min-height: 0;
     min-width: 0;
     position: relative;
+  }
+  .load-older {
+    align-self: center;
+    background: #27272a;
+    border: 0;
+    border-radius: 999px;
+    color: #d4d4d8;
+    font: inherit;
+    font-size: 12px;
+    padding: 4px 12px;
+    cursor: pointer;
   }
   .messages {
     flex: 1;

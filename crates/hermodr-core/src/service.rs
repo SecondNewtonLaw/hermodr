@@ -1004,6 +1004,22 @@ impl Service {
         result.map_err(|e| anyhow::anyhow!(e.to_string()))
     }
 
+    /// Asks the phone for older messages in a chat.
+    ///
+    /// The request goes to our own primary device, and the messages arrive
+    /// asynchronously through the normal event stream.
+    pub async fn load_older(&self, chat: &str, count: i32) -> Result<()> {
+        let Some((id, from_me, timestamp)) = self.store.oldest_message(chat)? else {
+            return Ok(());
+        };
+        let jid: Jid = chat.parse()?;
+        self.client
+            .fetch_message_history(&jid, &id, from_me, timestamp * 1000, count)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        Ok(())
+    }
+
     /// Unread messages that mention us, oldest first.
     pub fn unread_mentions(&self, chat: &str) -> Result<Vec<String>> {
         self.store.unread_mentions(chat)

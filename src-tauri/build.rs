@@ -21,6 +21,7 @@ const COMMANDS: &[&str] = &[
     "search",
     "open_url",
     "unread_mentions",
+    "load_older",
     "qr_svg",
     "get_settings",
     "set_settings",

@@ -584,6 +584,20 @@ async fn set_pinned(state: State<'_, AppState>, chat: String, pinned: bool) -> R
         .map_err(|e| e.to_string())
 }
 
+/// Asks the phone for older messages in a chat.
+#[tauri::command]
+async fn load_older(
+    state: State<'_, AppState>,
+    chat: String,
+    count: Option<i32>,
+) -> Result<(), String> {
+    state
+        .service()?
+        .load_older(&chat, count.unwrap_or(50))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Unread messages that mention us, oldest first.
 #[tauri::command]
 fn unread_mentions(state: State<'_, AppState>, chat: String) -> Result<Vec<String>, String> {
@@ -663,6 +677,7 @@ pub fn run() {
             group_info,
             set_pinned,
             unread_mentions,
+            load_older,
             search,
             open_url,
             qr_svg,

@@ -448,6 +448,26 @@ impl MessageStore {
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
+    /// The oldest stored message in a chat, as (id, from_me, timestamp).
+    pub fn oldest_message(&self, chat: &str) -> Result<Option<(String, bool, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT id, from_me, timestamp FROM messages
+                 WHERE chat = ?1 ORDER BY timestamp ASC LIMIT 1",
+                params![chat],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i32>(1)? != 0,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .ok();
+        Ok(row)
+    }
+
     /// Unread messages in `chat` that mention us, oldest first.
     pub fn unread_mentions(&self, chat: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
