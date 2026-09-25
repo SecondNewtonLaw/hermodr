@@ -3,6 +3,7 @@
     jid: string;
     name: string;
     admin: boolean;
+    owner: boolean;
     number: string | null;
     username: string | null;
     label: string | null;
@@ -132,13 +133,36 @@
   const members = $derived(
     (info?.participants ?? [])
       // Our own entry may carry a nickname from our address book; show our push name.
-      .map((m) => ({ ...m, display: me && m === self ? namer(null, me) : namer(m.name, m.jid) }))
+      .map((m) => ({
+        ...m,
+        isSelf: m === self,
+        display: me && m === self ? namer(null, me) : namer(m.name, m.jid),
+      }))
       .filter((m) => {
         const q = query.trim().toLowerCase();
-        return !q || m.display.toLowerCase().includes(q) || (m.number ?? "").includes(q);
+        return (
+          !q ||
+          m.display.toLowerCase().includes(q) ||
+          (m.number ?? "").includes(q) ||
+          (m.username ?? "").toLowerCase().includes(q)
+        );
       })
-      .sort((a, b) => Number(b.admin) - Number(a.admin) || a.display.localeCompare(b.display)),
+      .sort(
+        (a, b) =>
+          Number(b.isSelf) - Number(a.isSelf) ||
+          Number(b.owner) - Number(a.owner) ||
+          a.display.localeCompare(b.display),
+      ),
   );
+  const groups = $derived(
+    [
+      { title: "Admins", list: members.filter((m) => m.admin) },
+      { title: "Members", list: members.filter((m) => !m.admin) },
+    ].filter((g) => g.list.length > 0),
+  );
+
+  /** The group picture shown large, or null while closed. */
+  let enlarged = $state<string | null>(null);
 
   $effect(() => {
     if (section === "members") for (const m of info?.participants ?? []) onavatar(m.jid);
@@ -193,7 +217,11 @@
     {/if}
   {:else if section === "overview"}
     <div class="hero">
-      {@render avatar(jid, title, 96)}
+      <button
+        class="hero-picture"
+        title={avatars[jid] ? "View picture" : undefined}
+        disabled={!avatars[jid]}
+        onclick={() => (enlarged = avatars[jid] ?? null)}>{@render avatar(jid, title, 96)}</button>
       <div>
         <h2>{info.subject ?? title}</h2>
         <span class="muted">
@@ -297,38 +325,57 @@
     <h2>Members</h2>
     <label class="member-search">
       <Icon name="search" size={15} />
-      <input placeholder="Search members" bind:value={query} />
+      <input placeholder="Search by name, number or username" bind:value={query} />
     </label>
-    <ul class="members">
-      {#each members as member (member.jid)}
-        <li class="member">
-          {@render avatar(member.jid, member.display, 36)}
-          <span class="member-text">
-            <span class="member-name">
-              {member.display}
-              {#if member.admin}<span class="tag">Admin</span>{/if}
-            </span>
-            {#if member.label}<span class="member-tag">{member.label}</span>{/if}
-            <span class="muted">
-              {#if member.number && member.display !== phoneLabel(member.number)}
-                {phoneLabel(member.number) ?? member.number}
+    {#each groups as group (group.title)}
+      <h3 class="member-group">{group.title} <span>{group.list.length}</span></h3>
+      <ul class="members">
+        {#each group.list as member (member.jid)}
+          {@const secondary = [
+            member.number && member.display !== phoneLabel(member.number)
+              ? (phoneLabel(member.number) ?? member.number)
+              : null,
+            member.username ? `@${member.username}` : null,
+          ].filter(Boolean)}
+          <li class="member">
+            {@render avatar(member.jid, member.display, 38)}
+            <span class="member-text">
+              <span class="member-name">
+                <span class="member-display">{member.display}</span>
+                {#if member.isSelf}<span class="you">You</span>{/if}
+              </span>
+              {#if member.label}
+                <span class="member-tag">{member.label}</span>
+              {:else if secondary.length > 0}
+                <span class="member-sub">{secondary.join(" · ")}</span>
               {/if}
-              {#if member.username}@{member.username}{/if}
             </span>
-          </span>
-          <button
-            class="message"
-            title="Message"
-            aria-label="Message {member.display}"
-            onclick={() => onmessage(member.jid)}><Icon name="message" size={16} /></button>
-        </li>
-      {/each}
-      {#if members.length === 0}
-        <li class="muted">No members match.</li>
-      {/if}
-    </ul>
+            {#if member.owner}
+              <span class="role owner">Owner</span>
+            {:else if member.admin}
+              <span class="role">Admin</span>
+            {/if}
+            {#if !member.isSelf}
+              <button
+                class="message"
+                title="Message"
+                aria-label="Message {member.display}"
+                onclick={() => onmessage(member.jid)}><Icon name="message" size={16} /></button>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+    {:else}
+      <p class="muted">No members match.</p>
+    {/each}
   {/if}
 </Panel>
+
+{#if enlarged}
+  <button class="lightbox" aria-label="Close picture" onclick={() => (enlarged = null)}>
+    <img src={convertFileSrc(enlarged)} alt={title} />
+  </button>
+{/if}
 
 <style>
   .avatar {
@@ -447,12 +494,72 @@
   .report-text {
     white-space: pre-wrap;
   }
+  .hero-picture {
+    flex: none;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    background: none;
+    cursor: zoom-in;
+    transition: filter 0.15s;
+  }
+  .hero-picture:disabled {
+    cursor: default;
+  }
+  .hero-picture:not(:disabled):hover {
+    filter: brightness(1.12);
+  }
+  .lightbox {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    display: grid;
+    place-items: center;
+    padding: 40px;
+    border: 0;
+    background: var(--scrim);
+    cursor: zoom-out;
+    animation: lightbox-in 0.18s ease both;
+  }
+  .lightbox img {
+    max-width: min(640px, 100%);
+    max-height: 100%;
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+  }
+  @keyframes lightbox-in {
+    from {
+      opacity: 0;
+    }
+  }
+  .member-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 18px 0 6px;
+    padding: 0 10px 6px;
+    border-bottom: 1px solid var(--line);
+    font-size: 11.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .member-group span {
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: var(--raised);
+    color: var(--muted);
+    letter-spacing: 0;
+  }
+  .members + .member-group {
+    margin-top: 22px;
+  }
   .member {
     display: flex;
     align-items: center;
     gap: 12px;
-    padding: 8px 10px;
+    padding: 7px 10px;
     border-radius: var(--radius);
+    transition: background 0.12s;
   }
   .member:hover {
     background: var(--surface);
@@ -462,18 +569,49 @@
     min-width: 0;
     display: flex;
     flex-direction: column;
+    gap: 1px;
   }
   .member-name {
     display: flex;
     align-items: center;
     gap: 6px;
+    min-width: 0;
+    font-weight: 500;
+  }
+  .member-display {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .you {
+    flex: none;
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--muted);
+  }
+  .member-sub,
   .member-tag {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     font-size: 12.5px;
+    color: var(--muted);
+  }
+  .member-tag {
     color: var(--accent-text);
+  }
+  .role {
+    flex: none;
+    padding: 2px 8px;
+    border-radius: 6px;
+    background: var(--accent-soft);
+    color: var(--accent-text);
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .role.owner {
+    background: var(--mention-self-soft);
+    color: var(--text);
   }
   .tag-row {
     display: flex;
@@ -493,6 +631,7 @@
     color: var(--muted);
     cursor: pointer;
     opacity: 0;
+    flex: none;
   }
   .member:hover .message,
   .message:focus-visible {

@@ -312,6 +312,8 @@ pub struct Participant {
     pub name: String,
     /// Whether the member is a group admin.
     pub admin: bool,
+    /// Whether the member created the group (a super admin).
+    pub owner: bool,
     /// Phone number, when known.
     pub number: Option<String>,
     /// WhatsApp username, when the member has one.
@@ -1096,11 +1098,22 @@ impl Service {
                                     .as_deref()
                                     .and_then(|c| c.pn())
                                     .map(|j| j.to_non_ad().to_string());
+                                let mut names_learned = 0;
                                 for push in &history.pushnames {
                                     if let (Some(id), Some(name)) = (&push.id, &push.pushname) {
-                                        if !name.is_empty() {
-                                            let _ = store.set_name(id, name);
+                                        if !name.is_empty() && store.set_name(id, name).is_ok() {
+                                            names_learned += 1;
                                         }
+                                    }
+                                }
+                                let pair = |lid: Option<&str>, pn: Option<&str>| {
+                                    let (Some(lid), Some(pn)) = (lid, pn) else { return false };
+                                    let user = |j: &str| j.split(['@', ':']).next().unwrap_or(j).to_string();
+                                    store.set_lid_pn(&user(lid), &user(pn)).is_ok()
+                                };
+                                for mapping in &history.phone_number_to_lid_mappings {
+                                    if pair(mapping.lid_jid.as_deref(), mapping.pn_jid.as_deref()) {
+                                        names_learned += 1;
                                     }
                                 }
                                 let mut chats = Vec::new();
@@ -1108,6 +1121,17 @@ impl Service {
                                     let chat = conversation.id.clone();
                                     if chat == "status@broadcast" {
                                         continue;
+                                    }
+                                    pair(conversation.lid_jid.as_deref(), conversation.pn_jid.as_deref());
+                                    if !chat.ends_with("@g.us") {
+                                        let name = conversation
+                                            .display_name
+                                            .as_deref()
+                                            .or(conversation.username.as_deref())
+                                            .filter(|n| !n.trim().is_empty());
+                                        if let Some(name) = name {
+                                            let _ = store.set_name(&chat, name);
+                                        }
                                     }
                                     if let Some(subject) =
                                         conversation.name.as_deref().filter(|n| !n.is_empty())
@@ -1125,15 +1149,6 @@ impl Service {
                                         else {
                                             continue;
                                         };
-                                        // A stored row keeps its read state and
-                                        // downloaded file; upsert would reset both.
-                                        if store.message(&chat, &id).is_ok() {
-                                            continue;
-                                        }
-                                        if let Some(target) = revoke_target(message) {
-                                            let _ = store.revoke(&chat, &target);
-                                            continue;
-                                        }
                                         let from_me = key.from_me.unwrap_or(false);
                                         let sender = if from_me {
                                             own.clone().unwrap_or_else(|| chat.clone())
@@ -1143,12 +1158,23 @@ impl Service {
                                                 .or_else(|| key.participant.clone())
                                                 .unwrap_or_else(|| chat.clone())
                                         };
+                                        // Learned even from rows we already have: a re-paired
+                                        // device gets its names back from this history.
                                         if let Some(push) =
                                             web.push_name.as_deref().filter(|p| !p.is_empty())
                                         {
-                                            if !from_me {
-                                                let _ = store.set_name(&sender, push);
+                                            if !from_me && store.set_name(&sender, push).is_ok() {
+                                                names_learned += 1;
                                             }
+                                        }
+                                        // A stored row keeps its read state and
+                                        // downloaded file; upsert would reset both.
+                                        if store.message(&chat, &id).is_ok() {
+                                            continue;
+                                        }
+                                        if let Some(target) = revoke_target(message) {
+                                            let _ = store.revoke(&chat, &target);
+                                            continue;
                                         }
                                         remember_structures(&store, &chat, &id, &sender, message);
                                         let envelope = Envelope {
@@ -1178,6 +1204,9 @@ impl Service {
                                     if added {
                                         chats.push(chat);
                                     }
+                                }
+                                if names_learned > 0 {
+                                    let _ = events.send(ServiceEvent::NamesUpdated { count: names_learned });
                                 }
                                 // Retention is left to the next live write, so
                                 // what was just loaded can be seen first.
@@ -1437,6 +1466,7 @@ impl Service {
                 jid: mention.clone(),
                 name,
                 admin: member.is_admin(),
+                owner: member.is_super_admin(),
                 number,
                 username,
                 label,

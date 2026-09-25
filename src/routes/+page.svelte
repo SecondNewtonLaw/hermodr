@@ -90,6 +90,7 @@
       jid: string;
       name: string;
       admin: boolean;
+      owner: boolean;
       number: string | null;
       username: string | null;
       label: string | null;
@@ -204,6 +205,8 @@
     admin: boolean;
   };
   let participants: Member[] = $state([]);
+  /** Last member list per group, shown while a switch reloads it so the header does not flash. */
+  const memberCache: Record<string, Member[]> = {};
   /** Open mention query, or null while the autocomplete is closed. */
   let mentionQuery = $state<string | null>(null);
   /** Unread mentions in the open chat, oldest first, for jump-to-mention. */
@@ -492,7 +495,7 @@
     invoke<{ retention: ChatRetention }>("chat_settings", { chat })
       .then((s) => selectedChat === chat && (loadOnScroll = s.retention.on_demand))
       .catch(() => {});
-    participants = [];
+    participants = memberCache[chat] ?? [];
     chosenMentions = [];
     mentionQuery = null;
     draft = drafts[chat] ?? "";
@@ -523,17 +526,15 @@
     }
     // Group members power the @ autocomplete; a one-to-one chat returns none.
     try {
-      participants = await invoke<Member[]>("participants", { chat });
+      const loaded = await invoke<Member[]>("participants", { chat });
+      memberCache[chat] = loaded;
+      if (selectedChat !== chat) return;
+      participants = loaded;
       // Loading members stores their group display names, so numbers looked up
       // before now may have a name; ask again.
-      for (const [jid, name] of Object.entries(learnedNames)) {
-        if (/^\+?\d+$/.test(name)) {
-          delete learnedNames[jid];
-          requestedNames.delete(jid);
-        }
-      }
+      forgetUnresolvedNames();
     } catch {
-      participants = [];
+      if (selectedChat === chat) participants = memberCache[chat] ?? [];
     }
     // Opening a chat is the obvious moment to start typing.
     await tick();
@@ -889,6 +890,16 @@
         for (const jid of jids) requestedNames.delete(jid);
       }
     }, 30);
+  }
+  /** Asks again for every JID the core had no name for, once it may have learned some. */
+  function forgetUnresolvedNames() {
+    const kept: Record<string, string> = {};
+    for (const [jid, name] of Object.entries(learnedNames)) {
+      if (/^\+?\d+$/.test(name)) requestedNames.delete(jid);
+      else kept[jid] = name;
+    }
+    for (const jid of requestedNames) if (!(jid in kept)) requestedNames.delete(jid);
+    learnedNames = kept;
   }
   /** A name for a JID, asking the core when the given one is missing or a bare number. */
   function displayName(name: string | null | undefined, jid: string) {
@@ -2137,6 +2148,7 @@
           case "namesUpdated":
             // Address-book names arrived after the initial fetch, so the cached
             // display names are stale until both lists reload.
+            forgetUnresolvedNames();
             await refreshChats();
             await reloadMessages();
             break;
@@ -2632,7 +2644,7 @@
               <button class="chat-title" title="Group info" onclick={openGroupInfo}>
                 {title}
                 <span class="chat-sub" class:typing={typingNow}
-                  >{typingNow ?? subtitle ?? "Click for group info"}</span
+                  >{typingNow ?? subtitle ?? " "}</span
                 >
               </button>
             {:else}
