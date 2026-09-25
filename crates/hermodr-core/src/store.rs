@@ -489,6 +489,16 @@ impl MessageStore {
         Ok(row)
     }
 
+    /// Forgets every stored media path, returning how many rows changed.
+    pub fn clear_media_paths(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "UPDATE messages SET media_path = NULL, media_thumb = NULL
+             WHERE media_path IS NOT NULL OR media_thumb IS NOT NULL",
+            [],
+        )?)
+    }
+
     /// Unread messages in `chat` that mention us, oldest first.
     pub fn unread_mentions(&self, chat: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();

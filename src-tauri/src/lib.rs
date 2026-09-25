@@ -18,13 +18,35 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder
 const SERVICE_EVENT: &str = "service-event";
 
 /// Settings the UI can change.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UiSettings {
     pub retention: Retention,
     /// Whether to pull the account's entire history during pairing.
     pub accept_full_history: bool,
     /// Where downloaded media is stored. Empty disables downloads.
     pub media_dir: Option<String>,
+    /// Whether to download incoming media automatically.
+    #[serde(default = "default_true")]
+    pub auto_download_media: bool,
+    /// Whether to warn when a video goes out without a preview.
+    #[serde(default = "default_true")]
+    pub warn_missing_video_preview: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            retention: Retention::default(),
+            accept_full_history: false,
+            media_dir: None,
+            auto_download_media: true,
+            warn_missing_video_preview: true,
+        }
+    }
 }
 
 struct AppState {
@@ -128,9 +150,18 @@ fn now_millis() -> u128 {
         .unwrap_or(0)
 }
 
+/// Where downloads live by default. The cache, because media is regenerable and
+/// should not be carried in a backup of the account.
+fn media_cache_dir(app: &AppHandle) -> PathBuf {
+    app.path()
+        .cache_dir()
+        .map(|dir| dir.join("media"))
+        .unwrap_or_else(|_| data_dir(app).join("media"))
+}
+
 fn config_for(app: &AppHandle, settings: &UiSettings, account: &str) -> ServiceConfig {
     let base = account_base(app, account);
-    let default_media = base.join("media");
+    let default_media = media_cache_dir(app);
     ServiceConfig {
         session_path: base.join("session.db"),
         messages_path: base.join("messages.db"),
@@ -432,7 +463,7 @@ async fn send_media(
     reply_to_id: Option<String>,
     reply_to_sender: Option<String>,
     reply_to_text: Option<String>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let bytes = BASE64.decode(data.as_bytes()).map_err(|e| e.to_string())?;
     let reply = match (reply_to_id, reply_to_sender, reply_to_text) {
         (Some(id), Some(sender), Some(text)) => Some((id, sender, text)),
@@ -591,6 +622,12 @@ async fn set_pinned(state: State<'_, AppState>, chat: String, pinned: bool) -> R
         .map_err(|e| e.to_string())
 }
 
+/// Deletes downloaded media, keeping the messages.
+#[tauri::command]
+fn flush_media(state: State<'_, AppState>) -> Result<usize, String> {
+    state.service()?.flush_media().map_err(|e| e.to_string())
+}
+
 /// Asks the phone for older messages in a chat.
 #[tauri::command]
 async fn load_older(
@@ -650,6 +687,21 @@ pub fn run() {
                 accounts: Mutex::new(load_accounts(app.handle())),
             });
 
+            // Media used to sit next to the session. Move it into the cache
+            // once, so an upgrade keeps the files it already downloaded.
+            let legacy = data_dir(app.handle()).join("media");
+            let target = media_cache_dir(app.handle());
+            if legacy.is_dir() && !target.exists() {
+                if std::fs::create_dir_all(&target).is_ok() && std::fs::rename(&legacy, &target).is_err() {
+                    // A different filesystem cannot be renamed across.
+                    if let Ok(entries) = std::fs::read_dir(&legacy) {
+                        for entry in entries.flatten() {
+                            let _ = std::fs::copy(entry.path(), target.join(entry.file_name()));
+                        }
+                    }
+                }
+            }
+
             // Built here rather than from the config so clipboard access can be
             // turned on. WebKitGTK only hands pasted images to the page when
             // `javascript_can_access_clipboard` is set, and it does not deliver
@@ -688,6 +740,7 @@ pub fn run() {
             set_pinned,
             unread_mentions,
             load_older,
+            flush_media,
             search,
             open_url,
             qr_svg,

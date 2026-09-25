@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-flush-media"
+description = "Enables the flush_media command without any pre-configured scope."
+commands.allow = ["flush_media"]
+
+[[permission]]
+identifier = "deny-flush-media"
+description = "Denies the flush_media command without any pre-configured scope."
+commands.deny = ["flush_media"]

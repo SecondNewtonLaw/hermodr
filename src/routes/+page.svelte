@@ -69,6 +69,8 @@
   type UiSettings = {
     retention: Retention;
     accept_full_history: boolean;
+    auto_download_media: boolean;
+    warn_missing_video_preview: boolean;
     media_dir: string | null;
   };
   type ConnectionState = { started: boolean; connected: boolean; qr: string | null };
@@ -117,6 +119,8 @@
   let accountList: Account[] = $state([]);
   let activeAccount = $state<string | null>(null);
   let showAccounts = $state(false);
+  /** A transient notice, such as a video sent without a preview. */
+  let notice = $state<string | null>(null);
   let searchQuery = $state("");
   let searchResults: SearchResult[] = $state([]);
   let titleOverride = $state<string | null>(null);
@@ -147,6 +151,8 @@
   let settings: UiSettings = $state({
     retention: { max_age_hours: 24, max_messages_per_chat: 500 },
     accept_full_history: false,
+    auto_download_media: true,
+    warn_missing_video_preview: true,
     media_dir: null,
   });
   let showSettings = $state(false);
@@ -333,6 +339,32 @@
     } catch (e) {
       error = String(e);
     }
+  }
+
+  /** Deletes downloaded media, keeping the messages. */
+  async function flushMedia() {
+    try {
+      const removed = await invoke<number>("flush_media");
+      notice =
+        removed > 0
+          ? `Removed media from ${removed} message(s).`
+          : "There was no downloaded media to remove.";
+      await refreshChats();
+      if (selectedChat) await reloadMessages();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  /** Stops showing the video-without-preview warning. */
+  async function muteNotice() {
+    settings.warn_missing_video_preview = false;
+    try {
+      await invoke("set_settings", { settings });
+    } catch (e) {
+      error = String(e);
+    }
+    notice = null;
   }
 
   async function loadAccounts() {
@@ -862,7 +894,7 @@
         for (let i = 0; i < buffer.length; i += 0x8000) {
           binary += String.fromCharCode(...buffer.subarray(i, i + 0x8000));
         }
-        await invoke("send_media", {
+        const warning = await invoke<string | null>("send_media", {
           chat: selectedChat,
           name: item.file.name,
           data: btoa(binary),
@@ -871,6 +903,7 @@
           replyToSender: reply?.sender ?? null,
           replyToText: reply?.text ?? null,
         });
+        if (warning && settings.warn_missing_video_preview) notice = warning;
       }
       clearPending();
       replyingTo = null;
@@ -1530,6 +1563,14 @@
   </div>
 {/if}
 
+{#if notice}
+  <div class="notice">
+    <span>{notice}</span>
+    <button class="link" onclick={muteNotice}>Do not warn again</button>
+    <button class="icon" title="Dismiss" onclick={() => (notice = null)}>×</button>
+  </div>
+{/if}
+
 {#if showAccounts}
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <div
@@ -1607,7 +1648,21 @@
         <span>Download full history on next pairing</span>
       </label>
 
+      <label class="check">
+        <input type="checkbox" bind:checked={settings.auto_download_media} />
+        <span>Download media automatically</span>
+      </label>
+
+      <label class="check">
+        <input type="checkbox" bind:checked={settings.warn_missing_video_preview} />
+        <span>Warn when a video is sent without a preview</span>
+      </label>
+
       <p class="hint">Retention and folder changes apply the next time Hermóðr starts.</p>
+
+      <div class="actions">
+        <button onclick={flushMedia}>Flush media</button>
+      </div>
 
       <div class="actions">
         <button class="primary" onclick={saveSettings}>Save</button>
@@ -1876,6 +1931,30 @@
     border-color: #22c55e;
     color: #052e16;
     font-weight: 600;
+  }
+  .notice {
+    position: fixed;
+    left: 50%;
+    bottom: 18px;
+    transform: translateX(-50%);
+    z-index: 200;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: 80vw;
+    padding: 8px 14px;
+    background: #3f3f46;
+    border-radius: 8px;
+    font-size: 13px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  }
+  .notice .link {
+    background: transparent;
+    border: 0;
+    color: #93c5fd;
+    font: inherit;
+    cursor: pointer;
+    white-space: nowrap;
   }
   .search {
     margin: 8px 14px;

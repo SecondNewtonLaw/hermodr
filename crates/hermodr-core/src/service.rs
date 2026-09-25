@@ -1007,6 +1007,24 @@ impl Service {
         result.map_err(|e| anyhow::anyhow!(e.to_string()))
     }
 
+    /// Deletes downloaded media and forgets the paths, keeping the messages.
+    pub fn flush_media(&self) -> Result<usize> {
+        let cleared = self.store.clear_media_paths()?;
+        if let Some(dir) = &self.media_dir {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        let _ = std::fs::remove_dir_all(&path);
+                    } else {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+        Ok(cleared)
+    }
+
     /// Asks the phone for older messages in a chat.
     ///
     /// The request goes to our own primary device, and the messages arrive
@@ -1128,7 +1146,7 @@ impl Service {
         bytes: Vec<u8>,
         caption: Option<String>,
         reply: Option<(String, String, String)>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let to: Jid = chat.parse()?;
         let file_name = file_name.to_string();
         let extension = std::path::Path::new(&file_name)
@@ -1150,6 +1168,15 @@ impl Service {
 
         let mimetype = mime_for(&extension).map(str::to_string);
 
+        // A thumbnail lets the recipient see a preview before the file lands.
+        let thumb = media_thumbnail(kind, &bytes);
+        let warning = (kind == "video" || kind == "gif")
+            .then(|| thumb.is_none())
+            .filter(|missing| *missing)
+            .map(|_| {
+                "The video was sent without a preview because ffmpeg is not installed.".to_string()
+            });
+
         // An attachment can carry a quote, the same as a text reply.
         let context = match &reply {
             Some((id, sender, text)) => {
@@ -1169,6 +1196,7 @@ impl Service {
                 ImageOptions {
                     caption: caption.clone(),
                     mimetype,
+                    jpeg_thumbnail: thumb.clone(),
                     context_info: context,
                     ..Default::default()
                 },
@@ -1178,6 +1206,7 @@ impl Service {
                 VideoOptions {
                     caption: caption.clone(),
                     mimetype,
+                    jpeg_thumbnail: thumb.clone(),
                     context_info: context,
                     ..Default::default()
                 },
@@ -1199,6 +1228,7 @@ impl Service {
                     file_name: Some(file_name.clone()),
                     caption: caption.clone(),
                     mimetype,
+                    jpeg_thumbnail: thumb.clone(),
                     context_info: context,
                     ..Default::default()
                 },
@@ -1246,7 +1276,7 @@ impl Service {
         };
         self.store.upsert(&stored)?;
         let _ = self.events.send(ServiceEvent::Message { message: Box::new(stored) });
-        Ok(())
+        Ok(warning)
     }
 
     /// Stored messages for a chat, newest first.
@@ -1827,6 +1857,52 @@ fn fetch_link_preview(url: &str) -> Option<LinkPreview> {
         description: meta("og:description"),
         thumbnail,
     })
+}
+
+/// A small JPEG preview for an outgoing attachment.
+///
+/// Images are downscaled locally. Video needs a decoder, so it is best effort:
+/// ffmpeg is used when present, and `None` means the file goes without a
+/// preview.
+fn media_thumbnail(kind: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+    match kind {
+        "image" => image_thumbnail(bytes),
+        "video" | "gif" => video_thumbnail(bytes),
+        _ => None,
+    }
+}
+
+fn image_thumbnail(bytes: &[u8]) -> Option<Vec<u8>> {
+    let decoded = image::load_from_memory(bytes).ok()?;
+    let thumb = decoded.thumbnail(256, 256);
+    let mut out = Vec::new();
+    thumb
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Jpeg)
+        .ok()?;
+    Some(out)
+}
+
+fn video_thumbnail(bytes: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-loglevel", "error",
+            "-i", "pipe:0",
+            "-frames:v", "1",
+            "-vf", "scale=256:-2",
+            "-f", "mjpeg",
+            "pipe:1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(bytes).ok()?;
+    let output = child.wait_with_output().ok()?;
+    (output.status.success() && !output.stdout.is_empty()).then_some(output.stdout)
 }
 
 /// MIME type for an outgoing attachment, from its file extension.

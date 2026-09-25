@@ -20,3 +20,6 @@ serde_json = "1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 # Fetches Open Graph metadata for link previews on outgoing messages.
 ureq = "3"
+# Renders outgoing image thumbnails so recipients see a preview before the
+# file finishes downloading.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
