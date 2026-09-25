@@ -874,6 +874,8 @@ impl Service {
             reply_to_id: None,
             reply_to_text: None,
             reply_to_sender: None,
+            reply_to_kind: None,
+            reply_to_thumb: None,
             // Not `true`: we cannot know whether the recipient has read it, and
             // claiming so shows a read marker that is not true.
             read: false,
@@ -1097,6 +1099,8 @@ impl Service {
             } else {
                 reply_to_sender.to_string()
             }),
+            reply_to_kind: None,
+            reply_to_thumb: None,
             read: false,
             revoked: false,
             mentioned: false,
@@ -1226,6 +1230,8 @@ impl Service {
             reply_to_id: reply.as_ref().map(|(id, _, _)| id.clone()),
             reply_to_text: reply.as_ref().map(|(_, _, text)| text.clone()),
             reply_to_sender: reply.as_ref().map(|(_, sender, _)| sender.clone()),
+            reply_to_kind: None,
+            reply_to_thumb: None,
             read: false,
             revoked: false,
             mentioned: false,
@@ -1276,7 +1282,7 @@ fn revoke_target(message: &wa::Message) -> Option<String> {
 ///
 /// `context_info` lives on each inner message type rather than on `Message`
 /// itself, so the carriers a reply can arrive on are checked in turn.
-fn quote_of(message: &wa::Message) -> Option<(String, String, String)> {
+fn quote_of(message: &wa::Message) -> Option<(String, String, String, String, Option<Vec<u8>>)> {
     let base = message.get_base_message();
     let context = base
         .extended_text_message
@@ -1334,7 +1340,23 @@ fn quote_of(message: &wa::Message) -> Option<(String, String, String)> {
             "document" => name.unwrap_or_else(|| "Document".to_string()),
             _ => "[media]".to_string(),
         });
-    Some((id, author, text))
+    let thumb = quoted
+        .image_message
+        .as_option()
+        .and_then(|m| m.jpeg_thumbnail.clone())
+        .or_else(|| {
+            quoted
+                .video_message
+                .as_option()
+                .and_then(|m| m.jpeg_thumbnail.clone())
+        })
+        .or_else(|| {
+            quoted
+                .document_message
+                .as_option()
+                .and_then(|m| m.jpeg_thumbnail.clone())
+        });
+    Some((id, author, text, kind.to_string(), thumb))
 }
 
 /// The user part of a JID, without the device suffix or server.
@@ -1421,21 +1443,36 @@ async fn incoming_message(
 
     // A reply carries the quote in the message context. We do not keep the
     // original protobuf, so the text is copied out for display.
-    let (reply_to_id, reply_to_text, reply_to_sender) = quote_of(&inbound.message)
-        .map(|(id, sender, text)| {
-            // Quoting our own message should read "You", not our phone number.
-            let mine = client
-                .map(|c| {
-                    [c.pn(), c.lid()]
-                        .into_iter()
-                        .flatten()
-                        .any(|j| j.to_non_ad().to_string() == sender)
-                })
-                .unwrap_or(false);
-            let sender = if mine { "@me".to_string() } else { sender };
-            (Some(id), Some(text), Some(sender))
-        })
-        .unwrap_or((None, None, None));
+    let (reply_to_id, reply_to_text, reply_to_sender, reply_to_kind, reply_to_thumb) =
+        quote_of(&inbound.message)
+            .map(|(id, sender, text, kind, thumb)| {
+                // Quoting our own message should read "You", not our phone number.
+                let mine = client
+                    .map(|c| {
+                        [c.pn(), c.lid()]
+                            .into_iter()
+                            .flatten()
+                            .any(|j| j.to_non_ad().to_string() == sender)
+                    })
+                    .unwrap_or(false);
+                let sender = if mine { "@me".to_string() } else { sender };
+                // Keep the quoted thumbnail so the quote shows a preview.
+                let thumb_path = thumb.and_then(|bytes| {
+                    let dir = media_dir?;
+                    std::fs::create_dir_all(dir).ok()?;
+                    let path = dir.join(format!("{id}_quote.jpg"));
+                    std::fs::write(&path, bytes).ok()?;
+                    Some(path.to_string_lossy().to_string())
+                });
+                (
+                    Some(id),
+                    Some(text),
+                    Some(sender),
+                    if kind.is_empty() { None } else { Some(kind) },
+                    thumb_path,
+                )
+            })
+            .unwrap_or((None, None, None, None, None));
 
     // A link preview rides on the extended text message.
     let (preview_url, preview_title, preview_desc, preview_thumb) =
@@ -1455,6 +1492,8 @@ async fn incoming_message(
         reply_to_id,
         reply_to_text,
         reply_to_sender,
+        reply_to_kind,
+        reply_to_thumb,
         // Newly arrived, so unseen until the chat is opened.
         read: false,
         revoked: false,
@@ -1789,6 +1828,8 @@ mod tests {
                 reply_to_id: None,
                 reply_to_text: None,
                 reply_to_sender: None,
+                reply_to_kind: None,
+                reply_to_thumb: None,
                 read: false,
                 revoked: false,
                 mentioned: false,

@@ -17,6 +17,8 @@
     reply_to_id: string | null;
     reply_to_text: string | null;
     reply_to_sender: string | null;
+    reply_to_kind: string | null;
+    reply_to_thumb: string | null;
     read: boolean;
     revoked: boolean;
     mentioned: boolean;
@@ -1237,6 +1239,15 @@
                     class="quote"
                     title="Go to message"
                     onclick={() => message.reply_to_id && scrollToMessage(message.reply_to_id)}>
+                    {#if message.reply_to_kind === "image" && message.reply_to_thumb}
+                      <img
+                        class="quote-thumb"
+                        src={convertFileSrc(message.reply_to_thumb)}
+                        alt=""
+                      />
+                    {:else if message.reply_to_kind}
+                      <span class="quote-icon">{replyIcon(message.reply_to_kind)}</span>
+                    {/if}
                     <span class="quote-author">
                       {quoteAuthor(message.reply_to_sender)}
                     </span>
@@ -2064,6 +2075,9 @@
     color: #71717a;
   }
   .quote {
+    display: flex;
+    align-items: center;
+    gap: 6px;
     background: transparent;
     border: 0;
     border-left: 2px solid #52525b;
@@ -2274,7 +2288,20 @@
     font-weight: 600;
     color: #a1a1aa;
   }
+  .quote-thumb {
+    width: 28px;
+    height: 28px;
+    object-fit: cover;
+    border-radius: 4px;
+    flex: none;
+  }
+  .quote-icon {
+    font-size: 14px;
+    flex: none;
+  }
   .quote-text {
+    flex: 1;
+    min-width: 0;
     display: block;
     overflow: hidden;
     text-overflow: ellipsis;

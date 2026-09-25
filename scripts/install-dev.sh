@@ -44,17 +44,23 @@ if [ "${1:-}" = "--dev" ]; then
   cd "$ROOT" && exec pnpm tauri dev
 fi
 
-# `--no-bundle` builds the production binary (and the frontend) without the
-# AppImage tooling, which is only needed for a release. A plain `cargo build`
-# would fall back to the dev URL and fail to load the UI.
-say "building"
-(cd "$ROOT" && pnpm tauri build --no-bundle)
+# Debug by default: it embeds the frontend the same way, but builds in a
+# fraction of the time, which is what a local install wants. Pass --release for
+# the optimized binary. `--no-bundle` skips the AppImage tooling.
+profile="debug"
+flag="--debug"
+if [ "${1:-}" = "--release" ] || [ "${2:-}" = "--release" ]; then
+  profile="release"
+  flag=""
+fi
+say "building ($profile)"
+(cd "$ROOT" && pnpm tauri build --no-bundle $flag)
 
 say "installing the desktop entry"
 BIN_DIR="$HOME/.local/bin"
 APP_DIR="$HOME/.local/share/applications"
 ICON_DIR="$HOME/.local/share/icons/hicolor/256x256/apps"
-BIN="$ROOT/src-tauri/target/release/hermodr"
+BIN="$ROOT/src-tauri/target/$profile/hermodr"
 [ -x "$BIN" ] || die "release binary not found at $BIN"
 mkdir -p "$BIN_DIR" "$APP_DIR" "$ICON_DIR"
 install -m 755 "$BIN" "$BIN_DIR/hermodr"

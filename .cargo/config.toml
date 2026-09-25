@@ -3,3 +3,12 @@
 # instead, which uses the user's SSH agent.
 [net]
 git-fetch-with-cli = true
+
+# lld links faster than the default BFD linker. Installed as ld.lld.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+# Uncomment to cache compilation across clean checkouts. Needs sccache on PATH
+# (`sudo pacman -S sccache`), which is not installed here.
+# [build]
+# rustc-wrapper = "sccache"

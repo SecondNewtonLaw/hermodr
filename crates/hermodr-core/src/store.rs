@@ -73,6 +73,10 @@ pub struct StoredMessage {
     pub reply_to_text: Option<String>,
     /// Author of the quoted message, so the quote can be attributed.
     pub reply_to_sender: Option<String>,
+    /// Media kind of the quoted message, when it carried media.
+    pub reply_to_kind: Option<String>,
+    /// Path to the quoted media's thumbnail, when one was available.
+    pub reply_to_thumb: Option<String>,
     /// Whether the user has seen this message.
     pub read: bool,
     /// Whether the sender deleted the message for everyone.
@@ -175,6 +179,8 @@ impl MessageStore {
             "reply_to_id",
             "reply_to_text",
             "reply_to_sender",
+            "reply_to_kind",
+            "reply_to_thumb",
             "preview_url",
             "preview_title",
             "preview_desc",
@@ -249,9 +255,10 @@ impl MessageStore {
                  (chat, id, sender, timestamp, from_me, text,
                   media_kind, media_path, reply_to_id, reply_to_text, reply_to_sender,
                   read, revoked, mentioned, status,
-                  preview_url, preview_title, preview_desc, preview_thumb)
+                  preview_url, preview_title, preview_desc, preview_thumb,
+                  reply_to_kind, reply_to_thumb)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                     ?15, ?16, ?17, ?18, ?19)
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21)
              ON CONFLICT(chat, id) DO UPDATE SET
                  sender = excluded.sender,
                  timestamp = excluded.timestamp,
@@ -269,7 +276,9 @@ impl MessageStore {
                  preview_url = excluded.preview_url,
                  preview_title = excluded.preview_title,
                  preview_desc = excluded.preview_desc,
-                 preview_thumb = excluded.preview_thumb",
+                 preview_thumb = excluded.preview_thumb,
+                 reply_to_kind = excluded.reply_to_kind,
+                 reply_to_thumb = excluded.reply_to_thumb",
             params![
                 message.chat,
                 message.id,
@@ -290,6 +299,8 @@ impl MessageStore {
                 message.preview_title,
                 message.preview_desc,
                 message.preview_thumb,
+                message.reply_to_kind,
+                message.reply_to_thumb,
             ],
         )?;
         Ok(())
@@ -415,7 +426,8 @@ impl MessageStore {
             "SELECT m.chat, m.id, m.sender, m.timestamp, m.from_me, m.text,
                     n.name, m.media_kind, m.media_path, m.reply_to_id, m.reply_to_text,
                     m.read, m.revoked, m.status, m.reply_to_sender, m.mentioned,
-                    m.preview_url, m.preview_title, m.preview_desc, m.preview_thumb
+                    m.preview_url, m.preview_title, m.preview_desc, m.preview_thumb,
+                    m.reply_to_kind, m.reply_to_thumb
              FROM messages m
              LEFT JOIN names n ON n.jid = m.sender
              WHERE m.chat = ?1
@@ -443,6 +455,8 @@ impl MessageStore {
                 preview_title: row.get(17)?,
                 preview_desc: row.get(18)?,
                 preview_thumb: row.get(19)?,
+                reply_to_kind: row.get(20)?,
+                reply_to_thumb: row.get(21)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -506,7 +520,8 @@ impl MessageStore {
             "SELECT m.chat, m.id, m.sender, m.timestamp, m.from_me, m.text,
                     n.name, m.media_kind, m.media_path, m.reply_to_id, m.reply_to_text,
                     m.read, m.revoked, m.status, m.reply_to_sender, m.mentioned,
-                    m.preview_url, m.preview_title, m.preview_desc, m.preview_thumb
+                    m.preview_url, m.preview_title, m.preview_desc, m.preview_thumb,
+                    m.reply_to_kind, m.reply_to_thumb
              FROM messages m
              LEFT JOIN names n ON n.jid = m.sender
              WHERE m.chat = ?1 AND m.id = ?2",
@@ -533,6 +548,8 @@ impl MessageStore {
                     preview_title: row.get(17)?,
                     preview_desc: row.get(18)?,
                     preview_thumb: row.get(19)?,
+                reply_to_kind: row.get(20)?,
+                reply_to_thumb: row.get(21)?,
                 })
             },
         )?;
@@ -722,24 +739,9 @@ mod tests {
     }
 
     fn store(retention: Retention) -> MessageStore {
-        // In-memory keeps tests independent and fast.
-        let mut s = MessageStore::open(Path::new(":memory:"), retention).unwrap();
-        s.conn.get_mut().unwrap().execute_batch(
-            "DROP TABLE IF EXISTS messages;
-             DROP TABLE IF EXISTS names;
-             CREATE TABLE messages (
-                 chat TEXT NOT NULL, id TEXT NOT NULL, sender TEXT NOT NULL,
-                 timestamp INTEGER NOT NULL, from_me INTEGER NOT NULL,
-                 text TEXT NOT NULL, media_kind TEXT, media_path TEXT,
-                 reply_to_id TEXT, reply_to_text TEXT, reply_to_sender TEXT,
-                 read INTEGER NOT NULL DEFAULT 0,
-                 revoked INTEGER NOT NULL DEFAULT 0,
-                 status TEXT, PRIMARY KEY (chat, id));
-             CREATE TABLE names (
-                 jid TEXT PRIMARY KEY, name TEXT NOT NULL,
-                 saved INTEGER NOT NULL DEFAULT 0);",
-        ).unwrap();
-        s
+        // In-memory keeps tests independent and fast. The real schema is used,
+        // so adding a column never breaks the tests.
+        MessageStore::open(Path::new(":memory:"), retention).unwrap()
     }
 
     fn msg(chat: &str, id: &str, age_hours: i64, text: &str) -> StoredMessage {
@@ -756,6 +758,8 @@ mod tests {
             reply_to_id: None,
             reply_to_text: None,
             reply_to_sender: None,
+            reply_to_kind: None,
+            reply_to_thumb: None,
             read: false,
             revoked: false,
             mentioned: false,
