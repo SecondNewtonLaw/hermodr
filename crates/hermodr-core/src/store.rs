@@ -560,8 +560,10 @@ impl MessageStore {
         }
         let conn = self.conn.lock().unwrap();
         conn.execute(
+            // A saved row holding only digits is a placeholder, never a real contact name.
             "INSERT INTO names (jid, name, saved) VALUES (?1, ?2, 0)
-             ON CONFLICT(jid) DO UPDATE SET name = excluded.name WHERE saved = 0",
+             ON CONFLICT(jid) DO UPDATE SET name = excluded.name, saved = 0
+             WHERE saved = 0 OR name NOT GLOB '*[^0-9+]*'",
             params![jid, name],
         )?;
         Ok(())
@@ -1755,6 +1757,17 @@ mod tests {
         s.set_name("a@s", "Alice").unwrap();
         s.set_name("a@s", "   ").unwrap();
         assert_eq!(s.name_for("a@s").unwrap().as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn push_names_replace_a_saved_number() {
+        let s = store(Retention::default());
+        s.set_saved_name("1@lid", "59899022028").unwrap();
+        s.set_name("1@lid", "Ana").unwrap();
+        assert_eq!(s.name_for("1@lid").unwrap().as_deref(), Some("Ana"));
+        s.set_saved_name("2@lid", "Bea").unwrap();
+        s.set_name("2@lid", "Other").unwrap();
+        assert_eq!(s.name_for("2@lid").unwrap().as_deref(), Some("Bea"));
     }
 
     #[test]

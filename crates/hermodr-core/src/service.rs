@@ -673,7 +673,9 @@ impl Service {
                                     if let Some(alt) =
                                         inbound.info.source.sender_alt.as_ref().map(|j| j.to_string())
                                     {
-                                        let known = store.name_for(&alt).ok().flatten();
+                                        let known = store.name_for(&alt).ok().flatten().filter(|n| {
+                                            !n.trim_start_matches('+').chars().all(|c| c.is_ascii_digit())
+                                        });
                                         let is_saved = known.is_some();
                                         // Fall back to the phone number, never
                                         // the unreadable LID.
@@ -1087,11 +1089,13 @@ impl Service {
                                     return;
                                 };
                                 eprintln!(
-                                    "[hermodr] history sync type {} ({:?}): {} conversation(s), {} message(s)",
+                                    "[hermodr] history sync type {} ({:?}): {} conversation(s), {} message(s), {} push name(s), {} LID mapping(s)",
                                     sync.sync_type(),
                                     sync.peer_data_request_session_id(),
                                     history.conversations.len(),
                                     history.conversations.iter().map(|c| c.messages.len()).sum::<usize>(),
+                                    history.pushnames.len(),
+                                    history.phone_number_to_lid_mappings.len(),
                                 );
                                 let client = client_for_events.get().cloned();
                                 let own = client
@@ -1718,6 +1722,8 @@ impl Service {
                     if let Some(found) = found.filter(|n| !n.trim().is_empty()) {
                         let _ = self.store.set_name(&jid.to_string(), &found);
                         out.insert(asked, found);
+                    } else {
+                        eprintln!("[hermodr] no name known for {jid} (shown as {:?})", out.get(&asked));
                     }
                 }
             }
