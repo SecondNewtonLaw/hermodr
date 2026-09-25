@@ -227,7 +227,7 @@ fn config_for(app: &AppHandle, settings: &UiSettings, account: &str) -> ServiceC
     let base = account_base(app, account);
     let default_media = media_cache_dir(app);
     ServiceConfig {
-        session_path: base.join("session.db"),
+        session_path: session_path(&base),
         messages_path: base.join("messages.db"),
         retention: settings.retention,
         accept_full_history: settings.accept_full_history,
@@ -296,11 +296,7 @@ async fn start_service(app: &AppHandle, state: &AppState, account: &str) -> Resu
     let settings = state.settings.lock().unwrap().clone();
     let config = config_for(app, &settings, account);
 
-    let marker = account_base(app, account).join(LOGGED_OUT_MARKER);
-    if marker.exists() {
-        let session = config.session_path.clone();
-        let _ = tauri::async_runtime::spawn_blocking(move || wipe_session(&session, &marker)).await;
-    }
+    remove_stale_sessions(&account_base(app, account), &config.session_path);
 
     let (service, mut events) = Service::start(config)
         .await
@@ -348,10 +344,34 @@ async fn start_service(app: &AppHandle, state: &AppState, account: &str) -> Resu
     Ok(())
 }
 
-/// Present in an account's directory once WhatsApp revoked its session.
-const LOGGED_OUT_MARKER: &str = "logged_out";
+/// Names the account's current session file; absent means `session.db`.
+const SESSION_POINTER: &str = "session_name";
 
-/// Stops a revoked account's service and marks its session for deletion on the next start.
+fn session_path(base: &std::path::Path) -> PathBuf {
+    let name = std::fs::read_to_string(base.join(SESSION_POINTER)).unwrap_or_default();
+    base.join(match name.trim() {
+        "" => "session.db",
+        name => name,
+    })
+}
+
+/// Deletes session files other than `current`; one still held open is retried on a later start.
+fn remove_stale_sessions(base: &std::path::Path, current: &std::path::Path) {
+    let Some(current) = current.file_name().and_then(|n| n.to_str()) else { return };
+    let Ok(entries) = std::fs::read_dir(base) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with("session") && name.contains(".db") && !name.starts_with(current) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Stops a revoked account's service and points it at a fresh session file.
+///
+/// The old file cannot be deleted yet: Windows keeps it locked until the
+/// library releases its connection pool.
 fn forget_session(app: &AppHandle, account: &str, service: &Arc<Service>) {
     let state = app.state::<AppState>();
     {
@@ -366,23 +386,10 @@ fn forget_session(app: &AppHandle, account: &str, service: &Arc<Service>) {
         entry.jid = None;
         save_accounts(app, &file);
     }
-    let _ = std::fs::write(account_base(app, account).join(LOGGED_OUT_MARKER), b"");
-}
-
-/// Deletes a revoked session, retrying while the old service still holds the file open.
-fn wipe_session(session: &std::path::Path, marker: &std::path::Path) {
-    for _ in 0..50 {
-        for suffix in ["", "-wal", "-shm"] {
-            let mut path = session.as_os_str().to_owned();
-            path.push(suffix);
-            let _ = std::fs::remove_file(path);
-        }
-        if !session.exists() {
-            let _ = std::fs::remove_file(marker);
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    let _ = std::fs::write(
+        account_base(app, account).join(SESSION_POINTER),
+        format!("session-{}.db", now_millis()),
+    );
 }
 
 /// Connects the active account, pairing by QR the first time.
