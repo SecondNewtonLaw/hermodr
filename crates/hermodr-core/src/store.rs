@@ -12,6 +12,17 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 /// How much history to keep locally.
+/// A number standing in for a name: bare digits, or a `+`-prefixed phone label
+/// such as WhatsApp's masked `+598∙∙∙∙∙27`. Never a real contact or push name.
+pub fn is_placeholder_name(name: &str) -> bool {
+    let name = name.trim();
+    name.trim_start_matches('+').chars().all(|c| c.is_ascii_digit())
+        || (name.starts_with('+') && !name.chars().any(char::is_alphabetic))
+}
+
+/// [`is_placeholder_name`] for the `name` column, as far as GLOB can tell (Latin letters only).
+const PLACEHOLDER_SQL: &str = "(name NOT GLOB '*[^0-9+]*' OR (name GLOB '+*' AND name NOT GLOB '*[A-Za-z]*'))";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Retention {
     /// Drop messages older than this many hours. `None` keeps everything.
@@ -450,6 +461,13 @@ impl MessageStore {
         // showing a "status" conversation.
         conn.execute("DELETE FROM messages WHERE chat = 'status@broadcast'", [])?;
 
+        // Masked group labels (`+598∙∙∙∙∙27`) were once stored as names, over the
+        // real push names. Dropping them lets the push names come back.
+        conn.execute(
+            "DELETE FROM names WHERE name GLOB '+*' AND name GLOB '*[^0-9+]*' AND name NOT GLOB '*[A-Za-z]*'",
+            [],
+        )?;
+
         // Names learned from messages are keyed with the sender's device suffix
         // (`123:98@lid`), but participants are listed without one. Mirror every
         // such name onto the bare form so lookups find it.
@@ -559,11 +577,16 @@ impl MessageStore {
             return Ok(());
         }
         let conn = self.conn.lock().unwrap();
+        if is_placeholder_name(name) {
+            conn.execute("INSERT OR IGNORE INTO names (jid, name, saved) VALUES (?1, ?2, 0)", params![jid, name])?;
+            return Ok(());
+        }
         conn.execute(
-            // A saved row holding only digits is a placeholder, never a real contact name.
-            "INSERT INTO names (jid, name, saved) VALUES (?1, ?2, 0)
-             ON CONFLICT(jid) DO UPDATE SET name = excluded.name, saved = 0
-             WHERE saved = 0 OR name NOT GLOB '*[^0-9+]*'",
+            &format!(
+                "INSERT INTO names (jid, name, saved) VALUES (?1, ?2, 0)
+                 ON CONFLICT(jid) DO UPDATE SET name = excluded.name, saved = 0
+                 WHERE saved = 0 OR {PLACEHOLDER_SQL}"
+            ),
             params![jid, name],
         )?;
         Ok(())
@@ -1815,6 +1838,14 @@ mod tests {
         s.set_saved_name("2@lid", "Bea").unwrap();
         s.set_name("2@lid", "Other").unwrap();
         assert_eq!(s.name_for("2@lid").unwrap().as_deref(), Some("Bea"));
+        // A masked group label never replaces a push name, and a push name replaces it.
+        s.set_name("3@lid", "Cata").unwrap();
+        s.set_name("3@lid", "+598∙∙∙∙∙27").unwrap();
+        assert_eq!(s.name_for("3@lid").unwrap().as_deref(), Some("Cata"));
+        s.set_name("4@lid", "+598∙∙∙∙∙41").unwrap();
+        s.set_name("4@lid", "Dani").unwrap();
+        assert_eq!(s.name_for("4@lid").unwrap().as_deref(), Some("Dani"));
+        assert!(is_placeholder_name("+598∙∙∙∙∙27") && is_placeholder_name("59899") && !is_placeholder_name("Ana"));
     }
 
     #[test]

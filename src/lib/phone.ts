@@ -47,12 +47,17 @@ export function phoneLabel(digits: string): string | null {
   return null;
 }
 
+/** A number standing in for a name: bare digits, or a `+` label such as WhatsApp's masked `+598∙∙∙∙∙27`. */
+export function isPlaceholder(name: string): boolean {
+  return /^\+?\d+$/.test(name) || (name.startsWith("+") && !/\p{L}/u.test(name));
+}
+
 /**
  * A name for someone, falling back to their number with its country when no
  * name is known. Only phone JIDs carry a number; a LID is left as it is.
  */
 export function displayName(name: string | null | undefined, jid: string): string {
-  if (name && !/^\+?\d+$/.test(name)) return name;
+  if (name && !isPlaceholder(name)) return name;
   const user = jid.split("@")[0].split(":")[0];
   const digits = name?.replace("+", "") ?? (jid.endsWith("@s.whatsapp.net") ? user : null);
   return (digits && phoneLabel(digits)) || name || user;

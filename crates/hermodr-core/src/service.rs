@@ -70,6 +70,8 @@ fn recall_allowed(chat: &str) -> bool {
 /// its recent days, telling the phone older history will be asked for on
 /// demand (a reply to something older fetches that chat's past). Only read at
 /// pairing; an existing link keeps what it was paired with.
+use crate::store::is_placeholder_name;
+
 /// Stores the LID and phone forms of one sender when a message carries both.
 fn remember_lid_pn(store: &MessageStore, sender: &Jid, alt: Option<&Jid>) {
     let Some(alt) = alt else { return };
@@ -710,9 +712,8 @@ impl Service {
                                     if let Some(alt) =
                                         inbound.info.source.sender_alt.as_ref().map(|j| j.to_string())
                                     {
-                                        let known = store.name_for(&alt).ok().flatten().filter(|n| {
-                                            !n.trim_start_matches('+').chars().all(|c| c.is_ascii_digit())
-                                        });
+                                        let known =
+                                            store.name_for(&alt).ok().flatten().filter(|n| !is_placeholder_name(n));
                                         let is_saved = known.is_some();
                                         // Fall back to the phone number, never
                                         // the unreadable LID.
@@ -1471,31 +1472,27 @@ impl Service {
                 .or_else(|| mention.ends_with("@s.whatsapp.net").then(|| mention.clone()))
                 .map(|j| j.split('@').next().unwrap_or(&j).to_string());
             let username = member.username.as_ref().map(|u| u.to_string());
-            // The name members see for each other in the group (WhatsApp Web's
-            // "~name"). Stored under every address so mentions and senders find it.
-            let display = member
+            // WhatsApp's masked number for a member whose phone is hidden
+            // ("+598∙∙∙∙∙27"). Only a label of last resort; never stored as a
+            // name, or it would overwrite the member's real push name.
+            let masked = member
                 .details
                 .as_ref()
                 .and_then(|d| d.display_name.as_ref())
                 .map(|n| n.to_string())
                 .filter(|n| !n.trim().is_empty());
-            if let Some(display) = &display {
-                for jid in candidates.iter().flatten() {
-                    let _ = self.store.set_name(&jid.to_non_ad().to_string(), display);
-                }
-            }
             // A name someone can read: saved/push name, then username, then the
-            // phone number, and only last the LID.
-            // A bare-number placeholder under one form must not hide a real
-            // name stored under the other.
+            // phone number, and only last the masked number or the LID.
+            // A placeholder under one form must not hide a real name stored
+            // under the other.
             let name = candidates
                 .into_iter()
                 .flatten()
                 .filter_map(|j| self.store.name_for(&j.to_string()).ok().flatten())
-                .find(|n| !n.trim_start_matches('+').chars().all(|c| c.is_ascii_digit()))
-                .or_else(|| display.clone())
+                .find(|n| !is_placeholder_name(n))
                 .or_else(|| username.clone())
                 .or_else(|| number.clone())
+                .or(masked)
                 .unwrap_or_else(|| mention.split('@').next().unwrap_or(&mention).to_string());
             let label = member
                 .details
@@ -1517,7 +1514,7 @@ impl Service {
         // and gives members we only know by number a username or business name.
         let jids: Vec<Jid> = participants.iter().filter_map(|p| p.jid.parse().ok()).collect();
         if let Ok(infos) = self.client.contacts().get_user_info(&jids).await {
-            let numeric = |n: &str| n.trim_start_matches('+').chars().all(|c| c.is_ascii_digit());
+            let numeric = |n: &str| is_placeholder_name(n);
             for p in participants.iter_mut() {
                 let user = p.jid.split('@').next().unwrap_or_default();
                 let Some(info) = infos.values().find(|i| {
@@ -1695,7 +1692,7 @@ impl Service {
     /// our own addresses read as our push name. Falls back to the phone number
     /// digits, and leaves out JIDs nothing is known about.
     pub async fn names_for(&self, jids: &[String]) -> std::collections::HashMap<String, String> {
-        let numeric = |n: &str| n.trim_start_matches('+').chars().all(|c| c.is_ascii_digit());
+        let numeric = |n: &str| is_placeholder_name(n);
         let own: Vec<String> = [self.client.pn(), self.client.lid()]
             .into_iter()
             .flatten()
@@ -1827,7 +1824,7 @@ impl Service {
             .names_for(std::slice::from_ref(&key))
             .await
             .remove(&key)
-            .filter(|n| !n.trim_start_matches('+').chars().all(|c| c.is_ascii_digit()));
+            .filter(|n| !is_placeholder_name(n));
         Ok(profile)
     }
 

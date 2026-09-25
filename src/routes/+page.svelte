@@ -10,7 +10,7 @@
   import ProfileCard from "$lib/ProfileCard.svelte";
   import MessageInfo from "$lib/MessageInfo.svelte";
   import InviteCard, { inviteLink } from "$lib/InviteCard.svelte";
-  import { displayName as phoneName, phoneLabel } from "$lib/phone";
+  import { displayName as phoneName, isPlaceholder, phoneLabel } from "$lib/phone";
   import { polyfillCountryFlagEmojis } from "country-flag-emoji-polyfill";
   import flagFont from "country-flag-emoji-polyfill/dist/TwemojiCountryFlags.woff2?url";
 
@@ -250,7 +250,7 @@
     // A member is found by nickname, reserved username or number, and inserted by nickname.
     const members = participants.map((p) => ({
       jid: p.jid,
-      name: /^\+?\d+$/.test(p.name) && p.username ? p.username : displayName(p.name, p.jid),
+      name: isPlaceholder(p.name) && p.username ? p.username : displayName(p.name, p.jid),
       username: p.username,
       number: p.number,
     }));
@@ -425,15 +425,15 @@
     // The message row joins names on one address form only; the member list
     // resolves both, so it rescues senders whose name is keyed by the other.
     const own = message.sender_name;
-    const known = own && !/^\+?\d+$/.test(own) ? own : memberOf(message.sender)?.name;
-    return displayName(known && !/^\+?\d+$/.test(known) ? known : own, message.sender);
+    const known = own && !isPlaceholder(own) ? own : memberOf(message.sender)?.name;
+    return displayName(known && !isPlaceholder(known) ? known : own, message.sender);
   }
   /** Resolves a JID to a known name, falling back to the bare address. */
   function senderName(jid: string) {
     const b = bare(jid);
     const known = messages.find((m) => bare(m.sender) === b && m.sender_name)?.sender_name;
     const member = memberOf(jid)?.name;
-    return displayName(known && !/^\+?\d+$/.test(known) ? known : (member ?? known), jid);
+    return displayName(known && !isPlaceholder(known) ? known : (member ?? known), jid);
   }
   /** Author shown on a quote; our own messages read "You". */
   function quoteAuthor(jid: string | null) {
@@ -908,7 +908,7 @@
   function forgetUnresolvedNames() {
     const kept: Record<string, string> = {};
     for (const [jid, name] of Object.entries(learnedNames)) {
-      if (/^\+?\d+$/.test(name)) requestedNames.delete(jid);
+      if (isPlaceholder(name)) requestedNames.delete(jid);
       else kept[jid] = name;
     }
     for (const jid of requestedNames) if (!(jid in kept)) requestedNames.delete(jid);
@@ -916,7 +916,7 @@
   }
   /** A name for a JID, asking the core when the given one is missing or a bare number. */
   function displayName(name: string | null | undefined, jid: string) {
-    if (!name || /^\+?\d+$/.test(name)) {
+    if (!name || isPlaceholder(name)) {
       const key = bare(jid);
       const learned = learnedNames[key];
       if (learned) return phoneName(learned, key);
@@ -936,9 +936,9 @@
     if (member) {
       // A push name seen on any of their messages here beats the member list's bare number.
       const spoken = messages.find(
-        (m) => m.sender_name && !/^\+?\d+$/.test(m.sender_name) && memberOf(m.sender) === member,
+        (m) => m.sender_name && !isPlaceholder(m.sender_name) && memberOf(m.sender) === member,
       )?.sender_name;
-      const named = spoken ?? (/^\+?\d+$/.test(member.name) ? null : member.name);
+      const named = spoken ?? (isPlaceholder(member.name) ? null : member.name);
       return { jid: member.jid, name: displayName(named, member.jid), self: false };
     }
     const lid = `${user}@lid`;
@@ -956,7 +956,7 @@
   function asWireMentions(text: string) {
     if (!text.includes("@") || participants.length === 0) return text;
     const named = participants
-      .filter((p) => p.name.length > 1 && !/^\+?\d+$/.test(p.name))
+      .filter((p) => p.name.length > 1 && !isPlaceholder(p.name))
       .sort((a, b) => b.name.length - a.name.length);
     for (const p of named) {
       const token = `@${p.name}`;
@@ -1052,7 +1052,7 @@
     if (!chat.endsWith("@g.us")) return `${verb}…`;
     if (who.length > 1) return `${who.length} people are ${verb}…`;
     const person = memberOf(who[0].sender);
-    const name = person && !/^\+?\d+$/.test(person.name) ? person.name : null;
+    const name = person && !isPlaceholder(person.name) ? person.name : null;
     return `${name ?? senderName(who[0].sender)} is ${verb}…`;
   }
 
@@ -3270,7 +3270,7 @@
               {#if isGroupChat}
                 <span class="sender-avatar">{@render avatarFor(typer.sender, senderName(typer.sender))}</span>
                 <span class="sender" style="--hue: {hue(typer.sender)}">
-                  {memberOf(typer.sender)?.name && !/^\+?\d+$/.test(memberOf(typer.sender)!.name)
+                  {memberOf(typer.sender)?.name && !isPlaceholder(memberOf(typer.sender)!.name)
                     ? memberOf(typer.sender)!.name
                     : senderName(typer.sender)}
                 </span>
@@ -3631,7 +3631,7 @@
     group={m.chat.endsWith("@g.us")}
     audience={m.chat === selectedChat ? Math.max(0, participants.length - 1) : 0}
     version={infoVersion}
-    namer={(name, jid) => (name && !/^\+?\d+$/.test(name) ? name : senderName(jid))}
+    namer={(name, jid) => (name && !isPlaceholder(name) ? name : senderName(jid))}
     picture={(jid) => pictureOf(bare(jid))}
     onclose={() => (infoFor = null)} />
 {/if}
