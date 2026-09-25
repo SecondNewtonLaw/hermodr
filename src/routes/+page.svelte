@@ -437,6 +437,31 @@
     openChat(result.jid, false, result.name);
   }
 
+  /** Label for a media message with no caption, used in reply previews. */
+  function replyPreviewText(message: StoredMessage) {
+    // Media stores a "[image]" style placeholder when it has no caption.
+    if (message.text && !message.text.startsWith("[")) return message.text;
+    switch (message.media_kind) {
+      case "image":
+        return "Photo";
+      case "video":
+        return "Video";
+      case "audio":
+        return "Voice message";
+      case "document":
+        return "Document";
+      default:
+        return "";
+    }
+  }
+
+  function replyIcon(kind: string | null) {
+    if (kind === "audio") return "\u{1F3B5}";
+    if (kind === "video") return "\u{1F3AC}";
+    if (kind === "document") return "\u{1F4C4}";
+    return "\u{1F4CE}";
+  }
+
   /** Scrolls a message into view by its id, and highlights it briefly. */
   function scrollToMessage(id: string) {
     const element = scroller?.querySelector(`[data-id="${id}"]`);
@@ -1307,7 +1332,18 @@
 
         {#if replyingTo}
           <div class="reply-preview">
-            <span>Replying to {senderLabel(replyingTo)}: {replyingTo.text}</span>
+            {#if replyingTo.media_kind === "image" && replyingTo.media_path}
+              <img
+                class="reply-thumb"
+                src={convertFileSrc(replyingTo.media_path)}
+                alt=""
+              />
+            {:else if replyingTo.media_kind}
+              <span class="reply-icon">{replyIcon(replyingTo.media_kind)}</span>
+            {/if}
+            <span
+              >Replying to {senderLabel(replyingTo)}: {replyPreviewText(replyingTo)}</span
+            >
             <button class="icon" onclick={() => (replyingTo = null)}>×</button>
           </div>
         {/if}
@@ -2266,6 +2302,17 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .reply-thumb {
+    width: 32px;
+    height: 32px;
+    object-fit: cover;
+    border-radius: 4px;
+    flex: none;
+  }
+  .reply-icon {
+    font-size: 16px;
+    flex: none;
   }
   .mentions {
     display: flex;

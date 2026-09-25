@@ -1310,7 +1310,30 @@ fn quote_of(message: &wa::Message) -> Option<(String, String, String)> {
         .map(|p| p.to_string())
         .unwrap_or_default();
     let quoted = context.quoted_message.as_option()?;
-    let text = quoted.text_content().unwrap_or("[media]").to_string();
+    // A quoted media message has no text, so name its type instead of saying
+    // "media". The caption, when there is one, wins.
+    let (kind, name) = if quoted.image_message.as_option().is_some() {
+        ("image", None)
+    } else if quoted.video_message.as_option().is_some() {
+        ("video", None)
+    } else if quoted.audio_message.as_option().is_some() {
+        ("audio", None)
+    } else if let Some(document) = quoted.document_message.as_option() {
+        ("document", document.file_name.clone())
+    } else {
+        ("", None)
+    };
+    let text = quoted
+        .text_content()
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| match kind {
+            "image" => "Photo".to_string(),
+            "video" => "Video".to_string(),
+            "audio" => "Voice message".to_string(),
+            "document" => name.unwrap_or_else(|| "Document".to_string()),
+            _ => "[media]".to_string(),
+        });
     Some((id, author, text))
 }
 
