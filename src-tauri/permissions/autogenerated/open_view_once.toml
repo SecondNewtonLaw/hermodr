@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-open-view-once"
+description = "Enables the open_view_once command without any pre-configured scope."
+commands.allow = ["open_view_once"]
+
+[[permission]]
+identifier = "deny-open-view-once"
+description = "Denies the open_view_once command without any pre-configured scope."
+commands.deny = ["open_view_once"]

@@ -11,7 +11,10 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
-use hermodr_core::{ChatSummary, Retention, Service, ServiceConfig, ServiceEvent, StoredMessage};
+use hermodr_core::{
+    ChatSummary, Retention, SendOptions, Service, ServiceConfig, ServiceEvent, StoredMessage,
+    VoiceNote,
+};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 /// Event name the frontend listens on for service updates.
@@ -31,6 +34,9 @@ pub struct UiSettings {
     /// Whether to warn when a video goes out without a preview.
     #[serde(default = "default_true")]
     pub warn_missing_video_preview: bool,
+    /// Whether others see "typing…" while we write.
+    #[serde(default = "default_true")]
+    pub send_typing: bool,
 }
 
 fn default_true() -> bool {
@@ -45,8 +51,24 @@ impl Default for UiSettings {
             auto_download_media: true,
             media_dir: None,
             warn_missing_video_preview: true,
+            send_typing: true,
         }
     }
+}
+
+fn settings_path(app: &AppHandle) -> PathBuf {
+    app.path()
+        .app_config_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("settings.json")
+}
+
+/// Saved settings, or the defaults when none were saved or they do not parse.
+fn load_settings(app: &AppHandle) -> UiSettings {
+    std::fs::read_to_string(settings_path(app))
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
 }
 
 struct AppState {
@@ -60,6 +82,9 @@ struct AppState {
 pub struct Account {
     pub id: String,
     pub label: String,
+    /// Learned once the account connects, so its picture shows while inactive.
+    #[serde(default)]
+    pub jid: Option<String>,
 }
 
 /// The account list, persisted next to the app config.
@@ -132,6 +157,7 @@ fn load_accounts(app: &AppHandle) -> AccountsFile {
         file.accounts.push(Account {
             id: "default".into(),
             label: "WhatsApp".into(),
+            jid: None,
         });
         file.active = Some("default".into());
         save_accounts(app, &file);
@@ -154,9 +180,42 @@ fn now_millis() -> u128 {
 /// should not be carried in a backup of the account.
 fn media_cache_dir(app: &AppHandle) -> PathBuf {
     app.path()
-        .cache_dir()
+        .app_cache_dir()
         .map(|dir| dir.join("media"))
         .unwrap_or_else(|_| data_dir(app).join("media"))
+}
+
+/// Moves media out of the folders earlier versions used: next to the session,
+/// then the shared cache root (`~/.cache/media`, `%LOCALAPPDATA%\media`).
+fn migrate_media(app: &AppHandle, accounts: &AccountsFile) {
+    let legacy: Vec<PathBuf> = [Ok(data_dir(app).join("media")), app.path().cache_dir().map(|d| d.join("media"))]
+        .into_iter()
+        .flatten()
+        .filter(|dir| dir.is_dir())
+        .collect();
+    if legacy.is_empty() {
+        return;
+    }
+    let from: Vec<&std::path::Path> = legacy.iter().map(PathBuf::as_path).collect();
+    let to = media_cache_dir(app);
+    for account in &accounts.accounts {
+        let db = account_base(app, &account.id).join("messages.db");
+        if !db.exists() {
+            continue;
+        }
+        match hermodr_core::MessageStore::open(&db, Retention::default()) {
+            Ok(store) => {
+                if let Err(e) = store.relocate_media(&from, &to) {
+                    eprintln!("[hermodr] media migration for {}: {e}", account.id);
+                }
+            }
+            Err(e) => eprintln!("[hermodr] media migration for {}: {e}", account.id),
+        }
+    }
+    for dir in &legacy {
+        // Only succeeds once empty, so another program's files keep the folder.
+        let _ = std::fs::remove_dir(dir);
+    }
 }
 
 fn config_for(app: &AppHandle, settings: &UiSettings, account: &str) -> ServiceConfig {
@@ -286,6 +345,7 @@ async fn connect(app: AppHandle, state: State<'_, AppState>) -> Result<(), Strin
                 file.accounts.push(Account {
                     id: "default".into(),
                     label: "WhatsApp".into(),
+                    jid: None,
                 });
                 file.active = Some("default".into());
             }
@@ -319,6 +379,7 @@ async fn add_account(
         file.accounts.push(Account {
             id: id.clone(),
             label: label.unwrap_or_else(|| "WhatsApp".into()),
+            jid: None,
         });
         file.active = Some(id.clone());
     }
@@ -434,6 +495,7 @@ async fn send_reply(
     reply_to_sender: String,
     reply_to_text: String,
     mentions: Option<Vec<String>>,
+    reply_to_chat: Option<String>,
 ) -> Result<(), String> {
     let service = state.service()?;
     service
@@ -444,9 +506,87 @@ async fn send_reply(
             &reply_to_sender,
             &reply_to_text,
             mentions.unwrap_or_default(),
+            reply_to_chat.as_deref().filter(|c| *c != chat),
         )
         .await
         .map_err(|e| e.to_string())
+}
+
+/// The message a context-menu action applies to.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Target {
+    chat: String,
+    id: String,
+    sender: String,
+    from_me: bool,
+}
+
+#[tauri::command]
+async fn react(state: State<'_, AppState>, target: Target, emoji: String) -> Result<(), String> {
+    state
+        .service()?
+        .react(&target.chat, &target.id, &target.sender, target.from_me, &emoji)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn star(state: State<'_, AppState>, target: Target, starred: bool) -> Result<(), String> {
+    state
+        .service()?
+        .star(&target.chat, &target.id, &target.sender, target.from_me, starred)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pin_message(state: State<'_, AppState>, target: Target, pinned: bool) -> Result<(), String> {
+    state
+        .service()?
+        .pin_message(&target.chat, &target.id, &target.sender, target.from_me, pinned)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_message(
+    state: State<'_, AppState>,
+    target: Target,
+    everyone: bool,
+    timestamp: i64,
+) -> Result<(), String> {
+    let service = state.service()?;
+    let done = if everyone {
+        service
+            .delete_for_everyone(&target.chat, &target.id, &target.sender, target.from_me)
+            .await
+    } else {
+        service
+            .delete_for_me(&target.chat, &target.id, &target.sender, target.from_me, timestamp)
+            .await
+    };
+    done.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn report_message(state: State<'_, AppState>, chat: String, id: String) -> Result<(), String> {
+    state.service()?.report_to_admins(&chat, &id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn forward_message(
+    state: State<'_, AppState>,
+    chat: String,
+    id: String,
+    to: String,
+) -> Result<(), String> {
+    state.service()?.forward(&chat, &id, &to).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn marks(state: State<'_, AppState>, chat: String) -> Result<hermodr_core::ChatMarks, String> {
+    state.service()?.marks(&chat).map_err(|e| e.to_string())
 }
 
 /// Sends an attachment as an image or document.
@@ -464,15 +604,152 @@ async fn send_media(
     reply_to_id: Option<String>,
     reply_to_sender: Option<String>,
     reply_to_text: Option<String>,
+    gif: Option<bool>,
+    view_once: Option<bool>,
 ) -> Result<Option<String>, String> {
     let bytes = BASE64.decode(data.as_bytes()).map_err(|e| e.to_string())?;
     let reply = match (reply_to_id, reply_to_sender, reply_to_text) {
         (Some(id), Some(sender), Some(text)) => Some((id, sender, text)),
         _ => None,
     };
+    let options = SendOptions {
+        gif: gif.unwrap_or(false),
+        view_once: view_once.unwrap_or(false),
+        voice: None,
+    };
     let service = state.service()?;
     service
-        .send_media(&chat, &name, bytes, caption, reply)
+        .send_media(&chat, &name, bytes, caption, reply, options)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Sends a voice note recorded by the webview (WebM/Opus, base64).
+#[tauri::command]
+async fn send_voice(
+    state: State<'_, AppState>,
+    chat: String,
+    data: String,
+    seconds: u32,
+    waveform: Vec<u8>,
+    reply_to_id: Option<String>,
+    reply_to_sender: Option<String>,
+    reply_to_text: Option<String>,
+    view_once: Option<bool>,
+) -> Result<(), String> {
+    let webm = BASE64.decode(data.as_bytes()).map_err(|e| e.to_string())?;
+    let ogg = hermodr_core::ogg::webm_to_ogg(&webm).map_err(|e| e.to_string())?;
+    let reply = match (reply_to_id, reply_to_sender, reply_to_text) {
+        (Some(id), Some(sender), Some(text)) => Some((id, sender, text)),
+        _ => None,
+    };
+    let options = SendOptions {
+        gif: false,
+        view_once: view_once.unwrap_or(false),
+        voice: Some(VoiceNote { seconds, waveform }),
+    };
+    state
+        .service()?
+        .send_media(&chat, "voice.ogg", ogg, None, reply, options)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn create_poll(
+    state: State<'_, AppState>,
+    chat: String,
+    question: String,
+    options: Vec<String>,
+    multi: bool,
+) -> Result<(), String> {
+    state
+        .service()?
+        .create_poll(&chat, question.trim(), options, multi)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn vote_poll(
+    state: State<'_, AppState>,
+    chat: String,
+    id: String,
+    options: Vec<String>,
+) -> Result<(), String> {
+    state.service()?.vote_poll(&chat, &id, options).await.map_err(|e| e.to_string())
+}
+
+/// An event as the create dialog fills it; times are Unix seconds.
+#[derive(serde::Deserialize)]
+struct EventForm {
+    name: String,
+    description: Option<String>,
+    start: Option<i64>,
+    end: Option<i64>,
+    location: Option<String>,
+    link: Option<String>,
+}
+
+#[tauri::command]
+async fn create_event(state: State<'_, AppState>, chat: String, event: EventForm) -> Result<(), String> {
+    let event = hermodr_core::NewEvent {
+        name: event.name.trim().to_string(),
+        description: event.description.filter(|s| !s.trim().is_empty()),
+        start: event.start,
+        end: event.end,
+        location: event.location.filter(|s| !s.trim().is_empty()),
+        link: event.link.filter(|s| !s.trim().is_empty()),
+        canceled: false,
+    };
+    state.service()?.create_event(&chat, event).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn respond_event(
+    state: State<'_, AppState>,
+    chat: String,
+    id: String,
+    response: String,
+) -> Result<(), String> {
+    state
+        .service()?
+        .respond_event(&chat, &id, &response)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Sends base64 image bytes as a sticker.
+#[tauri::command]
+async fn send_sticker(state: State<'_, AppState>, chat: String, data: String) -> Result<(), String> {
+    let bytes = BASE64.decode(data.as_bytes()).map_err(|e| e.to_string())?;
+    state.service()?.send_sticker(&chat, bytes).await.map_err(|e| e.to_string())
+}
+
+/// Stickers or GIFs already downloaded, newest first.
+#[tauri::command]
+fn media_library(
+    state: State<'_, AppState>,
+    kind: String,
+    prefer: Option<Vec<String>>,
+) -> Result<Vec<String>, String> {
+    state
+        .service()?
+        .media_library(&kind, &prefer.unwrap_or_default())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn send_from_library(
+    state: State<'_, AppState>,
+    chat: String,
+    path: String,
+    kind: String,
+) -> Result<(), String> {
+    state
+        .service()?
+        .send_from_library(&chat, &path, &kind)
         .await
         .map_err(|e| e.to_string())
 }
@@ -497,24 +774,43 @@ fn open_path(app: AppHandle, state: State<'_, AppState>, path: String) -> Result
         });
 
     let dir = configured
-        .and_then(|dir| std::fs::canonicalize(dir).ok())
+        .and_then(|dir| dunce::canonicalize(dir).ok())
         .ok_or("no media folder is configured")?;
-    let target = std::fs::canonicalize(&path).map_err(|e| e.to_string())?;
+    let target = dunce::canonicalize(&path).map_err(|e| e.to_string())?;
     if !target.starts_with(&dir) {
         return Err("refusing to open a file outside the media folder".into());
     }
+    shell_open(target.as_os_str())
+}
 
+/// Opens a file or URL with the desktop's default handler.
+fn shell_open(target: &std::ffi::OsStr) -> Result<(), String> {
     #[cfg(target_os = "linux")]
-    let spawned = std::process::Command::new("xdg-open").arg(&target).spawn();
+    std::process::Command::new("xdg-open").arg(target).spawn().map_err(|e| e.to_string())?;
     #[cfg(target_os = "macos")]
-    let spawned = std::process::Command::new("open").arg(&target).spawn();
+    std::process::Command::new("open").arg(target).spawn().map_err(|e| e.to_string())?;
+    // Not `cmd /C start`: cmd re-parses the target, so a `&` in a URL runs a
+    // command, and it flashes a console window.
     #[cfg(target_os = "windows")]
-    let spawned = std::process::Command::new("cmd")
-        .args(["/C", "start", ""])
-        .arg(&target)
-        .spawn();
-
-    spawned.map_err(|e| e.to_string())?;
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+        let file: Vec<u16> = target.encode_wide().chain(Some(0)).collect();
+        let code = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        } as usize;
+        // Values above 32 mean success.
+        if code <= 32 {
+            return Err(format!("the shell could not open it (error {code})"));
+        }
+    }
     Ok(())
 }
 
@@ -591,17 +887,7 @@ fn open_url(url: String) -> Result<(), String> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err("only http(s) links are opened".into());
     }
-    #[cfg(target_os = "linux")]
-    let spawned = std::process::Command::new("xdg-open").arg(&url).spawn();
-    #[cfg(target_os = "macos")]
-    let spawned = std::process::Command::new("open").arg(&url).spawn();
-    #[cfg(target_os = "windows")]
-    let spawned = std::process::Command::new("cmd")
-        .args(["/C", "start", ""])
-        .arg(&url)
-        .spawn();
-    spawned.map_err(|e| e.to_string())?;
-    Ok(())
+    shell_open(url.as_ref())
 }
 
 /// Chats, contacts and groups matching a query.
@@ -679,6 +965,107 @@ async fn load_older(
         .map_err(|e| e.to_string())
 }
 
+/// The signed-in account's own JID, once connected. Also recorded on the
+/// account, so the switcher can show every account's picture.
+#[tauri::command]
+fn own_jid(app: AppHandle, state: State<'_, AppState>) -> Option<String> {
+    let jid = state.service().ok()?.own_jid();
+    if jid.is_empty() {
+        return None;
+    }
+    let active = active_account(&state);
+    let mut file = state.accounts.lock().unwrap();
+    if let Some(account) = file.accounts.iter_mut().find(|a| Some(&a.id) == active.as_ref()) {
+        if account.jid.as_deref() != Some(jid.as_str()) {
+            account.jid = Some(jid.clone());
+            save_accounts(&app, &file);
+        }
+    }
+    Some(jid)
+}
+
+#[tauri::command]
+async fn send_typing(state: State<'_, AppState>, chat: String, typing: bool) -> Result<(), String> {
+    state.service()?.send_typing(&chat, typing).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_online(state: State<'_, AppState>, online: bool) -> Result<(), String> {
+    state.service()?.set_online(online).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn watch_presence(state: State<'_, AppState>, jid: String) -> Result<(), String> {
+    state.service()?.watch_presence(&jid).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn profile(state: State<'_, AppState>) -> Result<hermodr_core::Profile, String> {
+    state.service()?.profile().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_member_label(
+    state: State<'_, AppState>,
+    chat: String,
+    label: String,
+) -> Result<(), String> {
+    state
+        .service()?
+        .set_member_label(&chat, label.trim())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Sets our profile picture from base64 image bytes; an empty string removes it.
+#[tauri::command]
+async fn set_profile_picture(state: State<'_, AppState>, data: String) -> Result<(), String> {
+    let bytes = BASE64.decode(data.as_bytes()).map_err(|e| e.to_string())?;
+    state.service()?.set_own_picture(bytes).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_about(state: State<'_, AppState>, text: String) -> Result<(), String> {
+    state.service()?.set_about(&text).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_push_name(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    state.service()?.set_push_name(&name).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_privacy(
+    state: State<'_, AppState>,
+    category: String,
+    value: String,
+) -> Result<(), String> {
+    state
+        .service()?
+        .set_privacy(&category, &value)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// A chat's cached profile picture path, if it has one.
+#[tauri::command]
+async fn avatar(state: State<'_, AppState>, jid: String) -> Result<Option<String>, String> {
+    state.service()?.avatar(&jid).await.map_err(|e| e.to_string())
+}
+
+/// Marks a view-once message opened and deletes its file.
+#[tauri::command]
+fn open_view_once(state: State<'_, AppState>, chat: String, id: String) -> Result<(), String> {
+    state.service()?.open_view_once(&chat, &id).map_err(|e| e.to_string())
+}
+
+/// Best known names for JIDs, keyed by the JID as given.
+#[tauri::command]
+async fn names(state: State<'_, AppState>, jids: Vec<String>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    Ok(state.service()?.names_for(&jids).await)
+}
+
 /// Unread messages that mention us, oldest first.
 #[tauri::command]
 fn unread_mentions(state: State<'_, AppState>, chat: String) -> Result<Vec<String>, String> {
@@ -700,14 +1087,27 @@ fn get_settings(state: State<'_, AppState>) -> UiSettings {
     state.settings.lock().unwrap().clone()
 }
 
-/// Updates settings. Takes effect on the next connection.
+/// Updates and saves settings. Service settings take effect on the next connection.
 #[tauri::command]
-fn set_settings(state: State<'_, AppState>, settings: UiSettings) {
+fn set_settings(app: AppHandle, state: State<'_, AppState>, settings: UiSettings) -> Result<(), String> {
+    let path = settings_path(&app);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| e.to_string())?;
     *state.settings.lock().unwrap() = settings;
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // History sync and peer requests fail silently otherwise. RUST_LOG overrides.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
+        "warn,whatsapp_rust::history_sync=info,whatsapp_rust::pdo=info",
+    ))
+    .init();
+
     // WebKitGTK's DMA-BUF renderer fails to create GBM buffers under Wayland
     // (Hyprland), aborting with "Gdk Error 71". This affects our own UI webview
     // as much as it did the old one.
@@ -718,40 +1118,33 @@ pub fn run() {
 
     tauri::Builder::default()
         .setup(|app| {
+            let accounts = load_accounts(app.handle());
+            migrate_media(app.handle(), &accounts);
+
             app.manage(AppState {
                 service: Mutex::new(None),
-                settings: Mutex::new(UiSettings::default()),
-                accounts: Mutex::new(load_accounts(app.handle())),
+                settings: Mutex::new(load_settings(app.handle())),
+                accounts: Mutex::new(accounts),
             });
-
-            // Media used to sit next to the session. Move it into the cache
-            // once, so an upgrade keeps the files it already downloaded.
-            let legacy = data_dir(app.handle()).join("media");
-            let target = media_cache_dir(app.handle());
-            if legacy.is_dir() && !target.exists() {
-                if std::fs::create_dir_all(&target).is_ok() && std::fs::rename(&legacy, &target).is_err() {
-                    // A different filesystem cannot be renamed across.
-                    if let Ok(entries) = std::fs::read_dir(&legacy) {
-                        for entry in entries.flatten() {
-                            let _ = std::fs::copy(entry.path(), target.join(entry.file_name()));
-                        }
-                    }
-                }
-            }
 
             // Built here rather than from the config so clipboard access can be
             // turned on. WebKitGTK only hands pasted images to the page when
             // `javascript_can_access_clipboard` is set, and it does not deliver
             // them through the paste event's clipboardData.
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
+            let builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
                 .title("Hermóðr")
                 .inner_size(1000.0, 720.0)
                 .min_inner_size(480.0, 360.0)
                 // No client side title bar: the compositor draws its own on KDE
-                // and GNOME, and Hyprland ignores ours entirely.
-                .decorations(false)
-                .enable_clipboard_access()
-                .build()?;
+                // and GNOME, and Hyprland ignores ours entirely. Windows has no
+                // compositor title bar, so it keeps the native one.
+                .decorations(cfg!(target_os = "windows"))
+                .enable_clipboard_access();
+            // WebView2 only delivers dropped files to the page's drop handler
+            // when Tauri's own drag and drop handler is off.
+            #[cfg(target_os = "windows")]
+            let builder = builder.disable_drag_drop_handler();
+            builder.build()?;
 
             Ok(())
         })
@@ -776,6 +1169,34 @@ pub fn run() {
             group_info,
             set_pinned,
             unread_mentions,
+            avatar,
+            names,
+            send_voice,
+            open_view_once,
+            own_jid,
+            send_typing,
+            set_online,
+            watch_presence,
+            profile,
+            set_about,
+            set_profile_picture,
+            set_member_label,
+            react,
+            star,
+            pin_message,
+            delete_message,
+            report_message,
+            forward_message,
+            marks,
+            send_sticker,
+            media_library,
+            send_from_library,
+            create_poll,
+            vote_poll,
+            create_event,
+            respond_event,
+            set_push_name,
+            set_privacy,
             load_older,
             flush_media,
             download_media,

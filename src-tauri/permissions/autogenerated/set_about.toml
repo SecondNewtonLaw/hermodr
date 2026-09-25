@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-about"
+description = "Enables the set_about command without any pre-configured scope."
+commands.allow = ["set_about"]
+
+[[permission]]
+identifier = "deny-set-about"
+description = "Denies the set_about command without any pre-configured scope."
+commands.deny = ["set_about"]

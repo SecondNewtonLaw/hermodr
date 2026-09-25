@@ -1,8 +1,29 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import { convertFileSrc, invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import AudioPlayer from "$lib/AudioPlayer.svelte";
+  import VoiceRecorder, { type Recording } from "$lib/VoiceRecorder.svelte";
+  import { displayName as phoneName, phoneLabel } from "$lib/phone";
+  import { polyfillCountryFlagEmojis } from "country-flag-emoji-polyfill";
+  import flagFont from "country-flag-emoji-polyfill/dist/TwemojiCountryFlags.woff2?url";
+
+  // Windows has no flag glyphs and draws the two letters instead. The font is
+  // bundled, so nothing is fetched at runtime; elsewhere this is a no-op.
+  polyfillCountryFlagEmojis("Twemoji Country Flags", flagFont);
+  import Icon, { type IconName } from "$lib/Icon.svelte";
+  import Settings, { type Section } from "$lib/Settings.svelte";
+  import GroupInfo from "$lib/GroupInfo.svelte";
+  import MediaViewer, { type ViewerItem } from "$lib/MediaViewer.svelte";
+  import MessageMenu, { type MenuItem } from "$lib/MessageMenu.svelte";
+  import ChatPicker from "$lib/ChatPicker.svelte";
+  import ExpressionPicker, { type PickerTab } from "$lib/ExpressionPicker.svelte";
+  import { loadEmojis, rememberEmoji, searchEmojis, type Emoji } from "$lib/emoji";
+  import PollCard, { type Poll } from "$lib/PollCard.svelte";
+  import EventCard, { type ChatEvent } from "$lib/EventCard.svelte";
+  import CreateDialog from "$lib/CreateDialog.svelte";
+  import { blocks, plain, type Inline } from "$lib/format";
+  import { activeTheme, applyTheme, customization, save as saveCustomization } from "$lib/theme.svelte";
 
   type StoredMessage = {
     chat: string;
@@ -37,12 +58,14 @@
     last_text: string;
     last_from_me: boolean;
     last_sender_name: string | null;
+    last_sender: string;
+    last_media_kind: string | null;
     message_count: number;
     unread_count: number;
     mention_count: number;
     pinned: boolean;
   };
-  type Account = { id: string; label: string };
+  type Account = { id: string; label: string; jid: string | null };
   type SearchResult = {
     jid: string;
     name: string;
@@ -61,6 +84,7 @@
       admin: boolean;
       number: string | null;
       username: string | null;
+      label: string | null;
     }[];
   };
   type Retention = {
@@ -73,6 +97,7 @@
     auto_download_media: boolean;
     warn_missing_video_preview: boolean;
     media_dir: string | null;
+    send_typing: boolean;
   };
   type ConnectionState = { started: boolean; connected: boolean; qr: string | null };
 
@@ -93,7 +118,49 @@
     | { kind: "retentionApplied"; removed: number }
     | { kind: "namesUpdated"; count: number }
     | { kind: "syncing"; pending: number }
-    | { kind: "synced" };
+    | { kind: "synced" }
+    | { kind: "historyLoaded"; chats: string[] }
+    | { kind: "avatarChanged"; jid: string }
+    | { kind: "typing"; chat: string; sender: string; state: string }
+    | { kind: "memberLabel"; chat: string; jid: string; label: string }
+    | { kind: "marks"; chat: string };
+
+  let settingsSection = $state<Section>("accounts");
+  let accountMenu = $state(false);
+  /** Our own JID, for the account panel's picture and number. */
+  let me = $state<string | null>(null);
+  /** Bumped when we replace our picture, which keeps its file name. */
+  let meVersion = $state(0);
+
+  function openSettings(section: Section) {
+    settingsSection = section;
+    accountMenu = false;
+    showSettings = true;
+  }
+
+  $effect(() => {
+    applyTheme(activeTheme());
+    saveCustomization();
+  });
+
+  /** CSS extensions, kept from closing their own style element. */
+  const extensionCss = $derived(
+    customization.extensions
+      .filter((e) => e.enabled && e.css.trim())
+      .map((e) => `<style data-extension="${e.id}">${e.css.replace(/<\/style/gi, "<\\/style")}</style>`)
+      .join(""),
+  );
+
+  /** How many messages the open chat shows; "load older" raises it. */
+  const PAGE = 200;
+  let messageLimit = $state(PAGE);
+  let loadingOlder = $state(false);
+  let olderTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Cached profile picture per chat; `null` means it has none. */
+  let avatars: Record<string, string | null> = $state({});
+  const requestedAvatars = new Set<string>();
+  const avatarQueue: string[] = [];
+  let avatarWorkers = 0;
 
   let connected = $state(false);
   let connecting = $state(false);
@@ -113,13 +180,22 @@
   let drafts: Record<string, string> = $state({});
   let composerInput: HTMLTextAreaElement | undefined = $state();
   /** Group members for the @ autocomplete. */
-  let participants: { jid: string; name: string }[] = $state([]);
+  type Member = {
+    jid: string;
+    name: string;
+    number: string | null;
+    label: string | null;
+    admin: boolean;
+  };
+  let participants: Member[] = $state([]);
   /** Open mention query, or null while the autocomplete is closed. */
   let mentionQuery = $state<string | null>(null);
   /** Unread mentions in the open chat, oldest first, for jump-to-mention. */
   let accountList: Account[] = $state([]);
   let activeAccount = $state<string | null>(null);
-  let showAccounts = $state(false);
+  const activeLabel = $derived(
+    accountList.find((a) => a.id === activeAccount)?.label ?? "WhatsApp",
+  );
   /** A transient notice, such as a video sent without a preview. */
   let notice = $state<string | null>(null);
   /** A quote whose target is not loaded yet, offered as a load action. */
@@ -157,32 +233,40 @@
     auto_download_media: true,
     warn_missing_video_preview: true,
     media_dir: null,
+    send_typing: true,
   });
   let showSettings = $state(false);
   let showGroupInfo = $state(false);
   let groupInfo: GroupInfo | null = $state(null);
   let groupInfoError = $state<string | null>(null);
   /** Sidebar widths, adjustable by dragging their edges. */
-  let leftWidth = $state(300);
-  let rightWidth = $state(320);
-  let layoutColumns = $derived(
-    showGroupInfo ? `${leftWidth}px 1fr ${rightWidth}px` : `${leftWidth}px 1fr`,
+  const WIDTH_KEY = "hermodr.sidebarWidth";
+  let leftWidth = $state(
+    (() => {
+      try {
+        return Number(localStorage.getItem(WIDTH_KEY)) || 300;
+      } catch {
+        return 300;
+      }
+    })(),
   );
+  let layoutColumns = $derived(`${leftWidth}px 1fr`);
 
-  function startResize(side: "left" | "right", event: MouseEvent) {
+  function startResize(event: MouseEvent) {
     event.preventDefault();
     const startX = event.clientX;
-    const startWidth = side === "left" ? leftWidth : rightWidth;
+    const startWidth = leftWidth;
     const onMove = (e: MouseEvent) => {
-      const delta = e.clientX - startX;
-      const next = side === "left" ? startWidth + delta : startWidth - delta;
-      const clamped = Math.max(180, Math.min(640, next));
-      if (side === "left") leftWidth = clamped;
-      else rightWidth = clamped;
+      leftWidth = Math.max(180, Math.min(640, startWidth + e.clientX - startX));
     };
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      try {
+        localStorage.setItem(WIDTH_KEY, String(leftWidth));
+      } catch {
+        // Only the remembered width is lost.
+      }
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
@@ -204,23 +288,117 @@
     return jid.replace(/@.*$/, "");
   }
   function chatLabel(chat: ChatSummary) {
-    return chat.display_name || bareJid(chat.chat);
+    return displayName(chat.display_name, chat.chat);
+  }
+  /** Up to two letters for an avatar, or a digit pair for a bare number. */
+  function initials(label: string) {
+    const words = label.replace(/[^\p{L}\p{N}\s]/gu, "").trim().split(/\s+/).filter(Boolean);
+    if (words.length === 0) return "#";
+    if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
+    return (words[0][0] + words[1][0]).toUpperCase();
+  }
+  /** Oldest first, the order the conversation is drawn in. */
+  const ordered = $derived(messages.slice().reverse());
+
+  const isGroupChat = $derived(!!selectedChat?.endsWith("@g.us"));
+
+  let chatFilter = $state<"all" | "unread" | "groups">("all");
+  const visibleChats = $derived(
+    chats.filter((c) =>
+      chatFilter === "all"
+        ? true
+        : chatFilter === "unread"
+          ? c.unread_count > 0
+          : c.chat.endsWith("@g.us"),
+    ),
+  );
+  const unreadChats = $derived(chats.filter((c) => c.unread_count > 0).length);
+
+  /** Member names under a group's title, as far as they are known. */
+  const subtitle = $derived(
+    selectedChat?.endsWith("@g.us") && participants.length > 0
+      ? participants.map((p) => displayName(p.name, p.jid)).join(", ")
+      : null,
+  );
+
+  function dayKey(ts: number) {
+    return new Date(ts * 1000).toDateString();
+  }
+  function dayLabel(ts: number) {
+    const day = new Date(ts * 1000);
+    const today = new Date();
+    const yesterday = new Date();
+    yesterday.setDate(today.getDate() - 1);
+    if (day.toDateString() === today.toDateString()) return "Today";
+    if (day.toDateString() === yesterday.toDateString()) return "Yesterday";
+    return day.toLocaleDateString(undefined, {
+      day: "numeric",
+      month: "long",
+      year: day.getFullYear() === today.getFullYear() ? undefined : "numeric",
+    });
+  }
+
+  /** A media message's caption. Uncaptioned media is stored as `[kind]`. */
+  function captionOf(message: StoredMessage) {
+    const text = message.text.trim();
+    return text === `[${message.media_kind}]` ? "" : text;
+  }
+  /** A stable hue per chat, so an avatar keeps its colour across sessions. */
+  function hue(jid: string) {
+    let h = 0;
+    for (const c of jid) h = (h * 31 + c.charCodeAt(0)) % 360;
+    return h;
   }
   /** Preview line: our own messages are prefixed "You", group peers by name. */
-  function chatPreview(chat: ChatSummary) {
-    if (chat.last_from_me) return `You: ${chat.last_text}`;
-    if (chat.chat.endsWith("@g.us") && chat.last_sender_name) {
-      return `${chat.last_sender_name}: ${chat.last_text}`;
-    }
-    return chat.last_text;
+  /** Who sent a chat's last message, as the list prefixes it. */
+  function previewAuthor(chat: ChatSummary) {
+    if (chat.last_from_me) return "You";
+    if (!chat.chat.endsWith("@g.us")) return null;
+    return displayName(chat.last_sender_name, chat.last_sender);
+  }
+  /** The last message's text; media without a caption reads as its kind. */
+  function previewText(chat: ChatSummary) {
+    const kind = chat.last_media_kind;
+    if (kind === "poll") return `📊 ${chat.last_text}`;
+    if (kind === "event") return `📅 ${chat.last_text}`;
+    if (kind === "view_once") return "View once message";
+    if (!kind || chat.last_text.trim() !== `[${kind}]`) return plain(chat.last_text, mentionName);
+    return MEDIA_LABELS[kind] ?? "Attachment";
+  }
+  const MEDIA_LABELS: Record<string, string> = {
+    image: "Photo",
+    video: "Video",
+    gif: "GIF",
+    audio: "Audio",
+    document: "Document",
+    sticker: "Sticker",
+  };
+  function mediaIcon(kind: string | null): IconName | null {
+    if (kind === "image" || kind === "sticker") return "image";
+    if (kind === "video" || kind === "gif") return "video";
+    if (kind === "audio") return "mic";
+    if (kind === "document") return "file";
+    return null;
+  }
+  /** The group member a sender is, matched by LID or by phone number. */
+  function memberOf(jid: string) {
+    const b = bare(jid);
+    const user = b.split("@")[0];
+    return participants.find((p) => p.jid === b || p.number === user);
   }
   function senderLabel(message: StoredMessage) {
-    return message.sender_name || bareJid(message.sender);
+    // The message row joins names on one address form only; the member list
+    // resolves both, so it rescues senders whose name is keyed by the other.
+    const own = message.sender_name;
+    const known = own && !/^\+?\d+$/.test(own) ? own : memberOf(message.sender)?.name;
+    return displayName(known && !/^\+?\d+$/.test(known) ? known : own, message.sender);
   }
   /** Resolves a JID to a known name, falling back to the bare address. */
   function senderName(jid: string) {
-    const known = messages.find((m) => m.sender === jid && m.sender_name);
-    return known?.sender_name || bareJid(jid);
+    const b = bare(jid);
+    const known = messages.find((m) => bare(m.sender) === b && m.sender_name)?.sender_name;
+    const member = memberOf(jid)?.name;
+    return displayName(known && !/^\+?\d+$/.test(known) ? known : (member ?? known), jid);
   }
   /** Author shown on a quote; our own messages read "You". */
   function quoteAuthor(jid: string | null) {
@@ -273,7 +451,10 @@
   }
 
   async function openChat(chat: string, jumpToMention = false, label: string | null = null) {
+    if (selectedChat !== chat) stopTyping();
     selectedChat = chat;
+    // One-to-one typing only arrives for contacts we are subscribed to.
+    if (!chat.endsWith("@g.us")) invoke("watch_presence", { jid: chat }).catch(() => {});
     titleOverride = label;
     scrolledUp = false;
     participants = [];
@@ -290,7 +471,9 @@
     }
     mentionCursor = 0;
     try {
-      messages = await invoke<StoredMessage[]>("messages", { chat, limit: 200 });
+      messageLimit = PAGE;
+      messages = await invoke<StoredMessage[]>("messages", { chat, limit: messageLimit });
+      await loadMarks();
       // Opening a conversation is what marks it seen.
       await invoke("mark_read", { chat });
       await refreshChats();
@@ -300,7 +483,7 @@
     }
     // Group members power the @ autocomplete; a one-to-one chat returns none.
     try {
-      participants = await invoke<{ jid: string; name: string }[]>("participants", { chat });
+      participants = await invoke<Member[]>("participants", { chat });
     } catch {
       participants = [];
     }
@@ -313,20 +496,6 @@
     composerInput?.focus();
   }
 
-  /** Splits text into plain runs and http(s) links, for rendering. */
-  function linkParts(text: string): { text: string; url?: string }[] {
-    const pattern = /(https?:\/\/[^\s<>()\[\]{}"']+)/g;
-    const parts: { text: string; url?: string }[] = [];
-    let last = 0;
-    for (const match of text.matchAll(pattern)) {
-      const at = match.index ?? 0;
-      if (at > last) parts.push({ text: text.slice(last, at) });
-      parts.push({ text: match[0], url: match[0] });
-      last = at + match[0].length;
-    }
-    if (last < text.length) parts.push({ text: text.slice(last) });
-    return parts;
-  }
 
   function hostOf(url: string) {
     try {
@@ -379,6 +548,10 @@
   /** Clears everything tied to the current account before switching. */
   function resetUi() {
     chats = [];
+    avatars = {};
+    requestedAvatars.clear();
+    me = null;
+    accountMenu = false;
     messages = [];
     selectedChat = null;
     draft = "";
@@ -446,10 +619,19 @@
 
   /** Asks the phone for older messages in the open chat. */
   async function loadOlder() {
-    if (!selectedChat) return;
+    if (!selectedChat || loadingOlder) return;
+    loadingOlder = true;
+    // The phone answers asynchronously, or not at all when it has nothing
+    // older or is offline, so the spinner gives up on its own.
+    clearTimeout(olderTimer);
+    olderTimer = setTimeout(() => {
+      loadingOlder = false;
+      error = "Your phone did not answer. It has to be online for older messages to load.";
+    }, 15000);
     try {
       await invoke("load_older", { chat: selectedChat, count: 50 });
     } catch (e) {
+      loadingOlder = false;
       error = String(e);
     }
   }
@@ -478,7 +660,7 @@
   /** Label for a media message with no caption, used in reply previews. */
   function replyPreviewText(message: StoredMessage) {
     // Media stores a "[image]" style placeholder when it has no caption.
-    if (message.text && !message.text.startsWith("[")) return message.text;
+    if (message.text && !message.text.startsWith("[")) return plain(message.text, mentionName);
     switch (message.media_kind) {
       case "image":
         return "Photo";
@@ -520,8 +702,8 @@
   }
 
   /** Pins or unpins a chat, mirrored to the account. */
-  async function togglePin(chat: ChatSummary, event: MouseEvent) {
-    event.stopPropagation();
+  async function togglePin(chat: ChatSummary, event?: MouseEvent) {
+    event?.stopPropagation();
     try {
       await invoke("set_pinned", { chat: chat.chat, pinned: !chat.pinned });
       await refreshChats();
@@ -545,18 +727,236 @@
     }
   }
 
-  /** Reloads the open conversation without touching the unread state. */
-  async function reloadMessages() {
+  /**
+   * Reloads the open conversation without touching the unread state.
+   *
+   * `keepPlace` holds the view on the same message when older ones are added
+   * above it, instead of letting them push it down.
+   */
+  async function reloadMessages(keepPlace = false) {
     if (!selectedChat) return;
+    const fromBottom = scroller ? scroller.scrollHeight - scroller.scrollTop : 0;
     try {
       messages = await invoke<StoredMessage[]>("messages", {
         chat: selectedChat,
-        limit: 200,
+        limit: messageLimit,
       });
     } catch (e) {
       error = String(e);
+      return;
+    }
+    if (keepPlace && scroller) {
+      await tick();
+      scroller.scrollTop = scroller.scrollHeight - fromBottom;
     }
   }
+
+  /** Fetches a profile picture once, a few requests at a time. */
+  function loadAvatar(jid: string) {
+    if (requestedAvatars.has(jid)) return;
+    requestedAvatars.add(jid);
+    avatarQueue.push(jid);
+    while (avatarWorkers < 4 && avatarQueue.length > 0) void avatarWorker();
+  }
+  async function avatarWorker() {
+    avatarWorkers++;
+    try {
+      for (let jid = avatarQueue.shift(); jid; jid = avatarQueue.shift()) {
+        try {
+          avatars[jid] = await invoke<string | null>("avatar", { jid });
+        } catch {
+          avatars[jid] = null;
+        }
+      }
+    } finally {
+      avatarWorkers--;
+    }
+  }
+
+  /** A JID's cached picture, fetching it on first use. */
+  function pictureOf(jid: string) {
+    loadAvatar(jid);
+    return avatars[jid] ?? null;
+  }
+
+  $effect(() => {
+    if (!connected) return;
+    for (const chat of chats) loadAvatar(chat.chat);
+  });
+
+  /** A JID without its device suffix, the form pictures and names are keyed by. */
+  function bare(jid: string) {
+    return jid.replace(/:\d+(?=@)/, "");
+  }
+
+  /**
+   * Names the core found under either address form (a LID sender, a phone
+   * quote author), fetched in batches for JIDs rendered without one.
+   */
+  let learnedNames: Record<string, string> = $state({});
+  const requestedNames = new Set<string>();
+  let queuedNames: string[] = [];
+  let nameTimer: ReturnType<typeof setTimeout> | undefined;
+  function requestName(jid: string) {
+    if (!connected || requestedNames.has(jid) || !jid.includes("@")) return;
+    requestedNames.add(jid);
+    queuedNames.push(jid);
+    clearTimeout(nameTimer);
+    nameTimer = setTimeout(async () => {
+      const jids = queuedNames;
+      queuedNames = [];
+      try {
+        Object.assign(learnedNames, await invoke<Record<string, string>>("names", { jids }));
+      } catch {
+        for (const jid of jids) requestedNames.delete(jid);
+      }
+    }, 30);
+  }
+  /** A name for a JID, asking the core when the given one is missing or a bare number. */
+  function displayName(name: string | null | undefined, jid: string) {
+    if (!name || /^\+?\d+$/.test(name)) {
+      const key = bare(jid);
+      const learned = learnedNames[key];
+      if (learned) return phoneName(learned, key);
+      requestName(key);
+    }
+    return phoneName(name, jid);
+  }
+
+  /** Who an `@<user>` token names: us, a group member, or whichever address form the core knows. */
+  function mentionTarget(user: string): { jid: string; name: string; self: boolean } {
+    const own = me ? bare(me) : null;
+    const member = participants.find((p) => p.jid.split("@")[0] === user || p.number === user);
+    if (own && (own.split("@")[0] === user || member?.number === own.split("@")[0])) {
+      // Our own contact card may be saved under a nickname; show our push name.
+      return { jid: own, name: displayName(null, own), self: true };
+    }
+    if (member) return { jid: member.jid, name: displayName(member.name, member.jid), self: false };
+    const lid = `${user}@lid`;
+    const pn = `${user}@s.whatsapp.net`;
+    const lidName = displayName(null, lid);
+    const pnName = displayName(null, pn);
+    const lidKnown = !!learnedNames[lid] && !/^\d+$/.test(learnedNames[lid]);
+    return lidKnown ? { jid: lid, name: lidName, self: false } : { jid: pn, name: pnName, self: false };
+  }
+  function mentionName(user: string) {
+    return mentionTarget(user).name;
+  }
+
+  $effect(() => {
+    if (!connected) return;
+    for (const account of accountList) if (account.jid) loadAvatar(account.jid);
+  });
+
+  // Group members get their picture next to their messages.
+  $effect(() => {
+    if (!connected || !selectedChat?.endsWith("@g.us")) return;
+    for (const message of messages) if (!message.from_me) loadAvatar(bare(message.sender));
+  });
+
+  const accountAvatars = $derived(
+    Object.fromEntries(
+      accountList.map((a) => {
+        const jid = a.id === activeAccount ? (me ?? a.jid) : a.jid;
+        return [a.id, jid ? (avatars[jid] ?? null) : null];
+      }),
+    ) as Record<string, string | null>,
+  );
+
+  /** Who is typing in each chat, until they pause or ten seconds pass. */
+  let typing: Record<string, { sender: string; state: string }[]> = $state({});
+  const typingTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  function setTyping(chat: string, sender: string, state: string) {
+    const key = `${chat} ${sender}`;
+    clearTimeout(typingTimers.get(key));
+    const others = (typing[chat] ?? []).filter((t) => t.sender !== sender);
+    typing[chat] = state === "paused" ? others : [...others, { sender, state }];
+    if (state !== "paused") {
+      typingTimers.set(key, setTimeout(() => setTyping(chat, sender, "paused"), 10000));
+    }
+  }
+
+  function typingLabel(chat: string) {
+    const who = typing[chat];
+    if (!who?.length) return null;
+    const verb = who.some((t) => t.state === "recording") ? "recording audio" : "typing";
+    if (!chat.endsWith("@g.us")) return `${verb}…`;
+    if (who.length > 1) return `${who.length} people are ${verb}…`;
+    const person = memberOf(who[0].sender);
+    const name = person && !/^\+?\d+$/.test(person.name) ? person.name : null;
+    return `${name ?? senderName(who[0].sender)} is ${verb}…`;
+  }
+
+  // Our own typing: announced at most every five seconds, withdrawn after four
+  // idle ones or when the message goes out.
+  let typingSentAt = 0;
+  let typingIdle: ReturnType<typeof setTimeout> | undefined;
+
+  function reportTyping() {
+    const chat = selectedChat;
+    if (!chat || !settings.send_typing) return;
+    if (Date.now() - typingSentAt > 5000) {
+      typingSentAt = Date.now();
+      invoke("send_typing", { chat, typing: true }).catch(() => {});
+    }
+    clearTimeout(typingIdle);
+    typingIdle = setTimeout(() => stopTyping(chat), 4000);
+  }
+
+  function stopTyping(chat = selectedChat) {
+    clearTimeout(typingIdle);
+    if (!chat || !typingSentAt) return;
+    typingSentAt = 0;
+    invoke("send_typing", { chat, typing: false }).catch(() => {});
+  }
+
+  /** Online while the window has focus, as WhatsApp Web does; typing only arrives then. */
+  function setOnline(online: boolean) {
+    if (connected) invoke("set_online", { online }).catch(() => {});
+  }
+
+  $effect(() => {
+    if (connected) setOnline(document.hasFocus());
+  });
+
+  /** WhatsApp privacy categories to values, for who can see us online. */
+  let privacy = $state<Record<string, string>>({});
+
+  $effect(() => {
+    if (!connected) return;
+    invoke<{ privacy: Record<string, string> }>("profile")
+      .then((p) => (privacy = p.privacy))
+      .catch(() => {});
+  });
+
+  /**
+   * Who sees us as online. "Same as last seen" defers to last seen, so with
+   * last seen hidden we are effectively invisible, as Discord shows it.
+   */
+  const visibility = $derived.by(() => {
+    if (!connected) return "offline";
+    const audience = privacy.online === "all" ? "all" : (privacy.last ?? "all");
+    return audience === "none" ? "invisible" : audience === "all" ? "online" : "contacts";
+  });
+  const STATUS_TEXT = {
+    offline: "Connecting…",
+    online: "Online",
+    contacts: "Online to contacts",
+    invisible: "Invisible",
+  };
+
+  $effect(() => {
+    if (!connected || me) return;
+    invoke<string | null>("own_jid")
+      .then((jid) => {
+        me = jid;
+        if (jid) loadAvatar(jid);
+        // The backend just recorded the JID on the account; pick it up.
+        return loadAccounts();
+      })
+      .catch(() => {});
+  });
 
   function scrollToBottom() {
     // Wait for the new messages to render before measuring.
@@ -565,6 +965,13 @@
       scrolledUp = false;
     });
   }
+
+  // The typing bubble coming and going moves the bottom; stay pinned to it.
+  $effect(() => {
+    if (!selectedChat) return;
+    void typing[selectedChat]?.length;
+    if (!untrack(() => scrolledUp)) scrollToBottom();
+  });
 
   function onScroll() {
     if (!scroller) return;
@@ -586,9 +993,63 @@
     return { query, start: at };
   }
 
+  let pickerTab = $state<PickerTab | null>(null);
+
+  // `:name` completion, as Discord does it.
+  let emojiTable = $state<Emoji[]>([]);
+  let emojiToken = $state<{ query: string; start: number } | null>(null);
+  let emojiIndex = $state(0);
+  const emojiMatches = $derived(
+    emojiToken ? searchEmojis(emojiTable, emojiToken.query, 12) : [],
+  );
+
+  /** A `:word` right before the caret, at least two letters long. */
+  function currentEmojiQuery() {
+    const caret = composerInput?.selectionStart ?? draft.length;
+    const match = /(?:^|\s)(:([a-z0-9_+-]{2,}))$/i.exec(draft.slice(0, caret));
+    return match ? { query: match[2], start: caret - match[1].length } : null;
+  }
+
+  /** Puts text at the caret, or in place of the characters from `start` to it. */
+  async function insertAtCaret(text: string, start?: number) {
+    const input = composerInput;
+    const caret = input?.selectionStart ?? draft.length;
+    const from = start ?? caret;
+    draft = draft.slice(0, from) + text + draft.slice(caret);
+    if (selectedChat) drafts[selectedChat] = draft;
+    await tick();
+    const position = from + text.length;
+    input?.focus();
+    input?.setSelectionRange(position, position);
+  }
+
+  function selectEmoji(emoji: string) {
+    const token = emojiToken;
+    emojiToken = null;
+    rememberEmoji(emoji);
+    void insertAtCaret(emoji, token?.start);
+  }
+
   function onComposerInput(event: Event) {
     draft = (event.currentTarget as HTMLTextAreaElement).value;
     if (selectedChat) drafts[selectedChat] = draft;
+    if (draft.trim()) reportTyping();
+    else stopTyping();
+    // A complete `:shortcode:` turns into its emoji the moment it is closed.
+    const caret = composerInput?.selectionStart ?? draft.length;
+    const closed = /(?:^|\s)(:([a-z0-9_+-]+):)$/i.exec(draft.slice(0, caret));
+    const exact = closed && emojiTable.find((e) => e.shortcodes.includes(closed[2].toLowerCase()));
+    if (closed && exact) {
+      emojiToken = null;
+      rememberEmoji(exact.emoji);
+      void insertAtCaret(exact.emoji, caret - closed[1].length);
+      return;
+    }
+    emojiToken = currentEmojiQuery();
+    emojiIndex = 0;
+    if ((emojiToken || draft.includes(":")) && emojiTable.length === 0) {
+      loadEmojis().then((list) => (emojiTable = list));
+    }
     const token = currentMentionQuery();
     if (token && participants.length > 0) {
       mentionQuery = token.query;
@@ -596,7 +1057,6 @@
     } else {
       mentionQuery = null;
     }
-    autoGrow();
   }
 
   async function selectMention(person: { jid: string; name: string }) {
@@ -616,6 +1076,24 @@
   }
 
   function onComposerKey(event: KeyboardEvent) {
+    if (emojiToken && emojiMatches.length > 0) {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const step = event.key === "ArrowDown" ? 1 : -1;
+        emojiIndex = (emojiIndex + step + emojiMatches.length) % emojiMatches.length;
+        return;
+      }
+      if (event.key === "Enter" || event.key === "Tab") {
+        event.preventDefault();
+        selectEmoji(emojiMatches[emojiIndex].emoji);
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        emojiToken = null;
+        return;
+      }
+    }
     if (mentionQuery !== null && mentionMatches.length > 0) {
       if (event.key === "ArrowDown") {
         event.preventDefault();
@@ -645,14 +1123,6 @@
     }
   }
 
-  /** Grows the composer with its content, up to a few lines. */
-  function autoGrow() {
-    const el = composerInput;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, 140)}px`;
-  }
-
   /** Turns the display text into wire text, naming mentions by number. */
   function mentionPayload() {
     let text = draft.trim();
@@ -678,31 +1148,55 @@
     return { text, jids };
   }
 
+  /**
+   * Every outgoing message goes through here, one at a time, so they reach the
+   * chat in the order they were sent even when an earlier one is slow.
+   */
+  let outbox: Promise<unknown> = Promise.resolve();
+  function enqueue<T>(task: () => Promise<T>): Promise<T> {
+    const run = outbox.then(task, task);
+    outbox = run.catch(() => {});
+    return run;
+  }
+
   async function send() {
-    if (!draft.trim() || !selectedChat) return;
+    if (!selectedChat) return;
+    // With attachments staged, the typed text goes out as their caption.
+    if (pending.length > 0) {
+      if (sendingMedia) return;
+      const caption = draft.trim();
+      draft = "";
+      delete drafts[selectedChat];
+      stopTyping();
+      await sendPending(caption);
+      return;
+    }
+    if (!draft.trim()) return;
+    const chat = selectedChat;
+    stopTyping();
     const { text, jids } = mentionPayload();
     const reply = replyingTo;
     draft = "";
-    if (selectedChat) delete drafts[selectedChat];
+    delete drafts[chat];
     replyingTo = null;
     chosenMentions = [];
     mentionQuery = null;
-    await tick();
-    autoGrow();
     composerInput?.focus();
     try {
-      if (reply) {
-        await invoke("send_reply", {
-          chat: selectedChat,
-          text,
-          replyToId: reply.id,
-          replyToSender: reply.sender,
-          replyToText: reply.text,
-          mentions: jids,
-        });
-      } else {
-        await invoke("send_text", { chat: selectedChat, text, mentions: jids });
-      }
+      await enqueue(() =>
+        reply
+          ? invoke("send_reply", {
+              chat,
+              text,
+              replyToId: reply.id,
+              replyToSender: reply.sender,
+              replyToText: reply.text,
+              mentions: jids,
+              // A group message answered privately quotes across chats.
+              replyToChat: reply.chat,
+            })
+          : invoke("send_text", { chat, text, mentions: jids }),
+      );
       await reloadMessages();
       await refreshChats();
       scrollToBottom();
@@ -822,7 +1316,8 @@
             .map((line) => line.trim())
             .find((line) => line.length > 0);
           if (!uri?.startsWith("file://")) continue;
-          const path = decodeURIComponent(new URL(uri).pathname);
+          // `file:///C:/x` has the pathname `/C:/x` on Windows.
+          const path = decodeURIComponent(new URL(uri).pathname).replace(/^\/([A-Za-z]:)/, "$1");
           if (!PASTABLE.test(path)) continue;
           const data = await invoke<string>("read_file", { path });
           const bytes = Uint8Array.from(atob(data), (c) => c.charCodeAt(0));
@@ -849,7 +1344,8 @@
     const data = event.clipboardData;
     const item = data
       ? Array.from(data.items).find(
-          (i) => i.type.startsWith("image/") || i.type.startsWith("video/"),
+          // A file copied in Explorer arrives here as a file item of any type.
+          (i) => i.type.startsWith("image/") || i.type.startsWith("video/") || i.kind === "file",
         )
       : undefined;
     const isUriList = data ? Array.from(data.types).includes("text/uri-list") : false;
@@ -884,32 +1380,84 @@
     previewId = null;
   }
 
-  async function sendPending() {
-    if (!selectedChat || pending.length === 0) return;
+  /** Upload progress while attachments go out; also the double-send guard. */
+  let sendingMedia = $state<{ done: number; total: number; current: number } | null>(null);
+
+  /** `text` from the composer becomes the first attachment's caption, unless it has its own. */
+  async function sendPending(text = "") {
+    if (!selectedChat || pending.length === 0 || sendingMedia) return;
+    if (text && !pending[0].caption.trim()) pending[0].caption = text;
+    const chat = selectedChat;
     const items = [...pending];
     const reply = replyingTo;
+    sendingMedia = { done: 0, total: items.length, current: items[0].id };
     try {
       for (const item of items) {
-        const buffer = new Uint8Array(await item.file.arrayBuffer());
-        // Base64 keeps the payload a single IPC value. Fine for the images and
-        // documents a picker is normally used for.
-        let binary = "";
-        for (let i = 0; i < buffer.length; i += 0x8000) {
-          binary += String.fromCharCode(...buffer.subarray(i, i + 0x8000));
-        }
-        const warning = await invoke<string | null>("send_media", {
-          chat: selectedChat,
-          name: item.file.name,
-          data: btoa(binary),
-          caption: item.caption.trim() || null,
+        sendingMedia = { ...sendingMedia, current: item.id };
+        const data = await base64Of(item.file);
+        const warning = await enqueue(() =>
+          invoke<string | null>("send_media", {
+            chat,
+            name: item.file.name,
+            data,
+            caption: item.caption.trim() || null,
+            replyToId: reply?.id ?? null,
+            replyToSender: reply?.sender ?? null,
+            replyToText: reply?.text ?? null,
+            viewOnce: sendOnce && item.kind !== "other",
+          }),
+        );
+        if (warning && settings.warn_missing_video_preview) notice = warning;
+        // Sent items leave the tray at once, so a later failure cannot resend them.
+        removePending(item.id);
+        sendingMedia = { ...sendingMedia, done: sendingMedia.done + 1 };
+      }
+      replyingTo = null;
+      sendOnce = false;
+      await reloadMessages();
+      await refreshChats();
+      scrollToBottom();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      sendingMedia = null;
+    }
+  }
+
+  /** Base64 keeps a file a single IPC value; fine for attachments and voice notes. */
+  async function base64Of(blob: Blob) {
+    const buffer = new Uint8Array(await blob.arrayBuffer());
+    let binary = "";
+    for (let i = 0; i < buffer.length; i += 0x8000) {
+      binary += String.fromCharCode(...buffer.subarray(i, i + 0x8000));
+    }
+    return btoa(binary);
+  }
+
+  /** Whether staged photos and videos go out as view once. */
+  let sendOnce = $state(false);
+  let recording = $state(false);
+
+  async function sendVoice(note: Recording) {
+    recording = false;
+    if (!selectedChat) return;
+    const chat = selectedChat;
+    const reply = replyingTo;
+    replyingTo = null;
+    try {
+      const data = await base64Of(note.blob);
+      await enqueue(() =>
+        invoke("send_voice", {
+          chat,
+          data,
+          seconds: note.seconds,
+          waveform: note.waveform,
           replyToId: reply?.id ?? null,
           replyToSender: reply?.sender ?? null,
           replyToText: reply?.text ?? null,
-        });
-        if (warning && settings.warn_missing_video_preview) notice = warning;
-      }
-      clearPending();
-      replyingTo = null;
+          viewOnce: note.viewOnce,
+        }),
+      );
       await reloadMessages();
       await refreshChats();
       scrollToBottom();
@@ -980,6 +1528,231 @@
     }
   }
 
+  type Marks = {
+    reactions: { target: string; sender: string; emoji: string }[];
+    starred: string[];
+    pinned: string | null;
+    polls: Poll[];
+    events: ChatEvent[];
+    view_once: { id: string; opened: boolean }[];
+  };
+  const NO_MARKS: Marks = { reactions: [], starred: [], pinned: null, polls: [], events: [], view_once: [] };
+  /** Reactions, stars, the pinned message, polls and events of the open chat. */
+  let marks = $state<Marks>(NO_MARKS);
+
+  async function loadMarks() {
+    if (!selectedChat) return;
+    try {
+      marks = await invoke<Marks>("marks", { chat: selectedChat });
+    } catch {
+      marks = NO_MARKS;
+    }
+  }
+
+  let attachMenu = $state(false);
+  let creating = $state<"poll" | "event" | null>(null);
+
+  async function create(value: unknown) {
+    const chat = selectedChat;
+    if (!chat) return;
+    await enqueue(() =>
+      creating === "poll"
+        ? invoke("create_poll", { chat, ...(value as object) })
+        : invoke("create_event", { chat, event: value }),
+    );
+    await reloadMessages();
+    await loadMarks();
+    await refreshChats();
+    scrollToBottom();
+  }
+
+  /** Per message: each emoji with its count, and whether one of them is ours. */
+  const reactionsFor = $derived.by(() => {
+    const byMessage = new Map<string, { emoji: string; count: number; mine: boolean }[]>();
+    for (const r of marks.reactions) {
+      const list = byMessage.get(r.target) ?? [];
+      const entry = list.find((e) => e.emoji === r.emoji);
+      if (entry) {
+        entry.count += 1;
+        entry.mine ||= r.sender === "@me";
+      } else {
+        list.push({ emoji: r.emoji, count: 1, mine: r.sender === "@me" });
+      }
+      byMessage.set(r.target, list);
+    }
+    return byMessage;
+  });
+  const starred = $derived(new Set(marks.starred));
+  const pinnedMessage = $derived(
+    marks.pinned ? (messages.find((m) => m.id === marks.pinned) ?? null) : null,
+  );
+
+  const QUICK_REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
+  let menu = $state<{ x: number; y: number; message: StoredMessage } | null>(null);
+  let forwarding = $state<StoredMessage | null>(null);
+  let deleting = $state<StoredMessage | null>(null);
+
+  function target(m: StoredMessage) {
+    return { chat: m.chat, id: m.id, sender: m.sender, fromMe: m.from_me };
+  }
+
+  /** Runs a message action, surfacing a failure instead of dropping it. */
+  async function act(run: () => Promise<unknown>) {
+    try {
+      await run();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  function menuItems(m: StoredMessage): MenuItem[] {
+    const group = m.chat.endsWith("@g.us");
+    const other = group && !m.from_me;
+    const text = m.media_kind ? captionOf(m) : m.text;
+    const items: MenuItem[] = [
+      {
+        label: "Reply",
+        icon: "reply",
+        action: () => {
+          replyingTo = m;
+          composerInput?.focus();
+        },
+      },
+    ];
+    if (other) {
+      items.push(
+        {
+          label: "Reply privately",
+          icon: "users",
+          action: async () => {
+            await openChat(bare(m.sender));
+            replyingTo = m;
+            composerInput?.focus();
+          },
+        },
+        {
+          label: `Message ${senderLabel(m)}`,
+          icon: "message",
+          action: () => openChat(bare(m.sender)),
+        },
+      );
+    }
+    if (text && !m.revoked) {
+      items.push({
+        label: "Copy",
+        icon: "copy",
+        action: () => act(() => navigator.clipboard.writeText(text)),
+      });
+    }
+    if (!m.revoked) {
+      items.push(
+        { label: "Forward", icon: "forward", action: () => (forwarding = m) },
+        {
+          label: marks.pinned === m.id ? "Unpin" : "Pin",
+          icon: "pin",
+          action: () =>
+            act(() =>
+              invoke("pin_message", { target: target(m), pinned: marks.pinned !== m.id }),
+            ),
+        },
+        {
+          label: starred.has(m.id) ? "Unstar" : "Star",
+          icon: "star",
+          action: () =>
+            act(() => invoke("star", { target: target(m), starred: !starred.has(m.id) })),
+        },
+      );
+    }
+    if (other) {
+      items.push({
+        label: "Report to admins",
+        icon: "flag",
+        separated: true,
+        action: () => {
+          if (window.confirm("Report this message to the group's admins?")) {
+            act(() => invoke("report_message", { chat: m.chat, id: m.id }));
+          }
+        },
+      });
+    }
+    items.push({
+      label: "Delete",
+      icon: "trash",
+      danger: true,
+      separated: !other,
+      action: () => (deleting = m),
+    });
+    return items;
+  }
+
+  /** Whether we may delete this message for everyone: ours, or ours to moderate. */
+  function canDeleteForEveryone(m: StoredMessage) {
+    if (m.revoked) return false;
+    if (m.from_me) return true;
+    return !!me && !!memberOf(me)?.admin;
+  }
+
+  async function deleteMessage(everyone: boolean) {
+    const m = deleting;
+    deleting = null;
+    if (!m) return;
+    await act(async () => {
+      await invoke("delete_message", { target: target(m), everyone, timestamp: m.timestamp });
+      await reloadMessages();
+      await refreshChats();
+    });
+  }
+
+  /** The open chat's downloaded pictures and videos, oldest first, for the viewer. */
+  const viewOnceIds = $derived(new Set(marks.view_once.map((v) => v.id)));
+  function viewerItem(m: StoredMessage): ViewerItem {
+    const who = m.from_me ? me : selectedChat?.endsWith("@g.us") ? bare(m.sender) : selectedChat;
+    return {
+      id: m.id,
+      path: m.media_path!,
+      thumb: m.media_thumb,
+      kind: m.media_kind!,
+      caption: captionOf(m),
+      author: m.from_me ? "You" : senderLabel(m),
+      avatar: who ? (avatars[who] ?? null) : null,
+      timestamp: m.timestamp,
+    };
+  }
+  const viewerItems = $derived<ViewerItem[]>(
+    ordered
+      .filter(
+        (m) =>
+          !m.revoked &&
+          !!m.media_path &&
+          !viewOnceIds.has(m.id) &&
+          (m.media_kind === "image" || m.media_kind === "video" || m.media_kind === "gif"),
+      )
+      .map(viewerItem),
+  );
+  let viewerIndex = $state<number | null>(null);
+
+  /** The view-once message being shown; closing it spends it. */
+  let onceOpen = $state<StoredMessage | null>(null);
+  let onceIndex = $state(0);
+  async function closeViewOnce() {
+    const message = onceOpen;
+    onceOpen = null;
+    if (!message) return;
+    try {
+      await invoke("open_view_once", { chat: message.chat, id: message.id });
+    } catch (e) {
+      error = String(e);
+    }
+    await reloadMessages();
+    await loadMarks();
+  }
+  const VIEW_ONCE_LABEL: Record<string, string> = { image: "Photo", video: "Video", audio: "Voice message" };
+
+  function openViewer(message: StoredMessage) {
+    const at = viewerItems.findIndex((item) => item.id === message.id);
+    if (at >= 0) viewerIndex = at;
+  }
+
   /** Opens a downloaded media file in the desktop's default application. */
   async function openMedia(path: string) {
     try {
@@ -1016,9 +1789,13 @@
     }
   }
 
-  async function saveSettings() {
-    await invoke("set_settings", { settings });
-    showSettings = false;
+  async function saveSettings(next: UiSettings) {
+    try {
+      await invoke("set_settings", { settings: next });
+      settings = next;
+    } catch (e) {
+      error = String(e);
+    }
   }
 
   onMount(() => {
@@ -1073,13 +1850,18 @@
             break;
           case "message":
             if (syncPending > 0) syncSeen += 1;
+            // A message ends the sender's typing, whether or not "paused" arrived.
+            if (!payload.message.from_me) {
+              setTyping(payload.message.chat, bare(payload.message.sender), "paused");
+            }
             // Refresh the list first (cheap), then the conversation, so the
             // open chat updates immediately rather than after a network query.
             await refreshChats();
             if (payload.message.chat === selectedChat) {
               await reloadMessages();
-              // An incoming message must not yank the view down while reading.
-              if (payload.message.from_me) scrollToBottom();
+              // Follow the stream when already at the bottom, but never yank
+              // the view down while reading older messages.
+              if (payload.message.from_me || !scrolledUp) scrollToBottom();
               // Seen while open, but only if the window is actually focused.
               if (!payload.message.from_me && document.hasFocus()) {
                 await invoke("mark_read", { chat: selectedChat });
@@ -1114,6 +1896,35 @@
             syncPending = 0;
             syncSeen = 0;
             break;
+          case "historyLoaded":
+            await refreshChats();
+            if (selectedChat && payload.chats.includes(selectedChat)) {
+              if (loadingOlder) messageLimit += 50;
+              loadingOlder = false;
+              clearTimeout(olderTimer);
+              await reloadMessages(true);
+            }
+            break;
+          case "avatarChanged":
+            requestedAvatars.delete(payload.jid);
+            delete avatars[payload.jid];
+            loadAvatar(payload.jid);
+            break;
+          case "typing":
+            setTyping(payload.chat, payload.sender, payload.state);
+            break;
+          case "marks":
+            if (payload.chat === selectedChat) await loadMarks();
+            break;
+          case "memberLabel":
+            if (payload.chat === selectedChat) {
+              const label = payload.label || null;
+              const member = participants.find((p) => p.jid === payload.jid);
+              if (member) member.label = label;
+              const info = groupInfo?.participants.find((p) => p.jid === payload.jid);
+              if (info) info.label = label;
+            }
+            break;
         }
       });
 
@@ -1134,19 +1945,89 @@
   });
 </script>
 
-<svelte:head><title>Hermóðr</title></svelte:head>
+<svelte:head>
+  <title>Hermóðr</title>
+  {@html extensionCss}
+</svelte:head>
+
+{#snippet runs(nodes: Inline[])}{#each nodes as n, i (i)}{#if n.kind === "text"}{n.text}{:else if n.kind === "link"}<a
+        class="link"
+        href={n.url}
+        onclick={(e) => {
+          e.preventDefault();
+          openUrl(n.url);
+        }}>{n.url}</a
+      >{:else if n.kind === "code"}<code class="inline-code">{n.text}</code>{:else if n.kind === "mention"}{@render
+        mentionPill(n.user)}{:else if n.kind === "bold"}<strong
+        >{@render runs(n.children)}</strong
+      >{:else if n.kind === "italic"}<em>{@render runs(n.children)}</em>{:else}<s
+        >{@render runs(n.children)}</s
+      >{/if}{/each}{/snippet}
+
+{#snippet mentionPill(user: string)}{@const target = mentionTarget(user)}{@const picture = pictureOf(target.jid)}<span
+    class="mention-pill"
+    class:self={target.self}
+    >{#if picture}<img src={convertFileSrc(picture)} alt="" />{:else}<span
+        class="mention-initials"
+        style="--hue: {hue(target.jid)}">{initials(target.name)}</span
+      >{/if}@{target.name}</span
+  >{/snippet}
+
+{#snippet lines(list: Inline[][])}{#each list as line, i (i)}{#if i > 0}<br />{/if}{@render runs(line)}{/each}{/snippet}
+
+<!-- WhatsApp formatting, with the time's reserved space after the last line. -->
+{#snippet formatted(text: string, mine: boolean)}
+  <span class="text"
+    >{#each blocks(text) as block, i (i)}{#if block.kind === "pre"}<pre class="pre">{block.text}</pre
+        >{:else if block.kind === "quote"}<span class="quote-block">{@render lines(block.lines)}</span
+        >{:else if block.kind === "list"}{#if block.ordered}<ol class="fmt-list">
+            {#each block.items as item, j (j)}<li>{@render runs(item)}</li>{/each}
+          </ol>{:else}<ul class="fmt-list">
+            {#each block.items as item, j (j)}<li>{@render runs(item)}</li>{/each}
+          </ul>{/if}{:else}{#if i > 0}<br />{/if}{@render lines(block.lines)}{/if}{/each}<span
+      class="meta-spacer"
+      class:mine></span
+    ></span
+  >
+{/snippet}
+
+{#snippet avatarFor(jid: string, label: string)}
+  {#if avatars[jid]}
+    <img class="avatar" src={convertFileSrc(avatars[jid]!)} alt="" />
+  {:else}
+    <span class="avatar" style="--hue: {hue(jid)}">{initials(label)}</span>
+  {/if}
+{/snippet}
 
 <!-- Window-level so a paste/drop anywhere cannot navigate the webview. -->
 <svelte:window
   onpaste={onPaste}
+  onclick={(e) => {
+    if (accountMenu && !(e.target as Element).closest?.(".user-panel")) accountMenu = false;
+  }}
+  oncontextmenu={(e) => {
+    // The webview's own menu (Back, Refresh, Inspect) is meaningless here; keep
+    // it only where it helps: text fields and a text selection.
+    const el = e.target as HTMLElement;
+    const editable = el.closest?.("input, textarea, [contenteditable]");
+    if (!editable && !window.getSelection()?.toString()) e.preventDefault();
+  }}
+  onfocus={() => setOnline(true)}
+  onblur={() => setOnline(false)}
   ondragover={(e) => e.preventDefault()}
   ondrop={onDrop}
 />
 
 {#if error}
-  <div class="error" role="alert">{error}</div>
+  <div class="error" role="alert">
+    <span>{error}</span>
+    <button class="icon" title="Dismiss" aria-label="Dismiss" onclick={() => (error = null)}>
+      <Icon name="x" size={16} />
+    </button>
+  </div>
 {/if}
 
+<div class="app">
 {#if syncPending > 0}
   <div class="sync-banner">
     <span class="sync-text">Loading messages… {syncPercent}%</span>
@@ -1175,7 +2056,8 @@
         <button
           class="account add"
           title="Manage accounts"
-          onclick={() => (showAccounts = true)}>⋯</button>
+          aria-label="Manage accounts"
+          onclick={() => openSettings("accounts")}><Icon name="settings" size={14} /></button>
       </div>
     {/if}
 
@@ -1192,31 +2074,40 @@
   <div class="layout" style="grid-template-columns: {layoutColumns}">
     <aside class="chats">
       <header>
-        <span>Chats</span>
-        <span class="account-bar">
-          {#each accountList as account (account.id)}
-            <button
-              class="account"
-              class:active={account.id === activeAccount}
-              title={account.label}
-              onclick={() => switchTo(account.id)}>{account.label}</button>
-          {/each}
-          <button class="account add" title="Add account" onclick={addAccount}>+</button>
-          <button class="account add" title="Manage accounts" onclick={() => (showAccounts = true)}>
-            ⋯
-          </button>
-        </span>
-        <button class="icon" title="Settings" onclick={() => (showSettings = !showSettings)}>
-          ⚙
-        </button>
+        <h1 class="title">Chats</h1>
       </header>
-      <input
-        class="search"
-        placeholder="Search chats and contacts"
-        bind:value={searchQuery}
-        oninput={runSearch}
-        autocomplete="off"
-      />
+      <label class="search">
+        <Icon name="search" size={15} />
+        <input
+          placeholder="Search chats and contacts"
+          bind:value={searchQuery}
+          oninput={runSearch}
+          autocomplete="off"
+        />
+      </label>
+      {#if !searchQuery.trim()}
+        <div class="filters" role="tablist" aria-label="Filter chats">
+          <button
+            class="chip"
+            class:active={chatFilter === "all"}
+            role="tab"
+            aria-selected={chatFilter === "all"}
+            onclick={() => (chatFilter = "all")}>All</button>
+          <button
+            class="chip"
+            class:active={chatFilter === "unread"}
+            role="tab"
+            aria-selected={chatFilter === "unread"}
+            onclick={() => (chatFilter = "unread")}
+            >Unread{#if unreadChats > 0}<span class="chip-count">{unreadChats}</span>{/if}</button>
+          <button
+            class="chip"
+            class:active={chatFilter === "groups"}
+            role="tab"
+            aria-selected={chatFilter === "groups"}
+            onclick={() => (chatFilter = "groups")}>Groups</button>
+        </div>
+      {/if}
       {#if searchQuery.trim()}
         <ul class="results">
           {#each searchResults as result (result.jid)}
@@ -1232,11 +2123,12 @@
                     openFromSearch(result);
                   }
                 }}>
+                {@render avatarFor(result.jid, result.name || result.number || result.jid)}
                 <span class="name">
                   {#if result.kind === "group" || result.saved}
                     {result.name}
                   {:else}
-                    {result.number}{result.name && result.name !== result.number
+                    {phoneLabel(result.number) ?? result.number}{result.name && result.name !== result.number
                       ? ` - ${result.name}`
                       : ""}
                   {/if}
@@ -1250,7 +2142,7 @@
         </ul>
       {:else}
       <ul>
-        {#each chats as chat (chat.chat)}
+        {#each visibleChats as chat (chat.chat)}
           <li>
             <div
               class="chat-row"
@@ -1264,13 +2156,24 @@
                   openChat(chat.chat);
                 }
               }}>
-              <span class="name">{#if chat.pinned}<span class="pin">📌</span>{/if}{chatLabel(chat)}</span>
-              <span class="time">{formatTime(chat.last_message_at)}</span>
-              <span class="preview">{chatPreview(chat)}</span>
+              {@render avatarFor(chat.chat, chatLabel(chat))}
+              <span class="name">{#if chat.pinned}<span class="pin"><Icon name="pin" size={12} /></span>{/if}{chatLabel(chat)}</span>
+              <span class="time" class:unread={chat.unread_count > 0}>{formatTime(chat.last_message_at)}</span>
+              {#if typingLabel(chat.chat)}
+                <span class="preview typing">{typingLabel(chat.chat)}</span>
+              {:else}
+                {@const author = previewAuthor(chat)}
+                {@const icon = mediaIcon(chat.last_media_kind)}
+                <span class="preview"
+                  >{#if author}{author}:&nbsp;{/if}{#if icon}<span class="preview-icon"
+                      ><Icon name={icon} size={15} /></span
+                    >{/if}{previewText(chat)}</span
+                >
+              {/if}
               <span class="badges">
                 {#if chat.mention_count > 0}
                   <button
-                    class="badge mention"
+                    class="badge mention-badge"
                     title="Jump to mention"
                     onclick={(e) => {
                       e.stopPropagation();
@@ -1281,58 +2184,215 @@
                   <span class="badge">{chat.unread_count > 99 ? "99+" : chat.unread_count}</span>
                 {/if}
                 <button
-                  class="badge pin-toggle"
+                  class="pin-toggle"
                   title={chat.pinned ? "Unpin" : "Pin"}
-                  onclick={(e) => togglePin(chat, e)}>📌</button>
+                  aria-label={chat.pinned ? "Unpin" : "Pin"}
+                  onclick={(e) => togglePin(chat, e)}><Icon name="pin" size={14} /></button>
               </span>
             </div>
           </li>
         {/each}
-        {#if chats.length === 0}
-          <li class="empty">No conversations yet.</li>
+        {#if visibleChats.length === 0}
+          <li class="empty">
+            {chatFilter === "unread"
+              ? "No unread chats."
+              : chatFilter === "groups"
+                ? "No groups yet."
+                : "No conversations yet."}
+          </li>
         {/if}
       </ul>
       {/if}
-      <button type="button" class="resizer" aria-label="Resize chat list" onmousedown={(e) => startResize("left", e)}></button>
+
+      <footer class="user-panel">
+        {#if accountMenu}
+          <div class="account-menu" role="menu">
+            <span class="menu-label">Accounts</span>
+            {#each accountList as account (account.id)}
+              <button
+                class="menu-item"
+                class:current={account.id === activeAccount}
+                role="menuitem"
+                onclick={() => {
+                  accountMenu = false;
+                  switchTo(account.id);
+                }}>
+                {#if accountAvatars[account.id]}
+                  <img class="menu-avatar" src={convertFileSrc(accountAvatars[account.id]!)} alt="" />
+                {:else}
+                  <span class="menu-avatar" style="--hue: {hue(account.id)}">{initials(account.label)}</span>
+                {/if}
+                <span class="menu-name">{account.label}</span>
+                <span class="menu-dot"></span>
+              </button>
+            {/each}
+            <div class="menu-sep"></div>
+            <button
+              class="menu-item"
+              role="menuitem"
+              onclick={() => {
+                accountMenu = false;
+                addAccount();
+              }}><Icon name="plus" size={15} /> Add account</button>
+            <button class="menu-item" role="menuitem" onclick={() => openSettings("accounts")}>
+              <Icon name="users" size={15} /> Manage accounts
+            </button>
+          </div>
+        {/if}
+        <button
+          class="me"
+          title="Switch account"
+          aria-expanded={accountMenu}
+          onclick={() => (accountMenu = !accountMenu)}>
+          <span class="me-avatar-wrap">
+            {#if me && avatars[me]}
+              <img class="me-avatar" src="{convertFileSrc(avatars[me]!)}?v={meVersion}" alt="" />
+            {:else}
+              <span class="me-avatar" style="--hue: {hue(activeAccount ?? '')}">{initials(activeLabel)}</span>
+            {/if}
+            <span class="presence {visibility}"></span>
+          </span>
+          <span class="me-text" title={me ? `+${me.split("@")[0]}` : undefined}>
+            <span class="me-name">{activeLabel}</span>
+            <span class="me-status">{STATUS_TEXT[visibility]}</span>
+          </span>
+        </button>
+        <button
+          class="icon"
+          title="Settings"
+          aria-label="Settings"
+          onclick={() => openSettings("profile")}><Icon name="settings" size={19} /></button>
+      </footer>
+      <button type="button" class="resizer" aria-label="Resize chat list" onmousedown={startResize}></button>
     </aside>
 
     <section class="conversation">
       {#if selectedChat}
+        {@const title =
+          chats.find((c) => c.chat === selectedChat)?.display_name ??
+          titleOverride ??
+          displayName(null, selectedChat)}
+        {@const typingNow = typingLabel(selectedChat)}
         <header>
-          {#if selectedChat.endsWith("@g.us")}
-            <button class="chat-title" title="Group info" onclick={openGroupInfo}>
-              {chats.find((c) => c.chat === selectedChat)?.display_name ?? bareJid(selectedChat)}
-            </button>
-          {:else}
-            {chats.find((c) => c.chat === selectedChat)?.display_name ??
-              titleOverride ??
-              bareJid(selectedChat)}
-          {/if}
+          <div class="chat-heading">
+            {#if selectedChat.endsWith("@g.us")}
+              <button class="heading-avatar" title="Group info" aria-label="Group info" onclick={openGroupInfo}
+                >{@render avatarFor(selectedChat, title)}</button
+              >
+              <button class="chat-title" title="Group info" onclick={openGroupInfo}>
+                {title}
+                <span class="chat-sub" class:typing={typingNow}
+                  >{typingNow ?? subtitle ?? "Click for group info"}</span
+                >
+              </button>
+            {:else}
+              {@render avatarFor(selectedChat, title)}
+              <span class="chat-title">
+                {title}
+                {#if typingNow}<span class="chat-sub typing">{typingNow}</span>{/if}
+              </span>
+            {/if}
+          </div>
           {#if mentionQueue.length > 0}
-            <button class="icon jump-mention" title="Jump to mention" onclick={jumpNextMention}>
-              @ {mentionCursor}/{mentionQueue.length}
+            <button class="jump-mention" title="Jump to mention" onclick={jumpNextMention}>
+              <Icon name="at" size={14} />
+              {mentionCursor}/{mentionQueue.length}
             </button>
           {/if}
         </header>
 
-        <div class="messages" bind:this={scroller} onscroll={onScroll}>
+        {#if pinnedMessage}
+          <button class="pinned-bar" onclick={() => scrollToMessage(pinnedMessage.id)}>
+            <Icon name="pin" size={16} />
+            <span class="pinned-text">
+              <strong>{pinnedMessage.from_me ? "You" : senderLabel(pinnedMessage)}:</strong>
+              {pinnedMessage.media_kind ? captionOf(pinnedMessage) || MEDIA_LABELS[pinnedMessage.media_kind] : pinnedMessage.text}
+            </span>
+          </button>
+        {/if}
+
+        <div
+          class="messages"
+          class:group={selectedChat.endsWith("@g.us")}
+          bind:this={scroller}
+          onscroll={onScroll}>
           {#if messages.length > 0}
-            <button class="load-older" onclick={loadOlder}>Load older messages</button>
+            <button class="load-older" onclick={loadOlder} disabled={loadingOlder}>
+              {loadingOlder ? "Asking your phone…" : "Load older messages"}
+            </button>
           {/if}
-          {#each messages.slice().reverse() as message (message.id)}
+          {#each ordered as message, i (message.id)}
+            {@const prev = ordered[i - 1]}
+            {@const newDay = !prev || dayKey(prev.timestamp) !== dayKey(message.timestamp)}
+            {@const first =
+              newDay || prev.from_me !== message.from_me || prev.sender !== message.sender}
+            {@const isGroup = !!selectedChat?.endsWith("@g.us")}
+            {@const viewOnce =
+              message.media_kind === "view_once"
+                ? { id: message.id, opened: true }
+                : marks.view_once.find((v) => v.id === message.id)}
+            {@const visual =
+              !message.revoked &&
+              !viewOnce &&
+              (message.media_kind === "image" ||
+                message.media_kind === "video" ||
+                message.media_kind === "gif") &&
+              !!(message.media_path || message.media_thumb)}
+            {@const caption = visual ? captionOf(message) : ""}
+            {@const showSender = first && !message.from_me && isGroup}
+            {@const reactions = reactionsFor.get(message.id)}
+            <!-- The time sits on the last line of text, as long as text ends the bubble. -->
+            {@const inlineMeta =
+              message.revoked ||
+              (!message.preview_url &&
+                (!message.media_kind || (!!caption && !!message.media_path)))}
+            {#if newDay}
+              <div class="day"><span>{dayLabel(message.timestamp)}</span></div>
+            {/if}
+            <!-- The whole row answers double-click and right-click, not just the bubble. -->
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
+              class="msg-row"
+              class:replying={replyingTo?.id === message.id}
+              class:jumped={message.id === highlightedId}
+              class:for-me={!message.from_me &&
+                (message.mentioned || message.reply_to_sender === "@me")}
+              class:first-row={first}
+              ondblclick={() => {
+                replyingTo = message;
+                composerInput?.focus();
+              }}
+              oncontextmenu={(e) => {
+                e.preventDefault();
+                menu = { x: e.clientX, y: e.clientY, message };
+              }}>
+            <div
               class="bubble"
+              class:media-only={visual &&
+                !caption &&
+                !message.reply_to_text &&
+                !message.preview_url &&
+                !showSender}
               class:mine={message.from_me}
-              class:highlighted={message.id === highlightedId}
-              data-id={message.id}
-              ondblclick={() => (replyingTo = message)}>
-              {#if !message.from_me && selectedChat?.endsWith("@g.us")}
-                <span class="sender">{senderLabel(message)}</span>
+              class:first
+              class:inline-meta={inlineMeta}
+              class:has-reactions={!!reactions}
+              class:sticker-only={message.media_kind === "sticker" &&
+                !!message.media_path &&
+                !message.reply_to_text &&
+                !showSender}
+              class:menu-open={menu?.message.id === message.id}
+              data-id={message.id}>
+              {#if showSender}
+                <span class="sender-avatar">{@render avatarFor(bare(message.sender), senderLabel(message))}</span>
+                <span class="sender" style="--hue: {hue(message.sender)}">{senderLabel(message)}</span>
+                {#if memberOf(message.sender)?.label}
+                  <span class="member-label">{memberOf(message.sender)?.label}</span>
+                {/if}
               {/if}
 
               {#if message.revoked}
-                <span class="revoked">This message was deleted</span>
+                <span class="revoked">This message was deleted<span class="meta-spacer"></span></span>
               {:else}
                 {#if message.reply_to_text}
                   <button
@@ -1352,19 +2412,47 @@
                     <span class="quote-author">
                       {quoteAuthor(message.reply_to_sender)}
                     </span>
-                    <span class="quote-text">{message.reply_to_text}</span>
+                    <span class="quote-text">{plain(message.reply_to_text, mentionName)}</span>
                     {#if message.reply_to_chat && message.reply_to_chat !== selectedChat}
                       <span class="quote-where">in {chatName(message.reply_to_chat)}</span>
                     {/if}
                   </button>
                 {/if}
 
-                {#if message.media_kind === "image" && (message.media_path || message.media_thumb)}
+                {#if viewOnce}
+                  {@const what = VIEW_ONCE_LABEL[message.media_kind ?? ""] ?? "View once message"}
+                  {#if onceOpen?.id === message.id && message.media_kind === "audio" && message.media_path}
+                    <AudioPlayer path={message.media_path} />
+                    <button class="once-done" onclick={closeViewOnce}>Done</button>
+                  {:else if message.media_kind === "view_once"}
+                    <span class="once spent">
+                      <span class="once-mark">1</span>
+                      <span>View once message<small>Open it on your phone</small></span>
+                    </span>
+                  {:else if viewOnce.opened}
+                    <span class="once spent">
+                      <span class="once-mark">1</span>
+                      <span>{what}<small>{message.from_me ? "View once" : "Opened"}</small></span>
+                    </span>
+                  {:else}
+                    <button
+                      class="once"
+                      onclick={() => {
+                        if (!message.media_path) return downloadMedia(message);
+                        onceIndex = 0;
+                        onceOpen = message;
+                      }}>
+                      <span class="once-mark">1</span>
+                      <span>{what}<small>{message.media_path ? "View once" : "Download to view once"}</small></span>
+                    </button>
+                  {/if}
+                {:else if message.media_kind === "sticker" && message.media_path}
+                  <img class="sticker" src={convertFileSrc(message.media_path)} alt="Sticker" />
+                {:else if message.media_kind === "image" && (message.media_path || message.media_thumb)}
                   <button
                     class="media-button"
-                    title="Open in image viewer"
-                    onclick={() =>
-                      message.media_path ? openMedia(message.media_path) : downloadMedia(message)}>
+                    title={message.media_path ? "View" : "Download"}
+                    onclick={() => (message.media_path ? openViewer(message) : downloadMedia(message))}>
                     <img
                       class="media"
                       src={convertFileSrc((message.media_path ?? message.media_thumb)!)}
@@ -1375,36 +2463,55 @@
                 (message.media_path || message.media_thumb)}
                   <button
                     class="media-button video"
-                    title={message.media_kind === "gif" ? "Open GIF" : "Open in video player"}
-                    onclick={() => message.media_path && openMedia(message.media_path)}>
+                    title={message.media_path ? "Play" : "Download"}
+                    onclick={() => (message.media_path ? openViewer(message) : downloadMedia(message))}>
                     {#if message.media_thumb}
                       <img class="media" src={convertFileSrc(message.media_thumb)} alt="" />
                     {/if}
-                    <span class="media-overlay">{message.media_kind === "gif" ? "GIF" : "▶"}</span>
+                    <span class="media-overlay">
+                      {#if message.media_kind === "gif"}GIF{:else}<span class="play">▶</span>{/if}
+                    </span>
                   </button>
                 {:else if message.media_kind === "audio" && message.media_path}
-                  <AudioPlayer path={message.media_path} />
+                  {@const voiceFrom = message.from_me ? me : bare(message.sender)}
+                  <AudioPlayer
+                    path={message.media_path}
+                    avatar={voiceFrom ? pictureOf(voiceFrom) : null}
+                    mine={message.from_me}
+                    initials={initials(message.from_me ? "You" : senderLabel(message))} />
+                {:else if message.media_kind === "poll"}
+                  <PollCard
+                    poll={marks.polls.find((p) => p.id === message.id)}
+                    question={message.text}
+                    namer={(jid) => (jid === "@me" ? "You" : senderName(jid))}
+                    picture={(jid) => (jid === "@me" ? (me ? pictureOf(me) : null) : pictureOf(bare(jid)))}
+                    onvote={(options) =>
+                      act(() => invoke("vote_poll", { chat: message.chat, id: message.id, options }))} />
+                {:else if message.media_kind === "event"}
+                  <EventCard
+                    event={marks.events.find((e) => e.id === message.id)}
+                    title={message.text}
+                    onopenurl={openUrl}
+                    onrespond={(response) =>
+                      act(() => invoke("respond_event", { chat: message.chat, id: message.id, response }))} />
                 {:else if message.media_kind && (message.media_path || message.media_thumb)}
                   <button
                     class="file"
                     onclick={() => message.media_path && openMedia(message.media_path)}>
-                    {message.text || message.media_kind}
+                    <Icon name="file" size={20} />
+                    <span>{message.text || message.media_kind}</span>
                   </button>
                 {:else}
-                  <span class="text"
-                    >{#each linkParts(message.text) as part}{#if part.url}<a
-                          class="link"
-                          href={part.url}
-                          onclick={(e) => {
-                            e.preventDefault();
-                            openUrl(part.url!);
-                          }}>{part.text}</a
-                        >{:else}{part.text}{/if}{/each}</span
-                  >
+                  {@render formatted(message.text, message.from_me)}
                 {/if}
 
-                {#if message.media_kind && !message.media_path}
+                {#if caption}
+                  {@render formatted(caption, message.from_me)}
+                {/if}
+
+                {#if message.media_kind && !message.media_path && !viewOnce && message.media_kind !== "poll" && message.media_kind !== "event"}
                   <button class="download" onclick={() => downloadMedia(message)}>
+                    <Icon name="download" size={14} />
                     Download {message.media_kind}
                   </button>
                 {/if}
@@ -1434,29 +2541,70 @@
                 {/if}
               {/if}
 
+              <button
+                class="reply-btn"
+                title="Message options"
+                aria-label="Message options"
+                onclick={(e) => {
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  menu = { x: rect.left, y: rect.bottom + 4, message };
+                }}><Icon name="chevronDown" size={16} /></button
+              >
               <span class="meta">
-                {#if !message.revoked}
-                  <button
-                    class="reply-btn"
-                    title="Reply"
-                    onclick={() => (replyingTo = message)}>↩</button
-                  >
-                {/if}
+                {#if starred.has(message.id)}<span class="star"><Icon name="star" size={11} /></span>{/if}
                 {formatTime(message.timestamp)}
                 {#if message.from_me}
                   <span
                     class="ticks"
                     class:read={message.status === "read"}
-                    title={message.status ?? "pending"}>{statusMark(message.status)}</span
+                    title={message.status ?? "pending"}
+                    >{#if message.status === "pending"}<Icon name="clock" size={11} />{:else}{statusMark(
+                        message.status,
+                      )}{/if}</span
                   >
                 {/if}
               </span>
+              {#if reactions}
+                {@const mine = reactions.find((r) => r.mine)?.emoji ?? null}
+                <button
+                  class="reactions"
+                  title={mine ? "Tap to remove your reaction" : "Reactions"}
+                  onclick={() =>
+                    mine &&
+                    act(() => invoke("react", { target: target(message), emoji: "" }))}>
+                  {#each reactions.slice(0, 3) as r (r.emoji)}<span>{r.emoji}</span>{/each}
+                  {#if reactions.reduce((n, r) => n + r.count, 0) > 1}
+                    <span class="reaction-count">{reactions.reduce((n, r) => n + r.count, 0)}</span>
+                  {/if}
+                </button>
+              {/if}
+            </div>
             </div>
           {/each}
+          {#if typing[selectedChat]?.length}
+            {@const typer = typing[selectedChat][0]}
+            <div class="bubble typing-bubble first">
+              {#if isGroupChat}
+                <span class="sender-avatar">{@render avatarFor(typer.sender, senderName(typer.sender))}</span>
+                <span class="sender" style="--hue: {hue(typer.sender)}">
+                  {memberOf(typer.sender)?.name && !/^\+?\d+$/.test(memberOf(typer.sender)!.name)
+                    ? memberOf(typer.sender)!.name
+                    : senderName(typer.sender)}
+                </span>
+              {/if}
+              {#if typer.state === "recording"}
+                <span class="recording"><Icon name="mic" size={15} /> recording audio…</span>
+              {:else}
+                <span class="dots" aria-label="typing"><i></i><i></i><i></i></span>
+              {/if}
+            </div>
+          {/if}
         </div>
 
         {#if scrolledUp}
-          <button class="jump" onclick={scrollToBottom}>Jump to latest ↓</button>
+          <button class="jump" onclick={scrollToBottom}>
+            Latest <Icon name="chevronDown" size={15} />
+          </button>
         {/if}
 
         {#if replyingTo}
@@ -1470,20 +2618,31 @@
             {:else if replyingTo.media_kind}
               <span class="reply-icon">{replyIcon(replyingTo.media_kind)}</span>
             {/if}
-            <span
-              >Replying to {senderLabel(replyingTo)}: {replyPreviewText(replyingTo)}</span
-            >
-            <button class="icon" onclick={() => (replyingTo = null)}>×</button>
+            <span class="reply-body">
+              <span class="reply-to"
+                >Replying to {replyingTo.from_me ? "yourself" : senderLabel(replyingTo)}</span
+              >
+              <span class="reply-snippet">{replyPreviewText(replyingTo)}</span>
+            </span>
+            <button
+              class="icon"
+              title="Cancel reply"
+              aria-label="Cancel reply"
+              onclick={() => (replyingTo = null)}><Icon name="x" size={16} /></button>
           </div>
         {/if}
 
         {#if pending.length > 0}
           <div class="pending">
             {#each pending as item (item.id)}
-              <div class="pending-item">
+              <div
+                class="pending-item"
+                class:waiting={sendingMedia && sendingMedia.current !== item.id}
+                class:uploading={sendingMedia?.current === item.id}>
                 <button
                   class="pending-thumb"
                   title="Preview and caption"
+                  disabled={!!sendingMedia}
                   onclick={() => (previewId = item.id)}>
                   {#if item.kind === "image"}
                     <img src={item.url} alt={item.file.name} />
@@ -1492,7 +2651,7 @@
                     <video src={item.url} preload="metadata" muted></video>
                     <span class="play-badge">▶</span>
                   {:else}
-                    <span class="file-icon">📄</span>
+                    <span class="file-icon"><Icon name="file" size={26} /></span>
                   {/if}
                 </button>
                 <span class="pending-name" title={item.file.name}>{item.file.name}</span>
@@ -1502,13 +2661,20 @@
                 <button
                   class="icon remove"
                   title="Remove"
-                  onclick={() => removePending(item.id)}>×</button
+                  aria-label="Remove"
+                  disabled={!!sendingMedia}
+                  onclick={() => removePending(item.id)}><Icon name="x" size={12} /></button
                 >
               </div>
             {/each}
-            <button class="primary" onclick={sendPending}>
-              Send{pending.length > 1 ? ` ${pending.length}` : ""}
-            </button>
+            <span class="pending-status">
+              {#if sendingMedia}
+                <span class="spinner"></span>
+                Sending {sendingMedia.done + 1} of {sendingMedia.total}…
+              {:else}
+                Type a caption below, then send.
+              {/if}
+            </span>
           </div>
         {/if}
 
@@ -1527,13 +2693,82 @@
           </div>
         {/if}
 
+        <div class="composer-area">
+        {#if emojiToken && emojiMatches.length > 0}
+          <div class="suggest" role="listbox" aria-label="Emoji suggestions">
+            <span class="suggest-title">Emoji matching :{emojiToken.query}</span>
+            {#each emojiMatches as e, i (e.emoji)}
+              <button
+                type="button"
+                class="suggest-row"
+                class:active={i === emojiIndex}
+                role="option"
+                aria-selected={i === emojiIndex}
+                onmouseenter={() => (emojiIndex = i)}
+                onclick={() => selectEmoji(e.emoji)}>
+                <span class="suggest-emoji">{e.emoji}</span>
+                :{e.shortcodes.find((c) => c.startsWith(emojiToken?.query.toLowerCase() ?? "")) ?? e.shortcodes[0] ?? e.label}:
+              </button>
+            {/each}
+          </div>
+        {/if}
+        {#if pickerTab}
+          <ExpressionPicker
+            chat={selectedChat}
+            bind:tab={pickerTab}
+            {enqueue}
+            onemoji={(emoji) => insertAtCaret(emoji)}
+            onsent={async () => {
+              await reloadMessages();
+              await refreshChats();
+              scrollToBottom();
+            }}
+            onerror={(message) => (error = message)}
+            onclose={() => (pickerTab = null)} />
+        {/if}
         <form class="composer" onsubmit={(e) => (e.preventDefault(), send())}>
+          {#if recording}
+            <VoiceRecorder
+              onsend={sendVoice}
+              oncancel={() => (recording = false)}
+              onerror={(message) => (error = message)} />
+          {:else}
           <button
             type="button"
             class="icon attach"
-            title="Attach a file"
-            onclick={() => filePicker?.click()}>📎</button
+            class:active={attachMenu}
+            title="Attach"
+            aria-label="Attach"
+            aria-expanded={attachMenu}
+            onclick={() => (attachMenu = !attachMenu)}><Icon name="plus" size={22} /></button
           >
+          {#if attachMenu}
+            <!-- svelte-ignore a11y_click_events_have_key_events -->
+            <div class="attach-catcher" role="presentation" onclick={() => (attachMenu = false)}></div>
+            <div class="attach-menu" role="menu">
+              <button
+                type="button"
+                role="menuitem"
+                onclick={() => {
+                  attachMenu = false;
+                  filePicker?.click();
+                }}><Icon name="paperclip" size={18} /> Upload a file</button>
+              <button
+                type="button"
+                role="menuitem"
+                onclick={() => {
+                  attachMenu = false;
+                  creating = "poll";
+                }}><Icon name="poll" size={18} /> Create poll</button>
+              <button
+                type="button"
+                role="menuitem"
+                onclick={() => {
+                  attachMenu = false;
+                  creating = "event";
+                }}><Icon name="calendar" size={18} /> Create event</button>
+            </div>
+          {/if}
           <input
             class="file-input"
             type="file"
@@ -1547,61 +2782,187 @@
             oninput={onComposerInput}
             onkeydown={onComposerKey}
             rows="1"
-            placeholder="Type a message"
+            placeholder={pending.length > 0 ? "Add a caption (optional)" : "Type a message"}
           ></textarea>
-          <button class="primary" type="submit" disabled={!draft.trim()}>Send</button>
+          <div class="composer-tools">
+            <button
+              type="button"
+              class="icon tool-text"
+              class:active={pickerTab === "gif"}
+              title="GIFs"
+              onclick={() => (pickerTab = pickerTab === "gif" ? null : "gif")}>GIF</button>
+            <button
+              type="button"
+              class="icon"
+              class:active={pickerTab === "sticker"}
+              title="Stickers"
+              aria-label="Stickers"
+              onclick={() => (pickerTab = pickerTab === "sticker" ? null : "sticker")}
+              ><Icon name="sticker" size={20} /></button>
+            <button
+              type="button"
+              class="icon"
+              class:active={pickerTab === "emoji"}
+              title="Emoji"
+              aria-label="Emoji"
+              onclick={() => (pickerTab = pickerTab === "emoji" ? null : "emoji")}
+              ><Icon name="smile" size={20} /></button>
+            {#if pending.some((p) => p.kind !== "other")}
+              <button
+                type="button"
+                class="icon once-toggle"
+                class:active={sendOnce}
+                title="View once"
+                aria-label="View once"
+                aria-pressed={sendOnce}
+                onclick={() => (sendOnce = !sendOnce)}>1</button>
+            {/if}
+          </div>
+          {#if !draft.trim() && pending.length === 0}
+            <button
+              class="send ready"
+              type="button"
+              title="Record a voice message"
+              aria-label="Record a voice message"
+              onclick={() => (recording = true)}><Icon name="mic" size={19} /></button>
+          {:else}
+            <button
+              class="send ready"
+              type="submit"
+              title="Send"
+              aria-label="Send"
+              disabled={!!sendingMedia}><Icon name="send" size={18} /></button>
+          {/if}
+          {/if}
         </form>
+        </div>
       {:else}
-        <div class="placeholder">Select a conversation</div>
+        <div class="placeholder">
+          <span class="placeholder-icon"><Icon name="message" size={28} /></span>
+          <p class="placeholder-title">No conversation open</p>
+          <p class="hint">Pick a chat on the left, or search for a contact to start one.</p>
+        </div>
       {/if}
     </section>
 
-    {#if showGroupInfo}
-      <aside class="group-info">
-        <button type="button" class="resizer" aria-label="Resize group info" onmousedown={(e) => startResize("right", e)}></button>
-        <header>
-          <span>Group info</span>
-          <button class="icon" title="Close" onclick={() => (showGroupInfo = false)}>×</button>
-        </header>
-        {#if groupInfo}
-          <div class="group-body">
-            <h2>{groupInfo.subject ?? "Group"}</h2>
-            {#if groupInfo.description}
-              <p class="group-desc">{groupInfo.description}</p>
-            {/if}
-            {#if groupInfo.created_at}
-              <p class="hint">
-                Created {new Date(groupInfo.created_at * 1000).toLocaleDateString()}
-              </p>
-            {/if}
-            <h3>{groupInfo.participants.length} members</h3>
-            <ul>
-              {#each groupInfo.participants as person (person.jid)}
-                <li>
-                  <span class="member-name">
-                    {person.number ?? person.name}{person.name && person.number && person.name !== person.number ? ` - ${person.name}` : ""}
-                    {#if person.admin}<span class="admin">admin</span>{/if}
-                  </span>
-                  {#if person.username}
-                    <span class="member-meta">@{person.username}</span>
-                  {/if}
-                </li>
-              {/each}
-            </ul>
-          </div>
-        {:else}
-          <div class="group-body">
-            {#if groupInfoError}
-              <p class="hint">Could not load group info: {groupInfoError}</p>
-              <button class="primary" onclick={openGroupInfo}>Retry</button>
-            {:else}
-              <p class="hint">Loading…</p>
-            {/if}
-          </div>
-        {/if}
-      </aside>
-    {/if}
   </div>
+{/if}
+</div>
+
+{#if menu}
+  {@const m = menu.message}
+  <MessageMenu
+    x={menu.x}
+    y={menu.y}
+    items={menuItems(m)}
+    reactions={QUICK_REACTIONS}
+    current={reactionsFor.get(m.id)?.find((r) => r.mine)?.emoji ?? null}
+    onreact={(emoji) => {
+      menu = null;
+      act(() => invoke("react", { target: target(m), emoji }));
+    }}
+    onclose={() => (menu = null)} />
+{/if}
+
+{#if creating}
+  <CreateDialog kind={creating} oncreate={create} onclose={() => (creating = null)} />
+{/if}
+
+{#if forwarding}
+  {@const m = forwarding}
+  <ChatPicker
+    title="Forward message to"
+    chats={chats.map((c) => ({ jid: c.chat, label: chatLabel(c), avatar: avatars[c.chat] ?? null }))}
+    onpick={async (to) => {
+      await enqueue(() => invoke("forward_message", { chat: m.chat, id: m.id, to }));
+      await refreshChats();
+    }}
+    onclose={() => (forwarding = null)} />
+{/if}
+
+{#if deleting}
+  {@const m = deleting}
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <div
+    class="sheet-backdrop"
+    role="presentation"
+    onclick={(e) => e.target === e.currentTarget && (deleting = null)}>
+    <div class="sheet confirm" role="dialog" aria-modal="true" aria-label="Delete message">
+      <h2>Delete message?</h2>
+      <p class="hint">
+        {canDeleteForEveryone(m)
+          ? "Delete it for everyone in this chat, or only from your devices."
+          : "It is removed from your devices only."}
+      </p>
+      <div class="confirm-actions">
+        {#if canDeleteForEveryone(m)}
+          <button class="danger" onclick={() => deleteMessage(true)}>Delete for everyone</button>
+        {/if}
+        <button class="danger" onclick={() => deleteMessage(false)}>Delete for me</button>
+        <button onclick={() => (deleting = null)}>Cancel</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if onceOpen && onceOpen.media_kind !== "audio" && onceOpen.media_path}
+  <MediaViewer
+    items={[viewerItem(onceOpen)]}
+    bind:index={onceIndex}
+    onclose={closeViewOnce}
+    onreply={(id) => {
+      replyingTo = messages.find((m) => m.id === id) ?? null;
+      void closeViewOnce();
+      composerInput?.focus();
+    }}
+    onjump={() => void closeViewOnce()} />
+{/if}
+
+{#if viewerIndex !== null && viewerItems.length > 0}
+  <MediaViewer
+    items={viewerItems}
+    bind:index={viewerIndex}
+    onclose={() => (viewerIndex = null)}
+    onopen={openMedia}
+    onreply={(id) => {
+      replyingTo = messages.find((m) => m.id === id) ?? null;
+      viewerIndex = null;
+      composerInput?.focus();
+    }}
+    onjump={(id) => {
+      viewerIndex = null;
+      scrollToMessage(id);
+    }} />
+{/if}
+
+{#if showGroupInfo && selectedChat}
+  {@const chat = chats.find((c) => c.chat === selectedChat)}
+  <GroupInfo
+    jid={selectedChat}
+    title={chat ? chatLabel(chat) : displayName(null, selectedChat)}
+    info={groupInfo}
+    error={groupInfoError}
+    {avatars}
+    pinned={!!chat?.pinned}
+    onavatar={(jid) => loadAvatar(bare(jid))}
+    onretry={openGroupInfo}
+    onpin={() => chat && togglePin(chat)}
+    onopenurl={openUrl}
+    onmessage={(jid) => {
+      showGroupInfo = false;
+      openChat(bare(jid));
+    }}
+    {me}
+    namer={displayName}
+    onlabel={async (label) => {
+      await invoke("set_member_label", { chat: selectedChat, label });
+      const user = me?.split("@")[0];
+      for (const list of [groupInfo?.participants ?? [], participants]) {
+        const self = list.find((p) => p.jid === me || p.number === user);
+        if (self) self.label = label || null;
+      }
+    }}
+    onclose={() => (showGroupInfo = false)} />
 {/if}
 
 {#if previewItem}
@@ -1623,7 +2984,7 @@
         <!-- svelte-ignore a11y_media_has_caption -->
         <video class="preview-large" src={previewItem.url} controls></video>
       {:else}
-        <span class="file-icon large">📄</span>
+        <span class="file-icon large"><Icon name="file" size={56} /></span>
       {/if}
       <span class="pending-name">{previewItem.file.name}</span>
       <input
@@ -1650,127 +3011,148 @@
   <div class="notice">
     <span>{notice}</span>
     <button class="link" onclick={muteNotice}>Do not warn again</button>
-    <button class="icon" title="Dismiss" onclick={() => (notice = null)}>×</button>
-  </div>
-{/if}
-
-{#if showAccounts}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <div
-    class="sheet-backdrop"
-    role="presentation"
-    onclick={(e) => {
-      if (e.target === e.currentTarget) showAccounts = false;
-    }}>
-    <div class="sheet" role="dialog" aria-modal="true" aria-label="Accounts">
-      <h2>Accounts</h2>
-      {#each accountList as account (account.id)}
-        <div class="account-row">
-          <input
-            type="text"
-            value={account.label}
-            onchange={(e) => renameAccount(account.id, e.currentTarget.value)}
-          />
-          <button class="icon" title="Remove" onclick={() => removeAccount(account.id)}>×</button>
-        </div>
-      {/each}
-      <button class="primary" onclick={addAccount}>Add account</button>
-      <button class="primary" onclick={() => (showAccounts = false)}>Done</button>
-    </div>
+    <button class="icon" title="Dismiss" aria-label="Dismiss" onclick={() => (notice = null)}>
+      <Icon name="x" size={16} />
+    </button>
   </div>
 {/if}
 
 {#if showSettings}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <div class="sheet-backdrop" role="presentation" onclick={() => (showSettings = false)}>
-    <div class="sheet" role="dialog" aria-modal="true" aria-label="Settings">
-      <h2>Retention</h2>
-      <p class="hint">
-        History is kept locally only for the window below. Nothing older is
-        downloaded during pairing unless you opt in.
-      </p>
-
-      <label>
-        <span>Keep messages for (hours)</span>
-        <input
-          type="number"
-          min="1"
-          value={settings.retention.max_age_hours ?? ""}
-          oninput={(e) =>
-            (settings.retention.max_age_hours = e.currentTarget.value
-              ? Number(e.currentTarget.value)
-              : null)}
-        />
-      </label>
-
-      <label>
-        <span>Max messages per chat</span>
-        <input
-          type="number"
-          min="1"
-          value={settings.retention.max_messages_per_chat ?? ""}
-          oninput={(e) =>
-            (settings.retention.max_messages_per_chat = e.currentTarget.value
-              ? Number(e.currentTarget.value)
-              : null)}
-        />
-      </label>
-
-      <label class="stack">
-        <span>Media download folder</span>
-        <input
-          type="text"
-          placeholder="App data folder"
-          value={settings.media_dir ?? ""}
-          oninput={(e) => (settings.media_dir = e.currentTarget.value || null)}
-        />
-      </label>
-
-      <label class="check">
-        <input type="checkbox" bind:checked={settings.accept_full_history} />
-        <span>Download full history on next pairing</span>
-      </label>
-
-      <label class="check">
-        <input type="checkbox" bind:checked={settings.auto_download_media} />
-        <span>Download media automatically</span>
-      </label>
-
-      <label class="check">
-        <input type="checkbox" bind:checked={settings.warn_missing_video_preview} />
-        <span>Warn when a video is sent without a preview</span>
-      </label>
-
-      <p class="hint">Retention and folder changes apply the next time Hermóðr starts.</p>
-
-      <div class="actions">
-        <button onclick={flushMedia}>Flush media</button>
-      </div>
-
-      <div class="actions">
-        <button class="primary" onclick={saveSettings}>Save</button>
-        <button onclick={() => (showSettings = false)}>Cancel</button>
-      </div>
-    </div>
-  </div>
+  <Settings
+    {settings}
+    accounts={accountList}
+    active={activeAccount}
+    {me}
+    meAvatar={me ? (avatars[me] ?? null) : null}
+    {accountAvatars}
+    bind:section={settingsSection}
+    onclose={() => (showSettings = false)}
+    onsave={saveSettings}
+    onflush={flushMedia}
+    onrename={renameAccount}
+    onremove={removeAccount}
+    onadd={() => {
+      showSettings = false;
+      addAccount();
+    }}
+    onswitch={(id) => {
+      showSettings = false;
+      switchTo(id);
+    }}
+    onprivacy={(next) => (privacy = next)}
+    onpicture={() => {
+      if (!me) return;
+      meVersion += 1;
+      requestedAvatars.delete(me);
+      delete avatars[me];
+      loadAvatar(me);
+    }} />
 {/if}
 
 <style>
+  :global(:root) {
+    --bg: #111b21;
+    --chat-bg: #0b141a;
+    --surface: #202c33;
+    --raised: #2a3942;
+    --raised-2: #374248;
+    --line: #222d34;
+    --line-soft: #1d282f;
+    --line-strong: #3b4a54;
+    --text: #e9edef;
+    --muted: #8696a0;
+    --faint: #667781;
+    --accent: #00a884;
+    --accent-hover: #06cf9c;
+    --accent-ink: #111b21;
+    --accent-text: #00a884;
+    --accent-soft: rgba(0, 168, 132, 0.18);
+    --link: #53bdeb;
+    --mention: #f0b232;
+    --mention-soft: rgba(240, 178, 50, 0.1);
+    --mention-self-soft: rgba(240, 178, 50, 0.24);
+    --mention-pill: #53bdeb;
+    --mention-pill-soft: rgba(83, 189, 235, 0.18);
+    --replying: #00a884;
+    --replying-soft: rgba(0, 168, 132, 0.16);
+    --jump-soft: rgba(0, 168, 132, 0.3);
+    --row-hover: rgba(233, 237, 239, 0.03);
+    --bubble: #202c33;
+    --bubble-mine: #005c4b;
+    --danger: #f15c6d;
+    --danger-soft: #3b1e24;
+    --shadow: 0 2px 12px rgba(0, 0, 0, 0.45);
+    --scrim: rgba(0, 0, 0, 0.6);
+    --radius-sm: 7.5px;
+    --radius: 8px;
+    --radius-lg: 10px;
+    --font: "Segoe UI", "Helvetica Neue", system-ui, sans-serif;
+    --font-size: 14.2px;
+    color-scheme: var(--scheme, dark);
+  }
   :global(html, body) {
     margin: 0;
     height: 100%;
-    background: #111214;
-    color: #e4e4e7;
-    font-family: system-ui, sans-serif;
-    font-size: 14px;
+    overflow: hidden;
+    background: var(--bg);
+    color: var(--text);
+    /* The flag font only covers flag codepoints, so it never shadows --font. */
+    font-family: "Twemoji Country Flags", var(--font);
+    font-size: var(--font-size);
+    -webkit-font-smoothing: antialiased;
   }
-  :global(#app) {
-    height: 100%;
+  :global(*) {
+    scrollbar-width: thin;
+    scrollbar-color: var(--raised-2) transparent;
+  }
+  :global(button) {
+    transition:
+      background-color 0.15s ease,
+      color 0.15s ease,
+      opacity 0.15s ease,
+      transform 0.1s ease;
+  }
+  :global(button:not(:disabled):active) {
+    transform: translateY(1px);
+  }
+  :global(:focus-visible) {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  :global(input:focus-visible, textarea:focus-visible) {
+    outline: none;
+    border-color: var(--accent) !important;
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+  .app {
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+  }
+  .app > .layout,
+  .app > .pairing {
+    flex: 1;
+    min-height: 0;
   }
   .error {
-    background: #7f1d1d;
-    padding: 8px 12px;
+    position: fixed;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 300;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: min(640px, 90vw);
+    padding: 8px 8px 8px 14px;
+    background: var(--danger-soft);
+    border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
     font-size: 13px;
+  }
+  .error .icon {
+    color: var(--muted);
   }
   .pairing {
     height: 100%;
@@ -1788,18 +3170,19 @@
   }
   .lede {
     margin: 0;
-    color: #a1a1aa;
+    color: var(--muted);
     max-width: 44ch;
     line-height: 1.5;
   }
   .hint {
     margin: 0;
-    color: #71717a;
+    color: var(--faint);
     font-size: 12px;
     max-width: 44ch;
+    text-wrap: balance;
   }
   .qr {
-    background: #111214;
+    background: var(--bg);
     padding: 12px;
     border-radius: 10px;
     line-height: 0;
@@ -1807,12 +3190,7 @@
   .layout {
     display: grid;
     grid-template-columns: 300px 1fr;
-    height: 100%;
     overflow: hidden;
-  }
-  .chats,
-  .group-info {
-    position: relative;
   }
   .resizer {
     border: 0;
@@ -1825,86 +3203,85 @@
     cursor: col-resize;
     z-index: 5;
   }
-  .chats .resizer,
-  .group-info .resizer {
-    display: block;
-    width: 6px;
-    padding: 0;
-    border: 0;
-    background: transparent;
-  }
   .chats .resizer {
+    display: block;
     right: -3px;
   }
-  .group-info .resizer {
-    left: -3px;
+  .chat-heading {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+  }
+  .heading-avatar {
+    flex: none;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    background: none;
+    cursor: pointer;
+  }
+  .heading-avatar:hover {
+    filter: brightness(1.12);
   }
   .chat-title {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
     background: transparent;
     border: 0;
     color: inherit;
     font: inherit;
     font-weight: 600;
     padding: 0;
-    cursor: pointer;
     text-align: left;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
-  .group-info {
-    position: relative;
-    display: flex;
-    flex-direction: column;
-    min-height: 0;
-    border-left: 1px solid #27272a;
+  button.chat-title {
+    cursor: pointer;
   }
-  .group-info header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 12px 14px;
-    font-weight: 600;
-    border-bottom: 1px solid #27272a;
+  button.chat-title:hover .chat-sub {
+    color: var(--accent-text);
   }
-  .group-body {
-    padding: 14px;
-    overflow-y: auto;
-  }
-  .group-body h2 {
-    margin: 0 0 8px;
-    font-size: 16px;
-  }
-  .group-body h3 {
-    margin: 16px 0 6px;
+  .chat-sub {
     font-size: 13px;
-    color: #a1a1aa;
+    font-weight: 400;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
-  .group-desc {
-    margin: 0 0 8px;
-    color: #d4d4d8;
-    white-space: pre-wrap;
+  .chat-title {
+    font-size: 16px;
+    font-weight: 400;
   }
-  .group-body ul {
-    list-style: none;
-    margin: 0;
-    padding: 0;
+  .avatar {
+    grid-area: avatar;
+    flex: none;
+    width: 49px;
+    height: 49px;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    background: hsl(var(--hue) 28% 24%);
+    color: hsl(var(--hue) 45% 80%);
+    font-size: 15px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    user-select: none;
   }
-  .group-body li {
-    padding: 6px 0;
-    border-bottom: 1px solid #1c1c1f;
+  img.avatar {
+    object-fit: cover;
+    background: var(--raised);
   }
-  .admin {
-    color: #86efac;
-    font-size: 11px;
-  }
-  .member-name {
-    display: block;
-  }
-  .member-meta {
-    display: block;
-    color: #71717a;
-    font-size: 11px;
+  .conversation header .avatar {
+    width: 40px;
+    height: 40px;
+    font-size: 14px;
   }
   .link {
-    color: #93c5fd;
+    color: var(--link);
     cursor: pointer;
   }
   .preview-card {
@@ -1912,7 +3289,7 @@
     gap: 8px;
     align-items: flex-start;
     text-align: left;
-    background: #1c1c1f;
+    background: var(--surface);
     border: 0;
     border-radius: 6px;
     padding: 8px;
@@ -1940,7 +3317,7 @@
   }
   .preview-desc {
     font-size: 12px;
-    color: #a1a1aa;
+    color: var(--muted);
     overflow: hidden;
     display: -webkit-box;
     line-clamp: 2;
@@ -1949,17 +3326,79 @@
   }
   .preview-host {
     font-size: 11px;
-    color: #71717a;
+    color: var(--faint);
   }
-  /* Keep the newlines the sender typed, and wrap long tokens. */
+  /* Keep the spaces the sender typed, and wrap long tokens. */
   .text {
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
+  .inline-code,
+  .pre {
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    font-size: 0.92em;
+  }
+  .inline-code {
+    padding: 1px 4px;
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--text) 10%, transparent);
+  }
+  .mention-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0 5px 0 2px;
+    border-radius: 4px;
+    vertical-align: bottom;
+    font-weight: 500;
+    color: var(--mention-pill);
+    background: var(--mention-pill-soft);
+    white-space: nowrap;
+  }
+  .mention-pill.self {
+    color: var(--mention);
+    background: var(--mention-self-soft);
+  }
+  .mention-pill img,
+  .mention-initials {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    flex: none;
+    object-fit: cover;
+  }
+  .mention-initials {
+    display: grid;
+    place-items: center;
+    font-size: 8px;
+    background: hsl(var(--hue) 28% 24%);
+    color: hsl(var(--hue) 45% 80%);
+  }
+  .pre {
+    display: block;
+    margin: 2px 0;
+    padding: 6px 8px;
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--text) 8%, transparent);
+    white-space: pre-wrap;
+  }
+  .quote-block {
+    display: block;
+    margin: 2px 0;
+    padding-left: 8px;
+    border-left: 3px solid color-mix(in srgb, var(--text) 30%, transparent);
+    color: var(--muted);
+  }
+  .fmt-list {
+    margin: 2px 0;
+    padding-left: 20px;
+    white-space: normal;
+  }
   .chats {
     position: relative;
     overflow: hidden;
-    border-right: 1px solid #27272a;
+    background: var(--bg);
+    border-right: 1px solid var(--line);
     display: flex;
     flex-direction: column;
     min-height: 0;
@@ -1967,22 +3406,26 @@
   .chats header,
   .conversation header {
     min-width: 0;
+    height: 59px;
+    box-sizing: border-box;
+    flex: none;
     overflow: hidden;
-    padding: 12px 14px;
-    font-weight: 600;
-    border-bottom: 1px solid #27272a;
+    padding: 0 12px 0 16px;
     display: flex;
     justify-content: space-between;
     align-items: center;
-  }
-  .account-row {
-    display: flex;
     gap: 8px;
-    align-items: center;
-    margin-bottom: 8px;
   }
-  .account-row input {
-    flex: 1;
+  .chats header {
+    height: 64px;
+  }
+  .conversation header {
+    background: var(--surface);
+  }
+  .title {
+    margin: 0;
+    font-size: 22px;
+    font-weight: 700;
   }
   .account-bar {
     display: flex;
@@ -1991,28 +3434,26 @@
     gap: 4px;
     overflow: hidden;
   }
-  /* Only the header bar fills the space between the title and the gear. */
-  .chats header .account-bar {
-    flex: 1;
-  }
   .account {
-    background: #1c1c1f;
-    border: 1px solid #27272a;
-    color: #a1a1aa;
+    background: transparent;
+    border: 0;
+    color: var(--muted);
     font: inherit;
-    font-size: 11px;
-    padding: 3px 10px;
-    border-radius: 999px;
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 4px;
     cursor: pointer;
-    max-width: 110px;
+    max-width: 120px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .account:hover {
+    color: var(--text);
+  }
   .account.active {
-    background: #22c55e;
-    border-color: #22c55e;
-    color: #052e16;
+    background: var(--raised);
+    color: var(--text);
     font-weight: 600;
   }
   .notice {
@@ -2026,7 +3467,7 @@
     gap: 10px;
     max-width: 80vw;
     padding: 8px 14px;
-    background: #3f3f46;
+    background: var(--raised-2);
     border-radius: 8px;
     font-size: 13px;
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
@@ -2034,22 +3475,76 @@
   .notice .link {
     background: transparent;
     border: 0;
-    color: #93c5fd;
+    color: var(--accent-text);
     font: inherit;
     cursor: pointer;
     white-space: nowrap;
   }
   .search {
-    margin: 8px 14px;
-    background: #1c1c1f;
-    border: 1px solid #3f3f46;
-    border-radius: 6px;
-    padding: 6px 10px;
-    color: inherit;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 12px 8px;
+    padding: 0 12px;
+    height: 36px;
+    flex: none;
+    background: var(--surface);
+    border: 1px solid transparent;
+    border-radius: 999px;
+    color: var(--faint);
+    cursor: text;
+  }
+  .search:focus-within {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+  .search input {
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: 0;
+    outline: none;
+    padding: 0;
+    color: var(--text);
     font: inherit;
   }
+  .search input:focus-visible {
+    box-shadow: none;
+  }
+  .search input::placeholder {
+    color: var(--muted);
+  }
+  .filters {
+    display: flex;
+    gap: 8px;
+    padding: 0 12px 8px;
+    flex: none;
+  }
+  .chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--surface);
+    border: 0;
+    border-radius: 999px;
+    color: var(--muted);
+    font: inherit;
+    font-size: 14px;
+    padding: 5px 12px;
+    cursor: pointer;
+  }
+  .chip:hover {
+    background: var(--raised);
+  }
+  .chip.active {
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+  .chip-count {
+    font-size: 12px;
+  }
   .results .preview {
-    color: #71717a;
+    color: var(--faint);
   }
   .chats ul {
     list-style: none;
@@ -2060,28 +3555,43 @@
     flex: 1;
   }
   .chat-row {
+    position: relative;
+    box-sizing: border-box;
     width: 100%;
+    height: 72px;
     min-width: 0;
     overflow: hidden;
     display: grid;
-    grid-template-columns: 1fr auto auto;
-    grid-template-areas: "name time badge" "preview preview preview";
-    gap: 2px 8px;
+    grid-template-columns: auto 1fr auto;
+    grid-template-areas: "avatar name time" "avatar preview badge";
+    gap: 2px 15px;
     text-align: left;
     background: transparent;
     color: inherit;
     border: 0;
-    padding: 10px 14px;
+    padding: 0 15px 0 13px;
     cursor: pointer;
-    border-bottom: 1px solid #1c1c1f;
     font: inherit;
     align-items: center;
+    align-content: center;
+  }
+  /* The divider starts after the avatar, as in WhatsApp. */
+  .chat-row::after {
+    content: "";
+    position: absolute;
+    left: 77px;
+    right: 0;
+    bottom: 0;
+    border-bottom: 1px solid var(--line);
   }
   .chat-row:hover {
-    background: #1c1c1f;
+    background: var(--surface);
   }
   .chat-row.active {
-    background: #27272a;
+    background: var(--raised);
+  }
+  .chat-row:focus-visible {
+    outline-offset: -2px;
   }
   .badges {
     grid-area: badge;
@@ -2090,30 +3600,49 @@
     gap: 4px;
   }
   .pin {
-    margin-right: 2px;
+    display: inline-flex;
+    vertical-align: -1px;
+    margin-right: 4px;
+    color: var(--faint);
   }
-  .badge.mention {
-    background: #2563eb;
-    color: #fff;
+  .badge.mention-badge {
+    background: var(--accent-soft);
+    color: var(--accent-text);
     border: 0;
     cursor: pointer;
+    font: inherit;
+    font-size: 11px;
     font-weight: 700;
   }
-  .badge.pin-toggle {
+  .pin-toggle {
+    display: none;
     background: transparent;
     border: 0;
-    color: inherit;
-    min-width: 0;
-    padding: 0;
+    color: var(--faint);
+    padding: 2px;
+    border-radius: 4px;
     cursor: pointer;
-    opacity: 0;
-    font-size: 11px;
   }
-  .chat-row:hover .pin-toggle {
-    opacity: 0.7;
+  .pin-toggle:hover {
+    color: var(--text);
+  }
+  .chat-row:hover .pin-toggle,
+  .pin-toggle:focus-visible {
+    display: block;
   }
   .jump-mention {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--accent-soft);
+    color: var(--accent-text);
+    border: 0;
+    border-radius: 999px;
+    padding: 4px 10px;
+    font: inherit;
     font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
   }
   .name {
     grid-area: name;
@@ -2125,32 +3654,235 @@
   }
   .time {
     grid-area: time;
-    color: #71717a;
+    color: var(--muted);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  .time.unread {
+    color: var(--accent);
+  }
+  .chat-row .name {
+    font-size: 17px;
+    font-weight: 400;
+  }
+  .chat-row .preview {
+    font-size: 14px;
+    color: var(--muted);
+  }
+  .preview.typing,
+  .chat-sub.typing {
+    color: var(--accent);
+  }
+  .preview-icon {
+    display: inline-flex;
+    vertical-align: -2px;
+    margin-right: 4px;
+  }
+  .messages.group {
+    --pad-l: max(56px, 7%);
+  }
+  /* Beside the first bubble of a run, outside the tail. */
+  .sender-avatar {
+    position: absolute;
+    left: -38px;
+    top: 0;
+  }
+  .sender-avatar .avatar {
+    width: 28px;
+    height: 28px;
     font-size: 11px;
   }
   .preview {
     grid-area: preview;
     min-width: 0;
-    color: #a1a1aa;
+    color: var(--muted);
     font-size: 12px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .badge {
-    grid-area: badge;
-    background: #22c55e;
-    color: #052e16;
-    font-size: 11px;
-    font-weight: 700;
+    display: grid;
+    place-items: center;
+    background: var(--accent);
+    color: var(--accent-ink);
+    font-size: 12px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
     border-radius: 999px;
-    padding: 1px 7px;
-    min-width: 18px;
-    text-align: center;
+    height: 20px;
+    padding: 0 6px;
+    min-width: 20px;
+    box-sizing: border-box;
   }
   .empty {
-    padding: 16px 14px;
-    color: #71717a;
+    padding: 16px 10px;
+    color: var(--faint);
+  }
+  .user-panel {
+    position: relative;
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    height: 62px;
+    box-sizing: border-box;
+    padding: 0 8px;
+    background: var(--surface);
+  }
+  .user-panel .me {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 4px 6px;
+    background: transparent;
+    border: 0;
+    border-radius: 8px;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .user-panel .me:hover,
+  .user-panel .me[aria-expanded="true"] {
+    background: var(--raised);
+  }
+  .me-avatar-wrap {
+    position: relative;
+    flex: none;
+  }
+  .me-avatar {
+    display: grid;
+    place-items: center;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    object-fit: cover;
+    background: hsl(var(--hue, 160) 28% 24%);
+    color: hsl(var(--hue, 160) 45% 80%);
+    font-size: 13px;
+    font-weight: 500;
+  }
+  .presence {
+    position: absolute;
+    right: -1px;
+    bottom: -1px;
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    background: var(--faint);
+    box-shadow: 0 0 0 3px var(--surface);
+  }
+  .presence.online {
+    background: var(--accent);
+  }
+  /* Half-lit: online, but only contacts can see it. */
+  .presence.contacts {
+    background: linear-gradient(90deg, var(--accent) 50%, var(--faint) 50%);
+  }
+  /* Discord's invisible: a hollow grey ring. */
+  .presence.invisible {
+    background: var(--surface);
+    border: 3px solid var(--muted);
+    box-sizing: border-box;
+  }
+  .me-text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    line-height: 1.25;
+  }
+  .me-name {
+    font-size: 14px;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .me-status {
+    font-size: 12px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .account-menu {
+    position: absolute;
+    left: 8px;
+    right: 8px;
+    bottom: calc(100% + 6px);
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    padding: 6px;
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+  }
+  .menu-label {
+    padding: 6px 8px 4px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+  }
+  .menu-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px;
+    background: transparent;
+    border: 0;
+    border-radius: 6px;
+    color: var(--text);
+    font: inherit;
+    font-size: 14px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .menu-item:hover {
+    background: var(--raised);
+  }
+  .menu-avatar {
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    flex: none;
+    border-radius: 50%;
+    object-fit: cover;
+    background: hsl(var(--hue, 160) 28% 24%);
+    color: hsl(var(--hue, 160) 45% 80%);
+    font-size: 11px;
+  }
+  .menu-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .menu-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    border: 2px solid var(--muted);
+    box-sizing: border-box;
+  }
+  .menu-item.current .menu-dot {
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+  .menu-sep {
+    height: 1px;
+    margin: 6px 4px;
+    background: var(--line-strong);
+  }
+  .account.add {
+    display: grid;
+    place-items: center;
   }
   .conversation {
     display: flex;
@@ -2158,56 +3890,110 @@
     min-height: 0;
     min-width: 0;
     position: relative;
+    background: var(--chat-bg);
+  }
+  .day {
+    display: flex;
+    justify-content: center;
+    margin: 12px 0 8px;
+  }
+  .day span {
+    background: var(--surface);
+    color: var(--muted);
+    font-size: 12.5px;
+    padding: 5px 12px;
+    border-radius: var(--radius-sm);
+    box-shadow: 0 1px 0.5px rgba(11, 20, 26, 0.13);
   }
   .load-older {
     align-self: center;
-    background: #27272a;
+    background: var(--surface);
     border: 0;
-    border-radius: 999px;
-    color: #d4d4d8;
+    border-radius: var(--radius-sm);
+    color: var(--muted);
     font: inherit;
-    font-size: 12px;
-    padding: 4px 12px;
+    font-size: 12.5px;
+    padding: 5px 12px;
+    margin-bottom: 4px;
     cursor: pointer;
+  }
+  .load-older:hover:not(:disabled) {
+    background: var(--raised);
+    color: var(--text);
+  }
+  .load-older:disabled {
+    cursor: progress;
+    opacity: 0.7;
   }
   .messages {
     flex: 1;
     overflow-y: auto;
     overflow-x: hidden;
     min-width: 0;
-    padding: 14px;
+    /* Rows carry the side padding so their highlight spans the full width. */
+    --pad-l: clamp(16px, 7%, 90px);
+    --pad-r: clamp(16px, 7%, 90px);
+    padding: 12px 0 8px;
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 2px;
+  }
+  .messages > .bubble {
+    margin-left: var(--pad-l);
+    margin-right: var(--pad-r);
+  }
+  .msg-row {
+    display: flex;
+    flex-direction: column;
+    padding: 1px var(--pad-r) 1px var(--pad-l);
+    transition: background-color 0.6s ease;
+  }
+  .msg-row:hover {
+    background: var(--row-hover);
+    transition-duration: 0.15s;
+  }
+  /* The message a reply is being drafted to. */
+  .msg-row.replying {
+    background: var(--replying-soft);
+    box-shadow: inset 3px 0 0 var(--replying);
+  }
+  /* Mentions of us and replies to us, as Discord marks them. */
+  .msg-row.for-me {
+    background: var(--mention-soft);
+    box-shadow: inset 3px 0 0 var(--mention);
+  }
+  .msg-row.for-me:hover {
+    background: color-mix(in srgb, var(--mention-soft), var(--row-hover));
+  }
+  /* The message a quote or mention jump landed on. */
+  .msg-row.jumped {
+    background: var(--jump-soft);
+    transition-duration: 0.15s;
   }
   .sync-banner {
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    z-index: 100;
+    flex: none;
     display: flex;
     align-items: center;
     gap: 8px;
     padding: 4px 14px;
-    background: #1c1c1f;
-    border-bottom: 1px solid #27272a;
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
   }
   .sync-text {
     font-size: 11px;
-    color: #a1a1aa;
+    color: var(--muted);
     white-space: nowrap;
   }
   .sync-track {
     flex: 1;
     height: 4px;
     border-radius: 2px;
-    background: #27272a;
+    background: var(--raised);
     overflow: hidden;
   }
   .sync-bar {
     height: 100%;
-    background: #22c55e;
+    background: var(--accent);
     transition: width 0.2s ease;
   }
   .bubble {
@@ -2220,52 +4006,121 @@
        the text away, which looks like every message collapsing. */
     flex-shrink: 0;
     align-self: flex-start;
-    background: #27272a;
-    border-radius: 8px;
-    padding: 6px 10px;
+    position: relative;
+    max-width: 65%;
+    background: var(--bubble);
+    border-radius: var(--radius-sm);
+    box-shadow: 0 1px 0.5px rgba(11, 20, 26, 0.13);
+    padding: 6px 7px 8px 9px;
     display: flex;
     flex-direction: column;
     gap: 3px;
+    line-height: 19px;
     word-break: break-word;
     overflow-wrap: anywhere;
-    overflow: hidden;
   }
-  .bubble.highlighted {
-    outline: 2px solid #22c55e;
-    outline-offset: 1px;
+  .bubble.first {
+    margin-top: 10px;
   }
   .bubble.mine {
     align-self: flex-end;
-    background: #14532d;
+    background: var(--bubble-mine);
+  }
+  /* The tail marks the first bubble of a run from one sender. */
+  .bubble.first:not(.mine) {
+    border-top-left-radius: 0;
+  }
+  .bubble.first.mine {
+    border-top-right-radius: 0;
+  }
+  /* 1px wider than it shows and tucked into the bubble, so no seam renders
+     where the two meet. */
+  .bubble.first::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    width: 9px;
+    height: 13px;
+    background: inherit;
+  }
+  .bubble.first:not(.mine)::before {
+    left: -8px;
+    clip-path: polygon(0 0, 100% 0, 100% 100%);
+  }
+  .bubble.first.mine::before {
+    right: -8px;
+    clip-path: polygon(0 0, 100% 0, 0 100%);
+  }
+  .bubble.media-only {
+    padding: 3px;
+  }
+  .bubble.media-only .media,
+  .bubble.media-only .media-button.video {
+    border-radius: calc(var(--radius-sm) - 2px);
+  }
+  .bubble.inline-meta .meta {
+    position: absolute;
+    right: 7px;
+    bottom: 4px;
+  }
+  /* Reserves room on the last line so the time never covers text. */
+  .meta-spacer {
+    display: inline-block;
+    width: 44px;
+    height: 1px;
+  }
+  .meta-spacer.mine {
+    width: 62px;
+  }
+  /* The time sits on the picture instead of below it. */
+  .bubble.media-only .meta {
+    position: absolute;
+    right: 9px;
+    bottom: 8px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: rgba(6, 8, 10, 0.55);
+    color: #eef0f2;
   }
   .sender {
-    font-size: 11px;
-    color: #86efac;
+    font-size: 12.8px;
+    font-weight: 500;
+    line-height: 22px;
+    color: hsl(var(--hue) 65% 68%);
+  }
+  .member-label {
+    margin-top: -4px;
+    font-size: 12px;
+    color: var(--muted);
   }
   .revoked {
     font-style: italic;
-    color: #71717a;
+    color: var(--faint);
   }
   .quote {
-    display: flex;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    grid-template-areas: "author thumb" "text thumb";
     align-items: center;
-    gap: 6px;
-    background: transparent;
+    column-gap: 8px;
+    background: rgba(0, 0, 0, 0.18);
     border: 0;
-    border-left: 2px solid #52525b;
-    color: inherit;
+    border-left: 4px solid var(--accent);
+    border-radius: 6px;
     font: inherit;
     text-align: left;
     cursor: pointer;
-    font-size: 12px;
-    color: #a1a1aa;
-    border-left: 2px solid #52525b;
-    padding-left: 6px;
+    font-size: 13px;
+    line-height: 18px;
+    color: var(--muted);
+    padding: 5px 8px 6px;
+    margin-bottom: 2px;
     overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
     min-width: 0;
     max-width: 100%;
+  }
+  .quote:hover {
+    background: rgba(0, 0, 0, 0.26);
   }
   .media {
     /* Cap both axes: width keeps it inside the bubble, height stops a tall
@@ -2278,14 +4133,76 @@
     border-radius: 6px;
     display: block;
   }
-  .file {
-    background: transparent;
+  .once {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 200px;
+    padding: 6px 4px;
     border: 0;
-    padding: 0;
+    background: none;
+    color: inherit;
     font: inherit;
-    color: #93c5fd;
+    text-align: left;
+    cursor: pointer;
+  }
+  .once > span:last-child {
+    display: flex;
+    flex-direction: column;
+  }
+  .once small {
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .once.spent {
+    cursor: default;
+    color: var(--muted);
+  }
+  .once-mark {
+    display: grid;
+    place-items: center;
+    width: 26px;
+    height: 26px;
+    flex: none;
+    border: 2px dashed var(--accent);
+    border-radius: 50%;
+    color: var(--accent);
+    font-size: 12px;
+    font-weight: 700;
+  }
+  .once.spent .once-mark {
+    border-color: var(--faint);
+    color: var(--faint);
+  }
+  .once-done {
+    align-self: flex-end;
+    padding: 4px 12px;
+    border: 0;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent-text);
+    font: inherit;
+    font-size: 12.5px;
+    cursor: pointer;
+  }
+  .file {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: rgba(0, 0, 0, 0.18);
+    border: 0;
+    border-radius: var(--radius-sm);
+    padding: 8px 12px 8px 10px;
+    font: inherit;
+    color: var(--text);
     cursor: pointer;
     text-align: left;
+  }
+  .file:hover {
+    background: rgba(0, 0, 0, 0.28);
+  }
+  .file :global(svg) {
+    color: var(--accent-text);
   }
   /* Media opens in the system viewer, so the whole preview is the button. */
   .media-button {
@@ -2305,7 +4222,7 @@
     gap: 6px;
     padding: 14px 16px;
     cursor: pointer;
-    background: #111214;
+    background: var(--bg);
     border-radius: 6px;
     min-width: 180px;
     min-height: 100px;
@@ -2316,12 +4233,24 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    color: #e4e4e7;
-    font-size: 26px;
+    color: var(--text);
+    font-size: 14px;
     font-weight: 700;
     letter-spacing: 1px;
     text-shadow: 0 1px 6px rgba(0, 0, 0, 0.8);
     pointer-events: none;
+  }
+  .media-overlay .play {
+    display: grid;
+    place-items: center;
+    width: 44px;
+    height: 44px;
+    padding-left: 3px;
+    box-sizing: border-box;
+    border-radius: 999px;
+    background: rgba(6, 8, 10, 0.6);
+    font-size: 16px;
+    text-shadow: none;
   }
   .play-badge {
     position: absolute;
@@ -2329,64 +4258,385 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    color: #e4e4e7;
+    color: var(--text);
     font-size: 28px;
     text-shadow: 0 1px 6px rgba(0, 0, 0, 0.8);
     pointer-events: none;
   }
   .download {
     align-self: flex-start;
-    background: #27272a;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: rgba(0, 0, 0, 0.2);
     border: 0;
-    border-radius: 6px;
-    color: #93c5fd;
+    border-radius: 999px;
+    color: var(--accent-text);
     font: inherit;
     font-size: 12px;
-    padding: 4px 10px;
+    padding: 4px 12px 4px 10px;
     cursor: pointer;
   }
-  .file-icon {
-    font-size: 28px;
+  .download:hover {
+    background: rgba(0, 0, 0, 0.32);
   }
-  .file-icon.large {
-    font-size: 56px;
+  .file-icon {
+    color: var(--muted);
   }
   .meta {
-    font-size: 10px;
-    color: #a1a1aa;
+    font-size: 11px;
+    line-height: 15px;
+    font-variant-numeric: tabular-nums;
+    color: color-mix(in srgb, var(--text) 60%, transparent);
     align-self: flex-end;
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 3px;
+    white-space: nowrap;
   }
   .reply-btn {
-    background: transparent;
+    position: absolute;
+    top: 3px;
+    right: 3px;
+    z-index: 1;
+    display: flex;
+    padding: 3px;
+    background: inherit;
     border: 0;
-    color: inherit;
+    border-radius: 999px;
+    color: var(--muted);
     cursor: pointer;
-    font-size: 12px;
     opacity: 0;
-    padding: 0 2px;
   }
-  .bubble:hover .reply-btn {
-    opacity: 0.8;
+  .bubble.mine .reply-btn {
+    background: var(--bubble-mine);
+  }
+  .bubble:not(.mine) .reply-btn {
+    background: var(--bubble);
+  }
+  .bubble:hover .reply-btn,
+  .bubble.menu-open .reply-btn,
+  .reply-btn:focus-visible {
+    opacity: 1;
+  }
+  .bubble.has-reactions {
+    margin-bottom: 16px;
+  }
+  .sticker {
+    width: 160px;
+    height: 160px;
+    object-fit: contain;
+    display: block;
+  }
+  /* Stickers float free of a bubble, as in WhatsApp. */
+  .bubble.sticker-only {
+    background: transparent;
+    box-shadow: none;
+    padding: 0;
+  }
+  .bubble.sticker-only::before {
+    display: none;
+  }
+  .bubble.sticker-only .meta {
+    align-self: flex-end;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: var(--surface);
+  }
+  .composer-area {
+    position: relative;
+    flex: none;
+  }
+  .attach.active {
+    color: var(--accent);
+  }
+  .attach-catcher {
+    position: fixed;
+    inset: 0;
+    z-index: 55;
+  }
+  .attach-menu {
+    position: absolute;
+    left: 10px;
+    bottom: calc(100% + 6px);
+    z-index: 56;
+    display: flex;
+    flex-direction: column;
+    min-width: 200px;
+    padding: 6px;
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow);
+  }
+  .attach-menu button {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 9px 10px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    font-size: 14.5px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .attach-menu button :global(svg) {
+    color: var(--accent);
+  }
+  .attach-menu button:hover {
+    background: var(--raised);
+  }
+  .composer-tools {
+    display: flex;
+    align-items: center;
+    align-self: center;
+    gap: 2px;
+  }
+  .composer-tools .icon {
+    width: 38px;
+    height: 38px;
+  }
+  .composer-tools .icon.active {
+    color: var(--accent);
+  }
+  .once-toggle {
+    width: 24px;
+    height: 24px;
+    border: 2px dashed currentColor;
+    border-radius: 50%;
+    font: inherit;
+    font-size: 11px;
+    font-weight: 800;
+  }
+  .once-toggle.active {
+    border-style: solid;
+  }
+  .tool-text {
+    font: inherit;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+  }
+  /* Discord-style completion list over the composer. */
+  .suggest {
+    position: absolute;
+    left: 12px;
+    right: 12px;
+    bottom: calc(100% + 6px);
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+    max-height: 360px;
+    overflow-y: auto;
+    padding: 8px;
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow);
+  }
+  .suggest-title {
+    padding: 2px 8px 6px;
+    font-size: 11.5px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .suggest-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 8px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    font-size: 14.5px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .suggest-row.active {
+    background: var(--raised);
+  }
+  .suggest-emoji {
+    font-size: 20px;
+    width: 26px;
+    text-align: center;
+  }
+  /* WhatsApp's reaction pill, hanging off the bubble's bottom edge. */
+  .reactions {
+    position: absolute;
+    bottom: -16px;
+    left: 8px;
+    display: flex;
+    align-items: center;
+    gap: 1px;
+    padding: 2px 6px;
+    border: 1px solid var(--chat-bg);
+    border-radius: 999px;
+    background: var(--surface);
+    font: inherit;
+    font-size: 13px;
+    line-height: 18px;
+    color: var(--muted);
+    cursor: pointer;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  }
+  .bubble.mine .reactions {
+    left: auto;
+    right: 8px;
+  }
+  .reaction-count {
+    margin-left: 3px;
+    font-size: 12px;
+  }
+  .star {
+    display: inline-flex;
+  }
+  .pinned-bar {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 16px;
+    border: 0;
+    border-top: 1px solid var(--line);
+    background: var(--surface);
+    color: var(--muted);
+    font: inherit;
+    font-size: 13.5px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .pinned-bar:hover {
+    background: var(--raised);
+  }
+  .pinned-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .pinned-text strong {
+    color: var(--text);
+    font-weight: 600;
+  }
+  .sheet.confirm {
+    width: min(400px, 90vw);
+  }
+  .sheet.confirm h2 {
+    margin: 0;
+    font-size: 17px;
+    font-weight: 600;
+  }
+  .confirm-actions {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 4px;
+  }
+  .confirm-actions button {
+    padding: 8px 14px;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--accent);
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .confirm-actions button:hover {
+    background: var(--raised);
+  }
+  .confirm-actions button.danger {
+    color: var(--danger);
+  }
+  .typing-bubble {
+    padding: 8px 12px;
+  }
+  .dots {
+    display: flex;
+    gap: 4px;
+    padding: 4px 2px;
+  }
+  .dots i {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--muted);
+    animation: blink 1.2s infinite ease-in-out;
+  }
+  .dots i:nth-child(2) {
+    animation-delay: 0.15s;
+  }
+  .dots i:nth-child(3) {
+    animation-delay: 0.3s;
+  }
+  @keyframes blink {
+    0%,
+    60%,
+    100% {
+      opacity: 0.35;
+      transform: translateY(0);
+    }
+    30% {
+      opacity: 1;
+      transform: translateY(-3px);
+    }
+  }
+  .recording {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--accent);
+    font-size: 13px;
   }
   .placeholder {
     margin: auto;
-    color: #71717a;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    text-align: center;
+  }
+  .placeholder-icon {
+    display: grid;
+    place-items: center;
+    width: 64px;
+    height: 64px;
+    border-radius: 20px;
+    background: var(--surface);
+    color: var(--faint);
+    margin-bottom: 4px;
+  }
+  .placeholder-title {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
   }
   .jump {
     position: absolute;
-    bottom: 74px;
-    right: 18px;
-    background: #3f3f46;
+    bottom: 76px;
+    right: 20px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--raised-2);
     color: inherit;
-    border: 0;
+    border: 1px solid var(--line-strong);
     border-radius: 999px;
-    padding: 6px 14px;
+    padding: 6px 10px 6px 14px;
     cursor: pointer;
     font: inherit;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+    font-size: 12px;
+    box-shadow: var(--shadow);
+  }
+  .jump:hover {
+    background: var(--line-strong);
   }
   .pending {
     display: flex;
@@ -2394,8 +4644,8 @@
     flex-wrap: wrap;
     gap: 12px;
     padding: 8px 14px;
-    background: #1c1c1f;
-    border-top: 1px solid #27272a;
+    background: var(--surface);
+    border-top: 1px solid var(--line);
   }
   .pending-item {
     position: relative;
@@ -2413,11 +4663,54 @@
     width: 120px;
     height: 72px;
     overflow: hidden;
-    border: 1px solid #3f3f46;
+    border: 1px solid var(--line-strong);
     border-radius: 6px;
-    background: #111214;
-    color: #e4e4e7;
+    background: var(--bg);
+    color: var(--text);
     cursor: pointer;
+  }
+  .pending-item.waiting {
+    opacity: 0.45;
+  }
+  /* The attachment in flight gets a spinner over its thumbnail. */
+  .pending-item.uploading .pending-thumb::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    margin: auto;
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    border: 3px solid rgba(255, 255, 255, 0.3);
+    border-top-color: #fff;
+    animation: spin 0.8s linear infinite;
+  }
+  .pending-item.uploading .pending-thumb {
+    filter: brightness(0.7);
+  }
+  .pending-status {
+    align-self: center;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .spinner {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    border-top-color: var(--accent);
+    animation: spin 0.8s linear infinite;
+  }
+  .send.ready {
+    color: var(--accent);
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
   .pending-thumb img,
   .pending-thumb video {
@@ -2427,14 +4720,14 @@
   }
   .pending-name {
     font-size: 11px;
-    color: #a1a1aa;
+    color: var(--muted);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .pending-caption {
     font-size: 11px;
-    color: #86efac;
+    color: var(--accent-text);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -2443,17 +4736,18 @@
     position: absolute;
     top: -6px;
     right: -6px;
-    width: 18px;
-    height: 18px;
+    width: 20px;
+    height: 20px;
+    min-width: 0;
+    min-height: 0;
     border-radius: 999px;
-    background: #3f3f46;
-    color: #e4e4e7;
-    font-size: 12px;
-    line-height: 1;
+    background: var(--raised-2);
+    color: var(--text);
+    box-shadow: 0 0 0 2px var(--surface);
   }
   .caption {
-    background: #111214;
-    border: 1px solid #3f3f46;
+    background: var(--bg);
+    border: 1px solid var(--line-strong);
     border-radius: 6px;
     padding: 8px 10px;
     color: inherit;
@@ -2469,16 +4763,17 @@
     object-fit: contain;
   }
   .quote-author {
+    grid-area: author;
     display: block;
-    font-weight: 600;
-    color: #a1a1aa;
+    font-weight: 500;
+    color: var(--accent);
   }
   .quote-thumb {
-    width: 28px;
-    height: 28px;
+    grid-area: thumb;
+    width: 42px;
+    height: 42px;
     object-fit: cover;
     border-radius: 4px;
-    flex: none;
   }
   .quote-where {
     flex: none;
@@ -2490,11 +4785,11 @@
     color: #71717a;
   }
   .quote-icon {
+    grid-area: thumb;
     font-size: 14px;
-    flex: none;
   }
   .quote-text {
-    flex: 1;
+    grid-area: text;
     min-width: 0;
     display: block;
     overflow: hidden;
@@ -2506,20 +4801,31 @@
     letter-spacing: -2px;
   }
   .ticks.read {
-    color: #38bdf8;
+    color: var(--link);
   }
   .reply-preview {
     display: flex;
-    justify-content: space-between;
     align-items: center;
-    gap: 8px;
-    padding: 6px 14px;
-    background: #1c1c1f;
-    border-top: 1px solid #27272a;
+    gap: 10px;
+    margin: 0 14px;
+    padding: 8px 8px 8px 12px;
+    background: var(--surface);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius-sm) var(--radius-sm) 0 0;
     font-size: 12px;
-    color: #a1a1aa;
+    color: var(--muted);
   }
-  .reply-preview span {
+  .reply-body {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .reply-to {
+    color: var(--accent-text);
+    font-weight: 600;
+  }
+  .reply-body span {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -2540,8 +4846,8 @@
     flex-direction: column;
     max-height: 180px;
     overflow-y: auto;
-    background: #1c1c1f;
-    border-top: 1px solid #27272a;
+    background: var(--surface);
+    border-top: 1px solid var(--line);
   }
   .mention {
     text-align: left;
@@ -2554,117 +4860,121 @@
   }
   .mention.active,
   .mention:hover {
-    background: #27272a;
+    background: var(--raised);
   }
   .composer {
     display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 14px;
-    border-top: 1px solid #27272a;
+    align-items: flex-end;
+    gap: 6px;
+    padding: 5px 16px 5px 10px;
+    min-height: 62px;
+    box-sizing: border-box;
+    background: var(--surface);
+    flex: none;
   }
   .composer > input:not(.file-input),
   .composer > textarea {
     flex: 1;
-    background: #1c1c1f;
-    border: 1px solid #3f3f46;
-    border-radius: 6px;
-    padding: 8px 10px;
+    align-self: center;
+    background: var(--raised);
+    border: 1px solid transparent;
+    border-radius: var(--radius);
+    padding: 9px 12px;
     color: inherit;
     font: inherit;
   }
   .composer > textarea {
     resize: none;
-    line-height: 1.35;
+    line-height: 1.4;
+    field-sizing: content;
+    box-sizing: border-box;
     max-height: 140px;
+  }
+  .composer > textarea::placeholder {
+    color: var(--faint);
   }
   .file-input {
     display: none;
   }
-  .attach {
-    font-size: 16px;
+  .attach,
+  .send {
+    width: 42px;
+    height: 42px;
+    margin-bottom: 5px;
+  }
+  .send {
+    flex: none;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .send:hover:not(:disabled) {
+    color: var(--accent);
+  }
+  .send:disabled {
+    color: var(--faint);
+    cursor: default;
   }
   .primary {
-    background: #2563eb;
-    color: white;
+    background: var(--accent);
+    color: var(--accent-ink);
     border: 0;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     padding: 8px 16px;
     cursor: pointer;
     font: inherit;
+    font-weight: 600;
+  }
+  .primary:hover:not(:disabled) {
+    background: var(--accent-hover);
   }
   .primary:disabled {
     opacity: 0.5;
     cursor: default;
   }
   .icon {
+    display: inline-grid;
+    place-items: center;
+    min-width: 32px;
+    min-height: 32px;
+    padding: 0;
     background: transparent;
     border: 0;
-    color: inherit;
+    border-radius: 8px;
+    color: var(--muted);
     cursor: pointer;
-    font-size: 15px;
+  }
+  .icon:hover {
+    background: var(--raised);
+    color: var(--text);
   }
   .sheet-backdrop {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.6);
+    z-index: 250;
+    background: var(--scrim);
+    backdrop-filter: blur(2px);
     display: flex;
     align-items: center;
     justify-content: center;
   }
   .sheet {
-    background: #1c1c1f;
-    border: 1px solid #3f3f46;
-    border-radius: 10px;
-    padding: 18px 20px;
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow);
+    padding: 20px 22px;
     width: min(460px, 90vw);
+    max-height: 86vh;
+    overflow-y: auto;
+    box-sizing: border-box;
     display: flex;
     flex-direction: column;
-    gap: 12px;
-  }
-  .sheet h2 {
-    margin: 0;
-    font-size: 15px;
-  }
-  .sheet label {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 12px;
-    font-size: 13px;
-  }
-  .sheet label.check {
-    justify-content: flex-start;
-  }
-  .sheet label.stack {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 4px;
-  }
-  .sheet input[type="number"],
-  .sheet input[type="text"] {
-    background: #111214;
-    border: 1px solid #3f3f46;
-    border-radius: 4px;
-    padding: 4px 8px;
-    color: inherit;
-    font: inherit;
-  }
-  .sheet input[type="number"] {
-    width: 100px;
-  }
-  .actions {
-    display: flex;
-    gap: 8px;
-    justify-content: flex-end;
-  }
-  .actions button:not(.primary) {
-    background: #3f3f46;
-    color: inherit;
-    border: 0;
-    border-radius: 6px;
-    padding: 8px 16px;
-    cursor: pointer;
-    font: inherit;
+    gap: 14px;
   }
 </style>

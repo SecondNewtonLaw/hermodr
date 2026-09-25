@@ -115,6 +115,10 @@ pub struct ChatSummary {
     pub last_from_me: bool,
     /// Resolved name of the last message's sender, when known.
     pub last_sender_name: Option<String>,
+    /// The last message's sender, for when no name is known.
+    pub last_sender: String,
+    /// What the last message carried (`image`, `video`, …), if not only text.
+    pub last_media_kind: Option<String>,
     pub message_count: i64,
     /// Incoming messages the user has not seen yet.
     pub unread_count: i64,
@@ -134,6 +138,87 @@ fn status_rank(s: &str) -> i32 {
         "read" => 3,
         _ => -1,
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Reaction {
+    pub target: String,
+    pub sender: String,
+    pub emoji: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PollVote {
+    pub voter: String,
+    pub options: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Poll {
+    pub id: String,
+    pub name: String,
+    pub options: Vec<String>,
+    /// More than one option may be chosen.
+    pub multi: bool,
+    pub votes: Vec<PollVote>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EventResponse {
+    pub responder: String,
+    /// `going`, `not_going` or `maybe`.
+    pub response: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Event {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub start: Option<i64>,
+    pub end: Option<i64>,
+    pub location: Option<String>,
+    pub link: Option<String>,
+    pub canceled: bool,
+    pub responses: Vec<EventResponse>,
+}
+
+/// What a poll or event needs to encrypt or open its votes and RSVPs.
+#[derive(Debug, Clone)]
+pub struct Secretive {
+    pub creator: String,
+    pub secret: Vec<u8>,
+    pub options: Vec<String>,
+}
+
+/// An event as it arrives or is created, before any responses.
+#[derive(Debug, Clone, Default)]
+pub struct NewEvent {
+    pub name: String,
+    pub description: Option<String>,
+    pub start: Option<i64>,
+    pub end: Option<i64>,
+    pub location: Option<String>,
+    pub link: Option<String>,
+    pub canceled: bool,
+}
+
+/// Per-message state kept beside the messages of one chat.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatMarks {
+    pub reactions: Vec<Reaction>,
+    pub starred: Vec<String>,
+    pub pinned: Option<String>,
+    pub polls: Vec<Poll>,
+    pub events: Vec<Event>,
+    /// View-once messages and whether each was opened (or sent by us, which counts).
+    pub view_once: Vec<ViewOnce>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ViewOnce {
+    pub id: String,
+    pub opened: bool,
 }
 
 /// SQLite-backed message store.
@@ -224,6 +309,33 @@ impl MessageStore {
 
         // Chat pins, mirrored from the account so they match the phone.
         conn.execute("CREATE TABLE IF NOT EXISTS pins (jid TEXT PRIMARY KEY)", [])?;
+        // Per-message state that is not part of the message itself.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS reactions (
+                 chat TEXT NOT NULL, target TEXT NOT NULL, sender TEXT NOT NULL,
+                 emoji TEXT NOT NULL, PRIMARY KEY (chat, target, sender));
+             CREATE TABLE IF NOT EXISTS stars (
+                 chat TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY (chat, id));
+             CREATE TABLE IF NOT EXISTS message_pins (chat TEXT PRIMARY KEY, id TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS polls (
+                 chat TEXT NOT NULL, id TEXT NOT NULL, creator TEXT NOT NULL,
+                 name TEXT NOT NULL, options TEXT NOT NULL, multi INTEGER NOT NULL,
+                 secret BLOB, PRIMARY KEY (chat, id));
+             CREATE TABLE IF NOT EXISTS poll_votes (
+                 chat TEXT NOT NULL, poll TEXT NOT NULL, voter TEXT NOT NULL,
+                 options TEXT NOT NULL, PRIMARY KEY (chat, poll, voter));
+             CREATE TABLE IF NOT EXISTS events (
+                 chat TEXT NOT NULL, id TEXT NOT NULL, creator TEXT NOT NULL,
+                 name TEXT NOT NULL, description TEXT, start_at INTEGER, end_at INTEGER,
+                 location TEXT, link TEXT, canceled INTEGER NOT NULL DEFAULT 0,
+                 secret BLOB, PRIMARY KEY (chat, id));
+             CREATE TABLE IF NOT EXISTS event_responses (
+                 chat TEXT NOT NULL, event TEXT NOT NULL, responder TEXT NOT NULL,
+                 response TEXT NOT NULL, PRIMARY KEY (chat, event, responder));
+             CREATE TABLE IF NOT EXISTS view_once (
+                 chat TEXT NOT NULL, id TEXT NOT NULL, opened INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (chat, id));",
+        )?;
 
         // Per chat overrides. Absent means the global setting applies.
         conn.execute(
@@ -607,6 +719,348 @@ impl MessageStore {
         )?)
     }
 
+    /// Records a reaction; an empty emoji removes the sender's reaction.
+    pub fn set_reaction(&self, chat: &str, target: &str, sender: &str, emoji: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        if emoji.is_empty() {
+            conn.execute(
+                "DELETE FROM reactions WHERE chat = ?1 AND target = ?2 AND sender = ?3",
+                params![chat, target, sender],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT INTO reactions (chat, target, sender, emoji) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(chat, target, sender) DO UPDATE SET emoji = excluded.emoji",
+                params![chat, target, sender, emoji],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn set_starred(&self, chat: &str, id: &str, starred: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let sql = if starred {
+            "INSERT OR IGNORE INTO stars (chat, id) VALUES (?1, ?2)"
+        } else {
+            "DELETE FROM stars WHERE chat = ?1 AND id = ?2"
+        };
+        conn.execute(sql, params![chat, id])?;
+        Ok(())
+    }
+
+    /// The chat's pinned message, or none.
+    // One pin per chat; WhatsApp allows three, add a rank column if needed.
+    pub fn set_message_pin(&self, chat: &str, id: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        match id {
+            Some(id) => conn.execute(
+                "INSERT INTO message_pins (chat, id) VALUES (?1, ?2)
+                 ON CONFLICT(chat) DO UPDATE SET id = excluded.id",
+                params![chat, id],
+            )?,
+            None => conn.execute("DELETE FROM message_pins WHERE chat = ?1", params![chat])?,
+        };
+        Ok(())
+    }
+
+    /// Reactions, stars and the pin for one chat.
+    pub fn marks(&self, chat: &str) -> Result<ChatMarks> {
+        let conn = self.conn.lock().unwrap();
+        let reactions = conn
+            .prepare("SELECT target, sender, emoji FROM reactions WHERE chat = ?1")?
+            .query_map(params![chat], |r| {
+                Ok(Reaction { target: r.get(0)?, sender: r.get(1)?, emoji: r.get(2)? })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let starred = conn
+            .prepare("SELECT id FROM stars WHERE chat = ?1")?
+            .query_map(params![chat], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let pinned = conn
+            .query_row("SELECT id FROM message_pins WHERE chat = ?1", params![chat], |r| r.get(0))
+            .ok();
+        let json = |s: String| serde_json::from_str::<Vec<String>>(&s).unwrap_or_default();
+
+        let mut polls: Vec<Poll> = conn
+            .prepare("SELECT id, name, options, multi FROM polls WHERE chat = ?1")?
+            .query_map(params![chat], |r| {
+                Ok(Poll {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    options: json(r.get(2)?),
+                    multi: r.get::<_, i32>(3)? != 0,
+                    votes: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let votes: Vec<(String, PollVote)> = conn
+            .prepare("SELECT poll, voter, options FROM poll_votes WHERE chat = ?1")?
+            .query_map(params![chat], |r| {
+                Ok((r.get(0)?, PollVote { voter: r.get(1)?, options: json(r.get(2)?) }))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        for (poll, vote) in votes {
+            if let Some(p) = polls.iter_mut().find(|p| p.id == poll) {
+                p.votes.push(vote);
+            }
+        }
+
+        let mut events: Vec<Event> = conn
+            .prepare(
+                "SELECT id, name, description, start_at, end_at, location, link, canceled
+                 FROM events WHERE chat = ?1",
+            )?
+            .query_map(params![chat], |r| {
+                Ok(Event {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    description: r.get(2)?,
+                    start: r.get(3)?,
+                    end: r.get(4)?,
+                    location: r.get(5)?,
+                    link: r.get(6)?,
+                    canceled: r.get::<_, i32>(7)? != 0,
+                    responses: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let responses: Vec<(String, EventResponse)> = conn
+            .prepare("SELECT event, responder, response FROM event_responses WHERE chat = ?1")?
+            .query_map(params![chat], |r| {
+                Ok((r.get(0)?, EventResponse { responder: r.get(1)?, response: r.get(2)? }))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        for (event, response) in responses {
+            if let Some(e) = events.iter_mut().find(|e| e.id == event) {
+                e.responses.push(response);
+            }
+        }
+
+        let view_once = conn
+            .prepare("SELECT id, opened FROM view_once WHERE chat = ?1")?
+            .query_map(params![chat], |r| Ok(ViewOnce { id: r.get(0)?, opened: r.get::<_, i32>(1)? != 0 }))?
+            .collect::<rusqlite::Result<_>>()?;
+
+        Ok(ChatMarks { reactions, starred, pinned, polls, events, view_once })
+    }
+
+    /// Records a view-once message; `opened` only ever moves from false to true.
+    pub fn set_view_once(&self, chat: &str, id: &str, opened: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO view_once (chat, id, opened) VALUES (?1, ?2, ?3)
+             ON CONFLICT(chat, id) DO UPDATE SET opened = MAX(opened, excluded.opened)",
+            params![chat, id, opened as i32],
+        )?;
+        Ok(())
+    }
+
+    /// Opens a view-once message: marks it and forgets its file, returning the path to delete.
+    pub fn open_view_once(&self, chat: &str, id: &str) -> Result<Option<String>> {
+        self.set_view_once(chat, id, true)?;
+        let conn = self.conn.lock().unwrap();
+        let path: Option<String> = conn
+            .query_row(
+                "SELECT media_path FROM messages WHERE chat = ?1 AND id = ?2",
+                params![chat, id],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        conn.execute(
+            "UPDATE messages SET media_path = NULL, media_thumb = NULL, media_ref = NULL
+             WHERE chat = ?1 AND id = ?2",
+            params![chat, id],
+        )?;
+        Ok(path)
+    }
+
+    /// Records a poll the first time it is seen; later copies change nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_poll(
+        &self,
+        chat: &str,
+        id: &str,
+        creator: &str,
+        name: &str,
+        options: &[String],
+        multi: bool,
+        secret: Option<&[u8]>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO polls (chat, id, creator, name, options, multi, secret)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![chat, id, creator, name, serde_json::to_string(options)?, multi as i32, secret],
+        )?;
+        Ok(())
+    }
+
+    pub fn poll_secret(&self, chat: &str, id: &str) -> Result<Option<Secretive>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT creator, secret, options FROM polls WHERE chat = ?1 AND id = ?2",
+                params![chat, id],
+                |r| {
+                    Ok(r.get::<_, Option<Vec<u8>>>(1)?.map(|secret| Secretive {
+                        creator: r.get(0).unwrap_or_default(),
+                        secret,
+                        options: serde_json::from_str(&r.get::<_, String>(2).unwrap_or_default())
+                            .unwrap_or_default(),
+                    }))
+                },
+            )
+            .ok()
+            .flatten())
+    }
+
+    /// A voter's current choice; an empty list withdraws their vote.
+    pub fn set_poll_vote(&self, chat: &str, poll: &str, voter: &str, options: &[String]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO poll_votes (chat, poll, voter, options) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(chat, poll, voter) DO UPDATE SET options = excluded.options",
+            params![chat, poll, voter, serde_json::to_string(options)?],
+        )?;
+        Ok(())
+    }
+
+    /// Records an event, or updates it when its creator edits or cancels it.
+    pub fn save_event(
+        &self,
+        chat: &str,
+        id: &str,
+        creator: &str,
+        event: &NewEvent,
+        secret: Option<&[u8]>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO events
+                 (chat, id, creator, name, description, start_at, end_at, location, link, canceled, secret)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(chat, id) DO UPDATE SET
+                 name = excluded.name, description = excluded.description,
+                 start_at = excluded.start_at, end_at = excluded.end_at, location = excluded.location,
+                 link = excluded.link, canceled = excluded.canceled,
+                 secret = COALESCE(events.secret, excluded.secret)",
+            params![
+                chat,
+                id,
+                creator,
+                event.name,
+                event.description,
+                event.start,
+                event.end,
+                event.location,
+                event.link,
+                event.canceled as i32,
+                secret
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn event_secret(&self, chat: &str, id: &str) -> Result<Option<Secretive>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT creator, secret FROM events WHERE chat = ?1 AND id = ?2",
+                params![chat, id],
+                |r| {
+                    Ok(r.get::<_, Option<Vec<u8>>>(1)?.map(|secret| Secretive {
+                        creator: r.get(0).unwrap_or_default(),
+                        secret,
+                        options: Vec::new(),
+                    }))
+                },
+            )
+            .ok()
+            .flatten())
+    }
+
+    pub fn set_event_response(&self, chat: &str, event: &str, responder: &str, response: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO event_responses (chat, event, responder, response) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(chat, event, responder) DO UPDATE SET response = excluded.response",
+            params![chat, event, responder, response],
+        )?;
+        Ok(())
+    }
+
+    /// Downloaded files of one media kind, newest first, each file once.
+    pub fn recent_media(&self, kind: &str, limit: u32) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn
+            .prepare(
+                "SELECT media_path FROM messages
+                 WHERE media_kind = ?1 AND media_path IS NOT NULL AND revoked = 0
+                 GROUP BY media_path ORDER BY MAX(timestamp) DESC LIMIT ?2",
+            )?
+            .query_map(params![kind, limit], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Removes one message, as "delete for me" does.
+    pub fn delete_message(&self, chat: &str, id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM messages WHERE chat = ?1 AND id = ?2", params![chat, id])?;
+        conn.execute("DELETE FROM reactions WHERE chat = ?1 AND target = ?2", params![chat, id])?;
+        conn.execute("DELETE FROM stars WHERE chat = ?1 AND id = ?2", params![chat, id])?;
+        conn.execute("DELETE FROM poll_votes WHERE chat = ?1 AND poll = ?2", params![chat, id])?;
+        conn.execute("DELETE FROM event_responses WHERE chat = ?1 AND event = ?2", params![chat, id])?;
+        conn.execute("DELETE FROM view_once WHERE chat = ?1 AND id = ?2", params![chat, id])?;
+        Ok(())
+    }
+
+    /// Moves the media files this store references out of `from` into `to`,
+    /// rewriting the stored paths, and returns how many paths were rewritten.
+    ///
+    /// Only referenced files move, so `from` may be a folder shared with other
+    /// programs. A reference whose file is gone is also relinked when a file of
+    /// the same name is found in `from` or `to`.
+    pub fn relocate_media(&self, from: &[&Path], to: &Path) -> Result<usize> {
+        const COLUMNS: [&str; 4] = ["media_path", "media_thumb", "reply_to_thumb", "preview_thumb"];
+        let conn = self.conn.lock().unwrap();
+        let mut rewritten = 0;
+        for column in COLUMNS {
+            let paths: Vec<String> = conn
+                .prepare(&format!("SELECT DISTINCT {column} FROM messages WHERE {column} IS NOT NULL"))?
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for old in paths {
+                let old_path = Path::new(&old);
+                let Some(name) = old_path.file_name() else { continue };
+                let in_from = from.iter().any(|dir| old_path.starts_with(dir));
+                if old_path.starts_with(to) || (!in_from && old_path.exists()) {
+                    continue;
+                }
+                let dest = to.join(name);
+                if !dest.exists() {
+                    let source = std::iter::once(old_path.to_path_buf())
+                        .filter(|_| in_from)
+                        .chain(from.iter().map(|dir| dir.join(name)))
+                        .find(|p| p.is_file());
+                    let Some(source) = source else { continue };
+                    std::fs::create_dir_all(to)?;
+                    if std::fs::rename(&source, &dest).is_err() {
+                        // A different filesystem cannot be renamed across.
+                        std::fs::copy(&source, &dest)?;
+                        let _ = std::fs::remove_file(&source);
+                    }
+                }
+                rewritten += conn.execute(
+                    &format!("UPDATE messages SET {column} = ?2 WHERE {column} = ?1"),
+                    params![old, dest.to_string_lossy()],
+                )?;
+            }
+        }
+        Ok(rewritten)
+    }
+
     /// Unread messages in `chat` that mention us, oldest first.
     pub fn unread_mentions(&self, chat: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
@@ -718,9 +1172,9 @@ impl MessageStore {
         for row in rows {
             let (chat, last_message_at, message_count, display_name, unread_count, mention_count, pinned) = row?;
             // The preview is fetched separately so the aggregate query stays simple.
-            let (last_text, last_from_me, last_sender_name) = conn
+            let (last_text, last_from_me, last_sender_name, last_sender, last_media_kind) = conn
                 .query_row(
-                    "SELECT m.text, m.from_me, n.name
+                    "SELECT m.text, m.from_me, n.name, m.sender, m.media_kind
                      FROM messages m
                      LEFT JOIN names n ON n.jid = m.sender
                      WHERE m.chat = ?1
@@ -731,6 +1185,8 @@ impl MessageStore {
                             r.get::<_, String>(0)?,
                             r.get::<_, i32>(1)? != 0,
                             r.get::<_, Option<String>>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, Option<String>>(4)?,
                         ))
                     },
                 )
@@ -742,6 +1198,8 @@ impl MessageStore {
                 last_text,
                 last_from_me,
                 last_sender_name,
+                last_sender,
+                last_media_kind,
                 message_count,
                 unread_count,
                 mention_count,
@@ -1089,6 +1547,31 @@ mod tests {
         let got = &s.messages_for("a@s", 1).unwrap()[0];
         assert_eq!(got.media_kind.as_deref(), Some("image"));
         assert_eq!(got.reply_to_text.as_deref(), Some("earlier"));
+    }
+
+    #[test]
+    fn relocate_media_moves_only_referenced_files() {
+        let root = std::env::temp_dir().join(format!("hermodr-relocate-{}", std::process::id()));
+        let (shared, to) = (root.join("shared"), root.join("app"));
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("1.jpg"), b"ours").unwrap();
+        std::fs::write(shared.join("other.jpg"), b"not ours").unwrap();
+
+        let s = store(Retention::unlimited());
+        let mut m = msg("a@s", "1", 0, "");
+        m.media_path = Some(shared.join("1.jpg").to_string_lossy().into());
+        m.media_thumb = Some(shared.join("1.jpg").to_string_lossy().into());
+        s.upsert(&m).unwrap();
+
+        assert_eq!(s.relocate_media(&[&shared], &to).unwrap(), 2);
+        let got = s.message("a@s", "1").unwrap();
+        assert_eq!(got.media_path.as_deref(), Some(&*to.join("1.jpg").to_string_lossy()));
+        assert_eq!(got.media_thumb, got.media_path);
+        assert_eq!(std::fs::read(to.join("1.jpg")).unwrap(), b"ours");
+        assert!(shared.join("other.jpg").exists());
+        // Idempotent: a second run finds nothing to do.
+        assert_eq!(s.relocate_media(&[&shared], &to).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

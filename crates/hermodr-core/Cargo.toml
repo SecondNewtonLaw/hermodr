@@ -24,3 +24,7 @@ ureq = "3"
 # file finishes downloading.
 buffa = "0.9"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+
+# Media Foundation decodes the first frame of outgoing videos for their preview.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_UI_Shell"] }

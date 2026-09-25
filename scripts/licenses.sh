@@ -59,6 +59,19 @@ for lic, pkgs in npm.items():
 for name, ver, lic in sorted(rows):
     lines.append(f"| {name} | {ver} | {lic} |")
 
+# Hand-written because it is not a package: the flag font ships inside the
+# country-flag-emoji-polyfill package and its glyphs are Twemoji artwork.
+lines += [
+    "",
+    "## Bundled artwork",
+    "",
+    "Country flags on Windows are drawn with the \"Twemoji Country Flags\" font from",
+    "country-flag-emoji-polyfill (TalkJS). Its glyphs are Twemoji graphics,",
+    "Copyright Twitter, Inc and other contributors, used unmodified under",
+    "CC-BY 4.0 (https://creativecommons.org/licenses/by/4.0/).",
+    "Source: https://github.com/twitter/twemoji",
+]
+
 lines += [
     "",
     "## Bundled C libraries",

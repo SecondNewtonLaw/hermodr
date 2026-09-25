@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-respond-event"
+description = "Enables the respond_event command without any pre-configured scope."
+commands.allow = ["respond_event"]
+
+[[permission]]
+identifier = "deny-respond-event"
+description = "Denies the respond_event command without any pre-configured scope."
+commands.deny = ["respond_event"]
