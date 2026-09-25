@@ -3481,6 +3481,7 @@
     chat={selectedChat}
     title={chats.find((c) => c.chat === selectedChat) ? chatLabel(chats.find((c) => c.chat === selectedChat)!) : displayName(null, selectedChat)}
     globalAutoDownload={settings.auto_download_media}
+    picture={avatars[selectedChat] ?? null}
     onchange={async (retention) => {
       loadOnScroll = retention.on_demand;
       await reloadMessages();
