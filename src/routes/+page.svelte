@@ -824,6 +824,7 @@
   async function sendPending() {
     if (!selectedChat || pending.length === 0) return;
     const items = [...pending];
+    const reply = replyingTo;
     try {
       for (const item of items) {
         const buffer = new Uint8Array(await item.file.arrayBuffer());
@@ -838,9 +839,13 @@
           name: item.file.name,
           data: btoa(binary),
           caption: item.caption.trim() || null,
+          replyToId: reply?.id ?? null,
+          replyToSender: reply?.sender ?? null,
+          replyToText: reply?.text ?? null,
         });
       }
       clearPending();
+      replyingTo = null;
       await reloadMessages();
       await refreshChats();
       scrollToBottom();

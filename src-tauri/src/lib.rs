@@ -429,11 +429,18 @@ async fn send_media(
     name: String,
     data: String,
     caption: Option<String>,
+    reply_to_id: Option<String>,
+    reply_to_sender: Option<String>,
+    reply_to_text: Option<String>,
 ) -> Result<(), String> {
     let bytes = BASE64.decode(data.as_bytes()).map_err(|e| e.to_string())?;
+    let reply = match (reply_to_id, reply_to_sender, reply_to_text) {
+        (Some(id), Some(sender), Some(text)) => Some((id, sender, text)),
+        _ => None,
+    };
     let service = state.service()?;
     service
-        .send_media(&chat, &name, bytes, caption)
+        .send_media(&chat, &name, bytes, caption, reply)
         .await
         .map_err(|e| e.to_string())
 }

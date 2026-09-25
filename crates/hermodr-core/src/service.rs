@@ -1121,6 +1121,7 @@ impl Service {
         file_name: &str,
         bytes: Vec<u8>,
         caption: Option<String>,
+        reply: Option<(String, String, String)>,
     ) -> Result<()> {
         let to: Jid = chat.parse()?;
         let file_name = file_name.to_string();
@@ -1142,12 +1143,27 @@ impl Service {
         let upload = self.client.upload(bytes.clone(), media_type, Default::default()).await?;
 
         let mimetype = mime_for(&extension).map(str::to_string);
+
+        // An attachment can carry a quote, the same as a text reply.
+        let context = match &reply {
+            Some((id, sender, text)) => {
+                use whatsapp_rust::wacore::proto_helpers::build_quote_context_with_info;
+                let sender: Jid = sender.parse::<Jid>()?.to_non_ad();
+                let quoted = wa::Message::text(text.clone());
+                Some(Box::new(build_quote_context_with_info(
+                    id, &sender, &to, &to, &quoted,
+                )))
+            }
+            None => None,
+        };
+
         let message = match kind {
             "image" => media::image_message(
                 upload,
                 ImageOptions {
                     caption: caption.clone(),
                     mimetype,
+                    context_info: context,
                     ..Default::default()
                 },
             ),
@@ -1156,6 +1172,7 @@ impl Service {
                 VideoOptions {
                     caption: caption.clone(),
                     mimetype,
+                    context_info: context,
                     ..Default::default()
                 },
             ),
@@ -1166,6 +1183,7 @@ impl Service {
                     // An ogg/opus attachment is a voice note, which is how
                     // WhatsApp records and replays them.
                     ptt: Some(extension == "ogg"),
+                    context_info: context,
                     ..Default::default()
                 },
             ),
@@ -1175,6 +1193,7 @@ impl Service {
                     file_name: Some(file_name.clone()),
                     caption: caption.clone(),
                     mimetype,
+                    context_info: context,
                     ..Default::default()
                 },
             ),
@@ -1204,9 +1223,9 @@ impl Service {
             text: caption.unwrap_or_default(),
             media_kind: Some(kind.to_string()),
             media_path: stored_path,
-            reply_to_id: None,
-            reply_to_text: None,
-            reply_to_sender: None,
+            reply_to_id: reply.as_ref().map(|(id, _, _)| id.clone()),
+            reply_to_text: reply.as_ref().map(|(_, _, text)| text.clone()),
+            reply_to_sender: reply.as_ref().map(|(_, sender, _)| sender.clone()),
             read: false,
             revoked: false,
             mentioned: false,
