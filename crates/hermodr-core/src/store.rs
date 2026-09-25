@@ -411,7 +411,10 @@ impl MessageStore {
                  read_at INTEGER, played_at INTEGER, PRIMARY KEY (id, recipient));
              CREATE TABLE IF NOT EXISTS chat_retention (
                  jid TEXT PRIMARY KEY, max_age_hours INTEGER, max_messages INTEGER,
-                 on_demand INTEGER NOT NULL DEFAULT 1);",
+                 on_demand INTEGER NOT NULL DEFAULT 1);
+             CREATE TABLE IF NOT EXISTS lid_pn (
+                 lid TEXT PRIMARY KEY, pn TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS lid_pn_by_pn ON lid_pn (pn);",
         )?;
 
         // Per chat overrides. Absent means the global setting applies.
@@ -656,6 +659,30 @@ impl MessageStore {
             })
             .ok();
         Ok(name)
+    }
+
+    /// Remembers that a LID user and a phone number are the same person.
+    ///
+    /// Kept here because the session's own mapping is lost when a device re-pairs.
+    pub fn set_lid_pn(&self, lid: &str, pn: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO lid_pn (lid, pn) VALUES (?1, ?2) ON CONFLICT(lid) DO UPDATE SET pn = excluded.pn",
+            params![lid, pn],
+        )?;
+        Ok(())
+    }
+
+    /// `(lid, pn)` user parts for either form of a user part.
+    pub fn lid_pn(&self, user: &str) -> Result<Option<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT lid, pn FROM lid_pn WHERE lid = ?1 OR pn = ?1 LIMIT 1",
+                params![user],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok())
     }
 
     /// Messages in a chat, newest first.

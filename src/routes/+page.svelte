@@ -177,6 +177,8 @@
   let connected = $state(false);
   let connecting = $state(false);
   let started = $state(false);
+  /** True while a newly opened chat's messages load, so the old ones fade out. */
+  let switching = $state(false);
   let qrSvg = $state<string | null>(null);
   let chats: ChatSummary[] = $state([]);
   let selectedChat = $state<string | null>(null);
@@ -475,7 +477,10 @@
   }
 
   async function openChat(chat: string, jumpToMention = false, label: string | null = null) {
-    if (selectedChat !== chat) stopTyping();
+    if (selectedChat !== chat) {
+      stopTyping();
+      switching = true;
+    }
     selectedChat = chat;
     // One-to-one typing only arrives for contacts we are subscribed to.
     if (!chat.endsWith("@g.us")) invoke("watch_presence", { jid: chat }).catch(() => {});
@@ -493,22 +498,27 @@
     draft = drafts[chat] ?? "";
     showGroupInfo = false;
     groupInfo = null;
-    // Captured before the chat is marked read, since that clears them.
-    try {
-      mentionQueue = await invoke<string[]>("unread_mentions", { chat });
-    } catch {
-      mentionQueue = [];
-    }
-    mentionCursor = 0;
     try {
       messageLimit = PAGE;
-      messages = await invoke<StoredMessage[]>("messages", { chat, limit: messageLimit });
+      // Mentions are captured before the chat is marked read, since that clears them.
+      const [mentions, loaded] = await Promise.all([
+        invoke<string[]>("unread_mentions", { chat }).catch(() => [] as string[]),
+        invoke<StoredMessage[]>("messages", { chat, limit: messageLimit }),
+      ]);
+      // A quicker click on another chat has already taken over.
+      if (selectedChat !== chat) return;
+      mentionQueue = mentions;
+      mentionCursor = 0;
+      messages = loaded;
       await loadMarks();
+      scrollToBottom();
+      await tick();
+      switching = false;
       // Opening a conversation is what marks it seen.
       await invoke("mark_read", { chat });
       await refreshChats();
-      scrollToBottom();
     } catch (e) {
+      switching = false;
       error = String(e);
     }
     // Group members power the @ autocomplete; a one-to-one chat returns none.
@@ -2659,6 +2669,7 @@
 
         <div
           class="messages"
+          class:switching
           class:group={selectedChat.endsWith("@g.us")}
           bind:this={scroller}
           onscroll={onScroll}>
@@ -2824,6 +2835,24 @@
                       src={convertFileSrc((message.media_path ?? message.media_thumb)!)}
                       alt={message.text}
                     />
+                    {#if !message.media_path}
+                      <span class="media-overlay">
+                        <span class="media-fetch">
+                          {#if downloading[message.id]}<span class="spinner"></span>{:else}<Icon name="download" size={22} />{/if}
+                        </span>
+                      </span>
+                    {/if}
+                  </button>
+                {:else if ["image", "video", "gif"].includes(message.media_kind ?? "") && !message.media_path}
+                  <button
+                    class="media-stub"
+                    title="Download"
+                    disabled={!!downloading[message.id]}
+                    onclick={() => downloadMedia(message)}>
+                    <span class="media-fetch">
+                      {#if downloading[message.id]}<span class="spinner"></span>{:else}<Icon name="download" size={22} />{/if}
+                    </span>
+                    <span>{message.media_kind === "image" ? "Photo" : message.media_kind === "gif" ? "GIF" : "Video"}</span>
                   </button>
                 {:else if (message.media_kind === "video" || message.media_kind === "gif") &&
                 (message.media_path || message.media_thumb)}
@@ -2902,7 +2931,7 @@
                   {@render formatted(caption, message.from_me)}
                 {/if}
 
-                {#if message.media_kind && !message.media_path && !viewOnce && !["poll", "event", "audio", "sticker"].includes(message.media_kind)}
+                {#if message.media_kind && !message.media_path && !viewOnce && !["poll", "event", "audio", "sticker", "image", "video", "gif"].includes(message.media_kind)}
                   <button class="download" onclick={() => downloadMedia(message)}>
                     <Icon name="download" size={14} />
                     Download {message.media_kind}
@@ -4739,6 +4768,21 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
+    transition:
+      opacity 0.22s ease,
+      transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .messages.switching {
+    opacity: 0;
+    transform: translateY(8px);
+    transition-duration: 0.08s;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .messages,
+    .messages.switching {
+      transition: none;
+      transform: none;
+    }
   }
   .messages > .bubble {
     margin-left: var(--pad-l);
@@ -5134,6 +5178,37 @@
     font-size: 28px;
     text-shadow: 0 1px 6px rgba(0, 0, 0, 0.8);
     pointer-events: none;
+  }
+  .media-fetch {
+    display: grid;
+    place-items: center;
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    background: var(--scrim);
+    color: #fff;
+    font-size: 0;
+    text-shadow: none;
+  }
+  .media-stub {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 260px;
+    max-width: 100%;
+    aspect-ratio: 4 / 3;
+    border: 0;
+    border-radius: 8px;
+    background: linear-gradient(135deg, var(--raised), var(--raised-2));
+    color: var(--muted);
+    font: inherit;
+    font-size: 12.5px;
+    cursor: pointer;
+  }
+  .media-stub:hover .media-fetch {
+    background: var(--accent);
   }
   .download {
     align-self: flex-start;

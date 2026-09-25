@@ -70,6 +70,27 @@ fn recall_allowed(chat: &str) -> bool {
 /// its recent days, telling the phone older history will be asked for on
 /// demand (a reply to something older fetches that chat's past). Only read at
 /// pairing; an existing link keeps what it was paired with.
+/// Stores the LID and phone forms of one sender when a message carries both.
+fn remember_lid_pn(store: &MessageStore, sender: &Jid, alt: Option<&Jid>) {
+    let Some(alt) = alt else { return };
+    let (lid, pn) = match (sender.is_lid(), alt.is_lid()) {
+        (true, false) => (sender, alt),
+        (false, true) => (alt, sender),
+        _ => return,
+    };
+    let _ = store.set_lid_pn(&lid.user, &pn.user);
+}
+
+/// The other address form of a bare user JID, from the session or our own record of it.
+async fn other_form(client: &Client, store: &MessageStore, bare: &Jid) -> Option<(String, String)> {
+    if let Ok(Some(entry)) = client.get_lid_pn_entry(bare).await {
+        let (lid, pn) = (entry.lid.to_string(), entry.phone_number.to_string());
+        let _ = store.set_lid_pn(&lid, &pn);
+        return Some((lid, pn));
+    }
+    store.lid_pn(&bare.user).ok().flatten()
+}
+
 fn pairing_props(full_history: bool) -> whatsapp_rust::wacore::store::DevicePropsOverride {
     use wa::device_props::{HistorySyncConfig, PlatformType};
     let props = whatsapp_rust::wacore::store::DevicePropsOverride::new()
@@ -642,6 +663,11 @@ impl Service {
                                     // match on their own. The source carries
                                     // the other form; copy the name across so
                                     // the saved one is what gets shown.
+                                    remember_lid_pn(
+                                        &store,
+                                        &inbound.info.source.sender,
+                                        inbound.info.source.sender_alt.as_ref(),
+                                    );
                                     if let Some(alt) =
                                         inbound.info.source.sender_alt.as_ref().map(|j| j.to_string())
                                     {
@@ -1361,6 +1387,7 @@ impl Service {
             if !seen.insert(mention.clone()) {
                 continue;
             }
+            remember_lid_pn(&self.store, &member.jid, member.phone_number.as_ref().or(member.lid.as_ref()));
             let candidates = [
                 member.phone_number.as_ref(),
                 member.lid.as_ref(),
@@ -1617,13 +1644,13 @@ impl Service {
             let mut name = self.store.name_for(&key).ok().flatten();
             let mut number = bare.is_pn().then(|| bare.user.to_string());
             if name.as_deref().is_none_or(numeric) {
-                if let Ok(Some(entry)) = self.client.get_lid_pn_entry(&bare).await {
-                    number = Some(entry.phone_number.to_string());
+                if let Some((lid, pn)) = other_form(&self.client, &self.store, &bare).await {
                     let other = if bare.is_lid() {
-                        format!("{}@s.whatsapp.net", entry.phone_number)
+                        format!("{pn}@s.whatsapp.net")
                     } else {
-                        format!("{}@lid", entry.lid)
+                        format!("{lid}@lid")
                     };
+                    number = Some(pn);
                     if let Some(found) = self.store.name_for(&other).ok().flatten() {
                         if !numeric(&found) {
                             name = Some(found);
@@ -1714,7 +1741,7 @@ impl Service {
         profile.number = if bare.is_pn() {
             Some(bare.user.to_string())
         } else {
-            self.client.get_lid_pn_entry(&bare).await.ok().flatten().map(|e| e.phone_number.to_string())
+            other_form(&self.client, &self.store, &bare).await.map(|(_, pn)| pn)
         };
         if let Ok(infos) = self.client.contacts().get_user_info(std::slice::from_ref(&bare)).await {
             if let Some(info) = infos.into_values().next() {
