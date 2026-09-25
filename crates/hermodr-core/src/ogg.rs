@@ -18,8 +18,10 @@ fn vint(data: &[u8], at: usize, keep_marker: bool) -> Option<(u64, usize, bool)>
     if len > 8 || at + len > data.len() {
         return None;
     }
-    let mut value = if keep_marker { first as u64 } else { (first & (0xFF >> len)) as u64 };
-    let mut all_ones = value == (0xFF >> len) as u64;
+    // `len` is at most 8, where the mask is zero; a u8 shift by 8 would overflow.
+    let mask = (0xFFu16 >> len) as u8;
+    let mut value = if keep_marker { first as u64 } else { (first & mask) as u64 };
+    let mut all_ones = value == mask as u64;
     for &b in &data[at + 1..at + len] {
         value = (value << 8) | b as u64;
         all_ones &= b == 0xFF;
@@ -125,19 +127,41 @@ impl OggWriter {
     }
 }
 
-/// Converts a WebM/Opus recording to Ogg/Opus. `None` if it holds no Opus audio.
-pub fn webm_to_ogg(webm: &[u8]) -> Option<Vec<u8>> {
-    let (head, packets) = demux_webm(webm)?;
-    if packets.is_empty() {
-        return None;
+/// Groups packets into pages whose lacing tables fit Ogg's 255-segment count.
+/// A packet of `n` bytes takes `n / 255 + 1` lacing entries.
+fn page_chunks(packets: &[Vec<u8>]) -> anyhow::Result<Vec<Vec<&[u8]>>> {
+    let mut chunks: Vec<Vec<&[u8]>> = Vec::new();
+    let mut current: Vec<&[u8]> = Vec::new();
+    let mut segments = 0usize;
+    for packet in packets {
+        let need = packet.len() / 255 + 1;
+        if need > 255 {
+            anyhow::bail!("an Opus packet is larger than one Ogg page can hold");
+        }
+        if segments + need > 255 {
+            chunks.push(std::mem::take(&mut current));
+            segments = 0;
+        }
+        current.push(packet);
+        segments += need;
     }
-    let head = head.filter(|h| h.starts_with(b"OpusHead")).unwrap_or_else(|| {
-        let mut h = b"OpusHead\x01\x01".to_vec();
-        h.extend_from_slice(&312u16.to_le_bytes());
-        h.extend_from_slice(&48_000u32.to_le_bytes());
-        h.extend_from_slice(&[0, 0, 0]);
-        h
-    });
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    Ok(chunks)
+}
+
+/// Converts a WebM/Opus recording to Ogg/Opus. Errors if the file holds no
+/// Opus audio, so a non-Opus recording is never mislabeled as Opus.
+pub fn webm_to_ogg(webm: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let (head, packets) = demux_webm(webm)
+        .ok_or_else(|| anyhow::anyhow!("the recording is not a WebM file"))?;
+    if packets.is_empty() {
+        anyhow::bail!("the recording held no audio");
+    }
+    let head = head
+        .filter(|h| h.starts_with(b"OpusHead"))
+        .ok_or_else(|| anyhow::anyhow!("the recording's audio is not Opus"))?;
     let mut tags = b"OpusTags".to_vec();
     let vendor = b"hermodr";
     tags.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
@@ -148,15 +172,14 @@ pub fn webm_to_ogg(webm: &[u8]) -> Option<Vec<u8>> {
     ogg.page(&[&head], 0, 0x02);
     ogg.page(&[&tags], 0, 0);
     let mut granule = 0;
-    // A page's lacing table holds 255 entries; Opus packets under 255 bytes
-    // take one each, so 50 packets (a second of 20 ms frames) always fit.
-    let chunks: Vec<&[Vec<u8>]> = packets.chunks(50).collect();
+    // A page's lacing table holds 255 entries, so packets are packed into
+    // pages by their total segment count instead of a fixed packet count.
+    let chunks = page_chunks(&packets)?;
     for (i, chunk) in chunks.iter().enumerate() {
         granule += chunk.iter().map(|p| packet_samples(p)).sum::<u64>();
-        let refs: Vec<&[u8]> = chunk.iter().map(Vec::as_slice).collect();
-        ogg.page(&refs, granule, if i + 1 == chunks.len() { 0x04 } else { 0 });
+        ogg.page(chunk, granule, if i + 1 == chunks.len() { 0x04 } else { 0 });
     }
-    Some(ogg.out)
+    Ok(ogg.out)
 }
 
 #[cfg(test)]
@@ -203,5 +226,30 @@ mod tests {
         let last = ogg.windows(4).rposition(|w| w == b"OggS").unwrap();
         assert_eq!(ogg[last + 5], 0x04);
         assert_eq!(u64::from_le_bytes(ogg[last + 6..last + 14].try_into().unwrap()), 1920);
+    }
+
+    #[test]
+    fn pages_never_exceed_the_lacing_limit() {
+        // A 1300-byte packet needs six lacing entries; the old 50-packet
+        // chunks needed 300, wrapping the page's single count byte.
+        let packets: Vec<Vec<u8>> = (0..100).map(|_| vec![0xF8; 1300]).collect();
+        let chunks = page_chunks(&packets).expect("chunks fit");
+        assert_eq!(chunks.iter().map(|c| c.len()).sum::<usize>(), 100);
+        assert_eq!(chunks.len(), 3);
+        for chunk in &chunks {
+            let segments: usize = chunk.iter().map(|p| p.len() / 255 + 1).sum();
+            assert!(segments <= 255, "a page needs {segments} lacing segments");
+        }
+    }
+
+    #[test]
+    fn rejects_non_opus_webm() {
+        let track = element(&[0xAE], &element(&[0x63, 0xA2], b"\x01vorbis"));
+        let mut webm = vec![0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        webm.extend(element(&[0x16, 0x54, 0xAE, 0x6B], &track));
+        let mut block = vec![0x81, 0, 0, 0x80];
+        block.extend_from_slice(&[0xF8, 1, 2, 3]);
+        webm.extend(element(&[0xA3], &block));
+        assert!(webm_to_ogg(&webm).is_err());
     }
 }

@@ -96,6 +96,7 @@ async fn main() -> Result<()> {
                 println!("[check] syncing {pending} message(s)");
             }
             ServiceEvent::Synced => println!("[check] synced"),
+            _ => {}
         }
     }
 

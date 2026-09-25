@@ -638,7 +638,7 @@ async fn send_voice(
     view_once: Option<bool>,
 ) -> Result<(), String> {
     let webm = BASE64.decode(data.as_bytes()).map_err(|e| e.to_string())?;
-    let ogg = hermodr_core::ogg::webm_to_ogg(&webm).ok_or("the recording held no audio")?;
+    let ogg = hermodr_core::ogg::webm_to_ogg(&webm).map_err(|e| e.to_string())?;
     let reply = match (reply_to_id, reply_to_sender, reply_to_text) {
         (Some(id), Some(sender), Some(text)) => Some((id, sender, text)),
         _ => None,

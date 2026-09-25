@@ -76,8 +76,10 @@
 
   let audio: HTMLAudioElement | undefined = $state();
   let src = $state<string | null>(null);
+  let loading = $state(false);
   let failed = $state(false);
   let paused = $state(true);
+  let url: string | null = null;
   let current = $state(0);
   let rate = $state(savedRate());
   // svelte-ignore state_referenced_locally
@@ -98,29 +100,44 @@
   }
 
   // The bytes come through IPC because WebKitGTK's media pipeline cannot load
-  // the asset scheme; they also give the waveform. Voice notes are small.
-  onMount(() => {
-    let url: string | null = null;
-    invoke<string>("read_file", { path })
-      .then(async (data) => {
-        const bytes = Uint8Array.from(atob(data), (c) => c.charCodeAt(0));
-        url = URL.createObjectURL(new Blob([bytes], { type: mime(path) }));
-        src = url;
-        if (!shape) {
-          shape = await shapeOf(bytes).catch(() => null);
-          if (shape) shapes.set(path, shape);
-        }
-      })
-      .catch(() => (failed = true));
-    return () => {
-      if (url) URL.revokeObjectURL(url);
-      if (playingNow === audio) playingNow = null;
-    };
+  // the asset scheme; they also give the waveform. Loading is deferred to the
+  // first play so a chat full of voice notes reads nothing until asked.
+  async function ensureLoaded() {
+    if (src) return true;
+    loading = true;
+    try {
+      const data = await invoke<string>("read_file", { path });
+      const bytes = Uint8Array.from(atob(data), (c) => c.charCodeAt(0));
+      url = URL.createObjectURL(new Blob([bytes], { type: mime(path) }));
+      if (audio) audio.src = url;
+      src = url;
+      if (!shape) {
+        // The waveform can decode while playback starts.
+        shapeOf(bytes)
+          .then((s) => {
+            shape = s;
+            shapes.set(path, s);
+          })
+          .catch(() => {});
+      }
+      return true;
+    } catch {
+      failed = true;
+      return false;
+    } finally {
+      loading = false;
+    }
+  }
+
+  onMount(() => () => {
+    if (url) URL.revokeObjectURL(url);
+    if (playingNow === audio) playingNow = null;
   });
 
   async function toggle() {
-    if (!audio || !src) return;
+    if (!audio || failed) return;
     if (!audio.paused) return audio.pause();
+    if (!src && !(await ensureLoaded())) return;
     if (playingNow && playingNow !== audio) playingNow.pause();
     playingNow = audio;
     audio.playbackRate = rate;
@@ -169,7 +186,7 @@
     class="toggle"
     class:failed
     onclick={toggle}
-    disabled={!src && !failed}
+    disabled={failed || loading}
     title={failed ? "Could not play this file" : paused ? "Play" : "Pause"}
     aria-label={paused ? "Play" : "Pause"}>
     {#if failed}!{:else}<Icon name={paused ? "play" : "pause"} size={22} filled />{/if}

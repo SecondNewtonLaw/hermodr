@@ -1010,6 +1010,9 @@ impl MessageStore {
         conn.execute("DELETE FROM messages WHERE chat = ?1 AND id = ?2", params![chat, id])?;
         conn.execute("DELETE FROM reactions WHERE chat = ?1 AND target = ?2", params![chat, id])?;
         conn.execute("DELETE FROM stars WHERE chat = ?1 AND id = ?2", params![chat, id])?;
+        conn.execute("DELETE FROM poll_votes WHERE chat = ?1 AND poll = ?2", params![chat, id])?;
+        conn.execute("DELETE FROM event_responses WHERE chat = ?1 AND event = ?2", params![chat, id])?;
+        conn.execute("DELETE FROM view_once WHERE chat = ?1 AND id = ?2", params![chat, id])?;
         Ok(())
     }
 

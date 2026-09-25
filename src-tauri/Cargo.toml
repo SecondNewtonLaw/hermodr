@@ -26,7 +26,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 # `std::fs::canonicalize` returns `\\?\` paths on Windows, which the shell
 # cannot open.
 dunce = "1"
-log = "0.4"
 env_logger = "0.11"
 
 [target.'cfg(windows)'.dependencies]

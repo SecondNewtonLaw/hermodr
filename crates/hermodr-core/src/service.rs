@@ -1664,6 +1664,12 @@ impl Service {
             .delete_message_for_me(&jid, participant.as_ref(), id, from_me, true, Some(timestamp))
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        // The stored copy is gone, so its media file has no other referent.
+        if let Ok(message) = self.store.message(chat, id) {
+            if let Some(path) = message.media_path.as_deref() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
         self.store.delete_message(chat, id)
     }
 
@@ -1722,7 +1728,7 @@ impl Service {
         Ok(())
     }
 
-    fn own_message(&self, chat: &str, id: &str, text: String, kind: &str) -> StoredMessage {
+    fn own_message(&self, chat: &str, id: &str, text: String, kind: &str, to_self: bool) -> StoredMessage {
         StoredMessage {
             chat: chat.to_string(),
             id: id.to_string(),
@@ -1748,12 +1754,14 @@ impl Service {
             preview_title: None,
             preview_desc: None,
             preview_thumb: None,
-            status: Some("pending".into()),
+            // A message to ourselves needs no receipt to count as delivered.
+            status: Some(if to_self { "delivered".into() } else { "pending".into() }),
         }
     }
 
     pub async fn create_poll(&self, chat: &str, question: &str, options: Vec<String>, multi: bool) -> Result<()> {
         let to: Jid = chat.parse()?;
+        let to_self = self.is_self_jid(&to);
         let selectable = if multi { options.len() as u32 } else { 1 };
         let (result, secret) = self
             .client
@@ -1764,7 +1772,7 @@ impl Service {
         let id = result.message_id.clone();
         self.store
             .save_poll(chat, &id, &self.own_jid(), question, &options, multi, Some(&secret))?;
-        let stored = self.own_message(chat, &id, question.to_string(), "poll");
+        let stored = self.own_message(chat, &id, question.to_string(), "poll", to_self);
         self.store.upsert(&stored)?;
         let _ = self.events.send(ServiceEvent::Message { message: Box::new(stored) });
         Ok(())
@@ -1791,6 +1799,7 @@ impl Service {
     pub async fn create_event(&self, chat: &str, event: crate::store::NewEvent) -> Result<()> {
         use whatsapp_rust::EventCreationParams;
         let to: Jid = chat.parse()?;
+        let to_self = self.is_self_jid(&to);
         let params = EventCreationParams {
             name: event.name.clone(),
             description: event.description.clone(),
@@ -1811,7 +1820,7 @@ impl Service {
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let id = result.message_id.clone();
         self.store.save_event(chat, &id, &self.own_jid(), &event, Some(&secret))?;
-        let stored = self.own_message(chat, &id, event.name, "event");
+        let stored = self.own_message(chat, &id, event.name, "event", to_self);
         self.store.upsert(&stored)?;
         let _ = self.events.send(ServiceEvent::Message { message: Box::new(stored) });
         Ok(())
@@ -2307,6 +2316,7 @@ impl Service {
     /// Sends a picture as a sticker (see [`sticker_webp`]).
     pub async fn send_sticker(&self, chat: &str, bytes: Vec<u8>) -> Result<()> {
         let to: Jid = chat.parse()?;
+        let to_self = self.is_self_jid(&to);
         let webp = sticker_webp(&bytes)
             .ok_or_else(|| anyhow::anyhow!("that file is not an image we can turn into a sticker"))?;
         let upload = self
@@ -2362,7 +2372,7 @@ impl Service {
             preview_title: None,
             preview_desc: None,
             preview_thumb: None,
-            status: Some("pending".into()),
+            status: Some(if to_self { "delivered".into() } else { "pending".into() }),
         };
         self.store.upsert(&stored)?;
         let _ = self.events.send(ServiceEvent::Message { message: Box::new(stored) });
