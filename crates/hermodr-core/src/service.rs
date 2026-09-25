@@ -202,6 +202,8 @@ pub enum ServiceEvent {
     QrCode { code: String },
     Connected,
     Disconnected,
+    /// WhatsApp revoked this device; the stored session can never sign in again.
+    LoggedOut,
     /// A message was received or sent and stored.
     ///
     /// Boxed because `StoredMessage` is far larger than the other variants, and
@@ -577,6 +579,7 @@ impl Service {
                 &[
                     EventKind::Messages,
                     EventKind::Disconnected,
+                    EventKind::LoggedOut,
                     EventKind::Receipt,
                     EventKind::ServerAck,
                     EventKind::ContactUpdate,
@@ -929,6 +932,10 @@ impl Service {
                             Event::Disconnected(_) => {
                                 connected.store(false, Ordering::SeqCst);
                                 let _ = events.send(ServiceEvent::Disconnected);
+                            }
+                            Event::LoggedOut(_) => {
+                                connected.store(false, Ordering::SeqCst);
+                                let _ = events.send(ServiceEvent::LoggedOut);
                             }
                             // A receipt names the messages it refers to, so the
                             // outgoing row can move to delivered or read.

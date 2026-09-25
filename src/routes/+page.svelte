@@ -124,6 +124,7 @@
     | { kind: "qrCode"; code: string }
     | { kind: "connected" }
     | { kind: "disconnected" }
+    | { kind: "loggedOut" }
     | { kind: "message"; message: StoredMessage }
     | { kind: "retentionApplied"; removed: number }
     | { kind: "namesUpdated"; count: number }
@@ -2086,6 +2087,13 @@
           case "disconnected":
             connected = false;
             break;
+          case "loggedOut":
+            connected = false;
+            started = false;
+            await showQr(null);
+            await loadAccounts();
+            await connect();
+            break;
           case "message":
             if (syncPending > 0) syncSeen += 1;
             // A message ends the sender's typing, whether or not "paused" arrived.
@@ -2338,10 +2346,12 @@
       <section class="intro-steps">
         <h2>Link this computer</h2>
         <ol>
-          <li><span>1</span>Open <strong>WhatsApp</strong> on your phone.</li>
-          <li><span>2</span>Tap <strong>Menu</strong> or <strong>Settings</strong>, then <strong>Linked devices</strong>.</li>
-          <li><span>3</span>Tap <strong>Link a device</strong>.</li>
-          <li><span>4</span>Point your phone at this screen to scan the code.</li>
+          <li><span class="num">1</span><span>Open <strong>WhatsApp</strong> on your phone.</span></li>
+          <li>
+            <span class="num">2</span><span>Tap <strong>Menu</strong> or <strong>Settings</strong>, then <strong>Linked devices</strong>.</span>
+          </li>
+          <li><span class="num">3</span><span>Tap <strong>Link a device</strong>.</span></li>
+          <li><span class="num">4</span><span>Point your phone at this screen to scan the code.</span></li>
         </ol>
         <!-- Each stage lights up as the connection actually reaches it. -->
         <div class="intro-progress" aria-label="Connection progress">
@@ -3665,6 +3675,7 @@
     justify-content: center;
     gap: 22px;
     padding: 32px 24px;
+    box-sizing: border-box;
     overflow: auto;
     background: var(--chat-bg);
   }
@@ -3680,7 +3691,9 @@
   .intro-card,
   .intro-foot {
     position: relative;
+    box-sizing: border-box;
     width: min(920px, 100%);
+    flex: none;
   }
   .intro-head {
     display: flex;
@@ -3812,9 +3825,9 @@
   .intro-steps li {
     display: flex;
     gap: 12px;
-    align-items: baseline;
+    align-items: center;
   }
-  .intro-steps li > span {
+  .intro-steps .num {
     flex: none;
     display: grid;
     place-items: center;
@@ -3874,6 +3887,10 @@
     color: var(--faint);
     text-transform: uppercase;
     letter-spacing: 0.06em;
+  }
+  .intro-accounts .account-bar {
+    justify-content: flex-start;
+    flex-wrap: wrap;
   }
   .intro-accounts .account {
     display: flex;

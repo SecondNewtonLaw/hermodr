@@ -296,6 +296,12 @@ async fn start_service(app: &AppHandle, state: &AppState, account: &str) -> Resu
     let settings = state.settings.lock().unwrap().clone();
     let config = config_for(app, &settings, account);
 
+    let marker = account_base(app, account).join(LOGGED_OUT_MARKER);
+    if marker.exists() {
+        let session = config.session_path.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || wipe_session(&session, &marker)).await;
+    }
+
     let (service, mut events) = Service::start(config)
         .await
         .map_err(|e| format!("failed to start service: {e}"))?;
@@ -305,9 +311,16 @@ async fn start_service(app: &AppHandle, state: &AppState, account: &str) -> Resu
     // cannot slip through the gap between starting and subscribing.
     let emitter = app.clone();
     let service_for_events = service.clone();
+    let account_id = account.to_string();
     tauri::async_runtime::spawn(async move {
         loop {
             match events.recv().await {
+                Ok(ServiceEvent::LoggedOut) => {
+                    forget_session(&emitter, &account_id, &service_for_events);
+                    let _ = emitter.emit(SERVICE_EVENT, &ServiceEvent::LoggedOut);
+                    // Holding the service keeps its session database open.
+                    break;
+                }
                 Ok(event) => {
                     let _ = emitter.emit(SERVICE_EVENT, &event);
                 }
@@ -333,6 +346,43 @@ async fn start_service(app: &AppHandle, state: &AppState, account: &str) -> Resu
 
     *state.service.lock().unwrap() = Some(service);
     Ok(())
+}
+
+/// Present in an account's directory once WhatsApp revoked its session.
+const LOGGED_OUT_MARKER: &str = "logged_out";
+
+/// Stops a revoked account's service and marks its session for deletion on the next start.
+fn forget_session(app: &AppHandle, account: &str, service: &Arc<Service>) {
+    let state = app.state::<AppState>();
+    {
+        let mut slot = state.service.lock().unwrap();
+        if slot.as_ref().is_some_and(|s| Arc::ptr_eq(s, service)) {
+            *slot = None;
+        }
+    }
+    service.shutdown();
+    let mut file = state.accounts.lock().unwrap();
+    if let Some(entry) = file.accounts.iter_mut().find(|a| a.id == account) {
+        entry.jid = None;
+        save_accounts(app, &file);
+    }
+    let _ = std::fs::write(account_base(app, account).join(LOGGED_OUT_MARKER), b"");
+}
+
+/// Deletes a revoked session, retrying while the old service still holds the file open.
+fn wipe_session(session: &std::path::Path, marker: &std::path::Path) {
+    for _ in 0..50 {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut path = session.as_os_str().to_owned();
+            path.push(suffix);
+            let _ = std::fs::remove_file(path);
+        }
+        if !session.exists() {
+            let _ = std::fs::remove_file(marker);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// Connects the active account, pairing by QR the first time.
