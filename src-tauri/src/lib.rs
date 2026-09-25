@@ -658,6 +658,9 @@ pub fn run() {
                 .title("Hermóðr")
                 .inner_size(1000.0, 720.0)
                 .min_inner_size(480.0, 360.0)
+                // No client side title bar: the compositor draws its own on KDE
+                // and GNOME, and Hyprland ignores ours entirely.
+                .decorations(false)
                 .enable_clipboard_access()
                 .build()?;
 
