@@ -31,7 +31,9 @@
   import EventCard, { type ChatEvent } from "$lib/EventCard.svelte";
   import CreateDialog from "$lib/CreateDialog.svelte";
   import { blocks, plain, type Inline } from "$lib/format";
-  import { activeTheme, applyTheme, customization, save as saveCustomization } from "$lib/theme.svelte";
+  import { activeTheme, applyTheme, customization, motion, save as saveCustomization } from "$lib/theme.svelte";
+  import { fly } from "svelte/transition";
+  import { cubicOut } from "svelte/easing";
 
   type StoredMessage = {
     chat: string;
@@ -126,6 +128,7 @@
     | { kind: "connected" }
     | { kind: "disconnected" }
     | { kind: "loggedOut" }
+    | { kind: "uploadProgress"; token: string; sent: number; total: number }
     | { kind: "message"; message: StoredMessage }
     | { kind: "retentionApplied"; removed: number }
     | { kind: "namesUpdated"; count: number }
@@ -1330,7 +1333,6 @@
     if (!selectedChat) return;
     // With attachments staged, the typed text goes out as their caption.
     if (pending.length > 0) {
-      if (sendingMedia) return;
       // Mentions in a caption go out as `@<number>` with their JIDs, as in text.
       const { text: caption, jids } = mentionPayload();
       draft = "";
@@ -1440,11 +1442,14 @@
           ? "video"
           : "other";
 
-      let url = "";
-      if (kind === "image") url = await imagePreview(file);
-      else if (kind === "video") url = URL.createObjectURL(file);
-
-      pending = [...pending, { id: pendingSeq++, file, url, kind, caption: "" }];
+      // Staged before the preview is drawn, so Enter can send it straight away.
+      const id = pendingSeq++;
+      pending = [...pending, { id, file, url: kind === "video" ? URL.createObjectURL(file) : "", kind, caption: "" }];
+      composerInput?.focus();
+      if (kind === "image") {
+        const url = await imagePreview(file);
+        pending = pending.map((p) => (p.id === id ? { ...p, url } : p));
+      }
     } catch (e) {
       // Staging must never take the chat down with it.
       error = `Could not preview that file: ${e}`;
@@ -1595,21 +1600,53 @@
   }
 
   /** Upload progress while attachments go out; also the double-send guard. */
-  let sendingMedia = $state<{ done: number; total: number; current: number } | null>(null);
+  /** Files on their way out, drawn at the end of their chat until the sent message replaces them. */
+  type Outgoing = {
+    token: string;
+    chat: string;
+    kind: "image" | "video" | "other";
+    url: string;
+    name: string;
+    caption: string;
+    /** 0 to 1, from the core's upload progress. */
+    progress: number;
+  };
+  let outgoing = $state<Outgoing[]>([]);
 
   /** `text` from the composer becomes the first attachment's caption, unless it has its own. */
   async function sendPending(text = "", mentions: string[] = []) {
-    if (!selectedChat || pending.length === 0 || sendingMedia) return;
+    if (!selectedChat || pending.length === 0) return;
     const captioned = !!text && !pending[0].caption.trim();
     if (captioned) pending[0].caption = text;
     const firstId = pending[0].id;
     const chat = selectedChat;
     const items = [...pending];
     const reply = replyingTo;
-    sendingMedia = { done: 0, total: items.length, current: items[0].id };
-    try {
-      for (const item of items) {
-        sendingMedia = { ...sendingMedia, current: item.id };
+    const once = sendOnce;
+    // The tray empties at once; each file waits in the chat as a bubble instead.
+    pending = [];
+    previewId = null;
+    replyingTo = null;
+    sendOnce = false;
+    const batch: Outgoing[] = items.map((item) => ({
+      token: `upload-${item.id}-${Date.now()}`,
+      chat,
+      kind: item.kind,
+      url: item.url,
+      name: item.file.name,
+      caption: item.caption.trim(),
+      progress: 0,
+    }));
+    outgoing = [...outgoing, ...batch];
+    scrollToBottom();
+    const finish = (token: string) => {
+      const done = outgoing.find((o) => o.token === token);
+      if (done?.url.startsWith("blob:")) URL.revokeObjectURL(done.url);
+      outgoing = outgoing.filter((o) => o.token !== token);
+    };
+    for (const [i, item] of items.entries()) {
+      const { token } = batch[i];
+      try {
         const data = await base64Of(item.file);
         const warning = await enqueue(() =>
           invoke<string | null>("send_media", {
@@ -1620,25 +1657,24 @@
             replyToId: reply?.id ?? null,
             replyToSender: reply?.sender ?? null,
             replyToText: reply?.text ?? null,
-            viewOnce: sendOnce && item.kind !== "other",
+            viewOnce: once && item.kind !== "other",
             mentions: captioned && item.id === firstId ? mentions : [],
+            progress: token,
           }),
         );
         if (warning && settings.warn_missing_video_preview) notice = warning;
-        // Sent items leave the tray at once, so a later failure cannot resend them.
-        removePending(item.id);
-        sendingMedia = { ...sendingMedia, done: sendingMedia.done + 1 };
+        if (selectedChat === chat) await reloadMessages();
+        finish(token);
+        if (selectedChat === chat) scrollToBottom();
+      } catch (e) {
+        error = String(e);
+        // What did not go out returns to the tray, so it can be sent again.
+        for (const rest of batch.slice(i)) outgoing = outgoing.filter((o) => o.token !== rest.token);
+        pending = [...items.slice(i), ...pending];
+        break;
       }
-      replyingTo = null;
-      sendOnce = false;
-      await reloadMessages();
-      await refreshChats();
-      scrollToBottom();
-    } catch (e) {
-      error = String(e);
-    } finally {
-      sendingMedia = null;
     }
+    await refreshChats();
   }
 
   /** Base64 keeps a file a single IPC value; fine for attachments and voice notes. */
@@ -2144,6 +2180,18 @@
       ) {
         return;
       }
+      // Staged attachments go out on Enter even when focus left the composer.
+      if (
+        event.key === "Enter" &&
+        !event.shiftKey &&
+        pending.length > 0 &&
+        target?.tagName !== "BUTTON" &&
+        !target?.closest?.("[role=dialog]")
+      ) {
+        event.preventDefault();
+        void send();
+        return;
+      }
       if (event.key.length !== 1) return;
       composerInput.focus();
     };
@@ -2168,6 +2216,11 @@
           case "disconnected":
             connected = false;
             break;
+          case "uploadProgress": {
+            const upload = outgoing.find((o) => o.token === payload.token);
+            if (upload) upload.progress = payload.total > 0 ? payload.sent / payload.total : 0;
+            break;
+          }
           case "loggedOut":
             connected = false;
             started = false;
@@ -3117,6 +3170,37 @@
             </div>
             </div>
           {/each}
+          {#each outgoing.filter((o) => o.chat === selectedChat) as upload (upload.token)}
+            <div class="msg-row" in:fly={{ y: 48, duration: motion(260), easing: cubicOut }}>
+              <div class="bubble mine first outgoing-upload" class:media-only={upload.kind !== "other" && !upload.caption}>
+                <div class="upload-visual" class:file-upload={upload.kind === "other" || !upload.url}>
+                  {#if upload.kind === "image" && upload.url}
+                    <img class="media" src={upload.url} alt={upload.name} />
+                  {:else if upload.kind === "video" && upload.url}
+                    <!-- svelte-ignore a11y_media_has_caption -->
+                    <video class="media" src={upload.url} preload="metadata" muted></video>
+                  {:else}
+                    <span class="upload-name"><Icon name="file" size={20} />{upload.name}</span>
+                  {/if}
+                  <span class="upload-ring" aria-label="Uploading, {Math.round(upload.progress * 100)}%">
+                    <svg viewBox="0 0 48 48" width="48" height="48">
+                      <circle class="ring-track" cx="24" cy="24" r="20" />
+                      <circle
+                        class="ring-fill"
+                        class:spinning={upload.progress === 0}
+                        cx="24"
+                        cy="24"
+                        r="20"
+                        stroke-dasharray="125.66"
+                        stroke-dashoffset={125.66 * (1 - (upload.progress || 0.12))} />
+                    </svg>
+                    <span class="ring-label">{upload.progress > 0 ? `${Math.round(upload.progress * 100)}%` : ""}</span>
+                  </span>
+                </div>
+                {#if upload.caption}<span class="upload-caption">{upload.caption}</span>{/if}
+              </div>
+            </div>
+          {/each}
           {#if typing[selectedChat]?.length}
             {@const typer = typing[selectedChat][0]}
             <div class="bubble typing-bubble first">
@@ -3171,15 +3255,8 @@
         {#if pending.length > 0}
           <div class="pending">
             {#each pending as item (item.id)}
-              <div
-                class="pending-item"
-                class:waiting={sendingMedia && sendingMedia.current !== item.id}
-                class:uploading={sendingMedia?.current === item.id}>
-                <button
-                  class="pending-thumb"
-                  title="Preview and caption"
-                  disabled={!!sendingMedia}
-                  onclick={() => (previewId = item.id)}>
+              <div class="pending-item">
+                <button class="pending-thumb" title="Preview and caption" onclick={() => (previewId = item.id)}>
                   {#if item.kind === "image"}
                     <img src={item.url} alt={item.file.name} />
                   {:else if item.kind === "video"}
@@ -3198,19 +3275,11 @@
                   class="icon remove"
                   title="Remove"
                   aria-label="Remove"
-                  disabled={!!sendingMedia}
                   onclick={() => removePending(item.id)}><Icon name="x" size={12} /></button
                 >
               </div>
             {/each}
-            <span class="pending-status">
-              {#if sendingMedia}
-                <span class="spinner"></span>
-                Sending {sendingMedia.done + 1} of {sendingMedia.total}…
-              {:else}
-                Type a caption below, then send.
-              {/if}
-            </span>
+            <span class="pending-status">Type a caption below, then press Enter.</span>
           </div>
         {/if}
 
@@ -3369,8 +3438,7 @@
               class="send ready"
               type="submit"
               title="Send"
-              aria-label="Send"
-              disabled={!!sendingMedia}><Icon name="send" size={18} /></button>
+              aria-label="Send"><Icon name="send" size={18} /></button>
           {/if}
           {/if}
         </form>
@@ -5338,6 +5406,75 @@
     text-shadow: 0 1px 6px rgba(0, 0, 0, 0.8);
     pointer-events: none;
   }
+  .upload-visual {
+    position: relative;
+    display: grid;
+    place-items: center;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .upload-visual .media {
+    display: block;
+    max-width: 280px;
+    max-height: 320px;
+    filter: brightness(0.7);
+  }
+  .upload-visual.file-upload {
+    min-width: 220px;
+    min-height: 72px;
+    gap: 8px;
+    padding: 10px;
+  }
+  .upload-name {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    max-width: 240px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .upload-ring {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+  }
+  .file-upload .upload-ring {
+    position: static;
+  }
+  .upload-ring svg {
+    grid-area: 1 / 1;
+    transform: rotate(-90deg);
+    border-radius: 50%;
+    background: var(--scrim);
+  }
+  .upload-ring circle {
+    fill: none;
+    stroke-width: 3.5;
+  }
+  .ring-track {
+    stroke: rgba(255, 255, 255, 0.2);
+  }
+  .ring-fill {
+    stroke: #fff;
+    stroke-linecap: round;
+    transition: stroke-dashoffset calc(0.25s * var(--motion-scale)) linear;
+  }
+  .ring-fill.spinning {
+    transform-origin: 24px 24px;
+    animation: spin 0.9s linear infinite;
+  }
+  .ring-label {
+    grid-area: 1 / 1;
+    color: #fff;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .upload-caption {
+    display: block;
+    padding: 6px 4px 2px;
+  }
   .svg-file .media {
     width: 280px;
     max-width: 100%;
@@ -5793,25 +5930,6 @@
     background: var(--bg);
     color: var(--text);
     cursor: pointer;
-  }
-  .pending-item.waiting {
-    opacity: 0.45;
-  }
-  /* The attachment in flight gets a spinner over its thumbnail. */
-  .pending-item.uploading .pending-thumb::after {
-    content: "";
-    position: absolute;
-    inset: 0;
-    margin: auto;
-    width: 26px;
-    height: 26px;
-    border-radius: 50%;
-    border: 3px solid rgba(255, 255, 255, 0.3);
-    border-top-color: #fff;
-    animation: spin 0.8s linear infinite;
-  }
-  .pending-item.uploading .pending-thumb {
-    filter: brightness(0.7);
   }
   .pending-status {
     align-self: center;

@@ -679,6 +679,7 @@ async fn send_media(
     gif: Option<bool>,
     view_once: Option<bool>,
     mentions: Option<Vec<String>>,
+    progress: Option<String>,
 ) -> Result<Option<String>, String> {
     let bytes = BASE64.decode(data.as_bytes()).map_err(|e| e.to_string())?;
     let reply = match (reply_to_id, reply_to_sender, reply_to_text) {
@@ -689,6 +690,7 @@ async fn send_media(
         gif: gif.unwrap_or(false),
         view_once: view_once.unwrap_or(false),
         mentions: mentions.unwrap_or_default(),
+        progress,
         ..Default::default()
     };
     let service = state.service()?;

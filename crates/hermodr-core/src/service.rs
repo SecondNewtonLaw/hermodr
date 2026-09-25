@@ -7,7 +7,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -253,6 +253,8 @@ pub enum ServiceEvent {
     MemberLabel { chat: String, jid: String, label: String },
     /// Reactions, stars or the pinned message of a chat changed.
     Marks { chat: String },
+    /// Bytes of an outgoing file sent so far, named by the caller's token.
+    UploadProgress { token: String, sent: u64, total: u64 },
 }
 
 /// The account's own profile and privacy, as the settings panel edits them.
@@ -281,6 +283,41 @@ pub struct SendOptions {
     pub forwarded: bool,
     /// JIDs the caption mentions as `@<number>`.
     pub mentions: Vec<String>,
+    /// Names the upload in [`ServiceEvent::UploadProgress`], when the caller wants progress.
+    pub progress: Option<String>,
+}
+
+/// Encrypted media handed to the uploader, reporting how far it has been read.
+struct ProgressSource {
+    data: Arc<[u8]>,
+    report: Arc<dyn Fn(u64) + Send + Sync>,
+}
+
+impl whatsapp_rust::wacore::upload::UploadSource for ProgressSource {
+    fn len(&self) -> u64 {
+        self.data.len() as u64
+    }
+
+    fn reader_from(&self, offset: u64) -> std::io::Result<Box<dyn std::io::Read + Send>> {
+        let mut cursor = std::io::Cursor::new(Arc::clone(&self.data));
+        cursor.set_position(offset.min(self.len()));
+        Ok(Box::new(CountingReader { inner: cursor, read: offset, report: Arc::clone(&self.report) }))
+    }
+}
+
+struct CountingReader {
+    inner: std::io::Cursor<Arc<[u8]>>,
+    read: u64,
+    report: Arc<dyn Fn(u64) + Send + Sync>,
+}
+
+impl std::io::Read for CountingReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read += n as u64;
+        (self.report)(self.read);
+        Ok(n)
+    }
 }
 
 /// Marks a message context as forwarded, keeping anything already in it (a quote).
@@ -2697,7 +2734,7 @@ impl Service {
         reply: Option<(String, String, String)>,
         options: SendOptions,
     ) -> Result<Option<String>> {
-        let SendOptions { gif, view_once, voice, forwarded, mentions } = options;
+        let SendOptions { gif, view_once, voice, forwarded, mentions, progress } = options;
         let to: Jid = chat.parse()?;
         let to_self = self.is_self_jid(&to);
         let file_name = file_name.to_string();
@@ -2716,7 +2753,10 @@ impl Service {
             _ => (MediaType::Document, "document"),
         };
 
-        let upload = self.client.upload(bytes.clone(), media_type, Default::default()).await?;
+        let upload = match progress {
+            Some(token) => self.upload_reporting(bytes.clone(), media_type, token).await?,
+            None => self.client.upload(bytes.clone(), media_type, Default::default()).await?,
+        };
 
         let mimetype = mime_for(&extension).map(str::to_string);
 
@@ -2865,6 +2905,39 @@ impl Service {
         self.store.upsert(&stored)?;
         let _ = self.events.send(ServiceEvent::Message { message: Box::new(stored) });
         Ok(warning)
+    }
+
+    /// Uploads media while reporting its progress as [`ServiceEvent::UploadProgress`], about once per percent.
+    async fn upload_reporting(
+        &self,
+        bytes: Vec<u8>,
+        media_type: MediaType,
+        token: String,
+    ) -> Result<whatsapp_rust::upload::UploadResponse> {
+        use whatsapp_rust::wacore::upload::{encrypt_media_with_key_and_sidecar, EncryptedMediaInfo};
+        let file_length = bytes.len() as u64;
+        let enc = tokio::task::spawn_blocking(move || {
+            encrypt_media_with_key_and_sidecar(&bytes, media_type, None, None)
+        })
+        .await??;
+        let total = enc.data_to_upload.len() as u64;
+        let events = self.events.clone();
+        let last = Arc::new(AtomicU64::new(u64::MAX));
+        let report: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |sent: u64| {
+            let percent = sent.saturating_mul(100) / total.max(1);
+            if last.swap(percent, Ordering::Relaxed) != percent {
+                let _ = events.send(ServiceEvent::UploadProgress { token: token.clone(), sent, total });
+            }
+        });
+        let source = ProgressSource { data: Arc::from(enc.data_to_upload), report };
+        let info = EncryptedMediaInfo {
+            media_key: enc.media_key,
+            file_sha256: enc.file_sha256,
+            file_enc_sha256: enc.file_enc_sha256,
+            file_length,
+            streaming_sidecar: enc.streaming_sidecar,
+        };
+        Ok(self.client.upload_stream(source, info, media_type).await?)
     }
 
     /// Sends a picture as a sticker (see [`sticker_webp`]).
