@@ -1489,18 +1489,32 @@ impl MessageStore {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
+        // Every chat keeps its newest message, whatever its age: a quiet chat
+        // must stay in the list with its last preview, not vanish.
+        const NOT_NEWEST: &str = "(chat, id) NOT IN (
+             SELECT chat, id FROM (
+                 SELECT chat, id, ROW_NUMBER() OVER (PARTITION BY chat ORDER BY timestamp DESC) AS rank
+                 FROM messages
+             ) WHERE rank = 1)";
+
         // A chat with its own window or cap is only bound by that one.
         if let Some(oldest) = self.retention.oldest_allowed() {
             removed += conn.execute(
-                "DELETE FROM messages WHERE timestamp < ?1 AND chat NOT IN
-                     (SELECT jid FROM chat_retention WHERE max_age_hours IS NOT NULL)",
+                &format!(
+                    "DELETE FROM messages WHERE timestamp < ?1 AND chat NOT IN
+                         (SELECT jid FROM chat_retention WHERE max_age_hours IS NOT NULL)
+                     AND {NOT_NEWEST}"
+                ),
                 params![oldest],
             )?;
         }
         removed += conn.execute(
-            "DELETE FROM messages WHERE EXISTS (
-                 SELECT 1 FROM chat_retention r WHERE r.jid = messages.chat
-                 AND r.max_age_hours > 0 AND messages.timestamp < ?1 - r.max_age_hours * 3600)",
+            &format!(
+                "DELETE FROM messages WHERE EXISTS (
+                     SELECT 1 FROM chat_retention r WHERE r.jid = messages.chat
+                     AND r.max_age_hours > 0 AND messages.timestamp < ?1 - r.max_age_hours * 3600)
+                 AND {NOT_NEWEST}"
+            ),
             params![now],
         )?;
 
@@ -1724,11 +1738,26 @@ mod tests {
             max_age_hours: Some(1),
             max_messages_per_chat: None,
         });
+        s.upsert(&msg("a@s", "older", 72, "hello")).unwrap();
         s.upsert(&msg("a@s", "old", 48, "hi")).unwrap();
         s.set_name("a@s", "Alice").unwrap();
         s.enforce_retention().unwrap();
-        assert_eq!(s.count().unwrap(), 0);
+        assert_eq!(s.count().unwrap(), 1);
         assert_eq!(s.name_for("a@s").unwrap().as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn quiet_chats_keep_their_newest_message() {
+        let s = store(Retention { max_age_hours: Some(24), max_messages_per_chat: None });
+        s.upsert(&msg("quiet@s", "1", 100, "first")).unwrap();
+        s.upsert(&msg("quiet@s", "2", 50, "last word")).unwrap();
+        s.upsert(&msg("busy@s", "1", 50, "old")).unwrap();
+        s.upsert(&msg("busy@s", "2", 1, "new")).unwrap();
+        s.enforce_retention().unwrap();
+        let chats = s.chats().unwrap();
+        assert_eq!(chats.len(), 2, "no chat vanishes from the list");
+        assert_eq!(s.messages_for("quiet@s", 9).unwrap()[0].text, "last word");
+        assert_eq!(s.messages_for("busy@s", 9).unwrap().len(), 1);
     }
 
     #[test]
