@@ -44,13 +44,11 @@ if [ "${1:-}" = "--dev" ]; then
   cd "$ROOT" && exec pnpm tauri dev
 fi
 
-say "building the frontend"
-(cd "$ROOT" && pnpm build)
-
-# Built with cargo rather than `pnpm tauri build`, so no bundle (and no
-# AppImage tooling) is needed for a local install.
-say "building the binary"
-(cd "$ROOT/src-tauri" && cargo build --release)
+# `--no-bundle` builds the production binary (and the frontend) without the
+# AppImage tooling, which is only needed for a release. A plain `cargo build`
+# would fall back to the dev URL and fail to load the UI.
+say "building"
+(cd "$ROOT" && pnpm tauri build --no-bundle)
 
 say "installing the desktop entry"
 BIN_DIR="$HOME/.local/bin"
