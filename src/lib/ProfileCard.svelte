@@ -12,6 +12,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { fly } from "svelte/transition";
+  import { motion } from "$lib/theme.svelte";
   import { convertFileSrc, invoke } from "@tauri-apps/api/core";
   import Icon from "$lib/Icon.svelte";
   import { phoneLabel } from "$lib/phone";
@@ -84,7 +85,7 @@
   role="dialog"
   aria-label="Profile of {shown}"
   style="left: {position.left}px; top: {position.top}px; --hue: {hue}"
-  transition:fly={{ y: 6, duration: 140 }}>
+  transition:fly={{ y: 6, duration: motion(140) }}>
   <div class="banner"></div>
   <div class="avatar-wrap">
     {#if picture}

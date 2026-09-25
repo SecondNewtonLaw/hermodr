@@ -501,7 +501,7 @@
     border-radius: 50%;
     background: none;
     cursor: zoom-in;
-    transition: filter 0.15s;
+    transition: filter calc(0.15s * var(--motion-scale));
   }
   .hero-picture:disabled {
     cursor: default;
@@ -519,7 +519,7 @@
     border: 0;
     background: var(--scrim);
     cursor: zoom-out;
-    animation: lightbox-in 0.18s ease both;
+    animation: lightbox-in calc(0.18s * var(--motion-scale)) var(--ease) both;
   }
   .lightbox img {
     max-width: min(640px, 100%);
@@ -559,7 +559,7 @@
     gap: 12px;
     padding: 7px 10px;
     border-radius: var(--radius);
-    transition: background 0.12s;
+    transition: background calc(0.12s * var(--motion-scale));
   }
   .member:hover {
     background: var(--surface);

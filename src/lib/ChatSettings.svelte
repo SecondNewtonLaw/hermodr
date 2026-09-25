@@ -9,6 +9,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { fade, scale } from "svelte/transition";
+  import { motion } from "$lib/theme.svelte";
   import { invoke } from "@tauri-apps/api/core";
   import Icon from "$lib/Icon.svelte";
 
@@ -86,9 +87,9 @@
 <div
   class="backdrop"
   role="presentation"
-  transition:fade|global={{ duration: 140 }}
+  transition:fade|global={{ duration: motion(140) }}
   onclick={(e) => e.target === e.currentTarget && onclose()}>
-  <div class="dialog" role="dialog" aria-modal="true" aria-label="Chat settings" transition:scale|global={{ start: 0.96, duration: 160 }}>
+  <div class="dialog" role="dialog" aria-modal="true" aria-label="Chat settings" transition:scale|global={{ start: 0.96, duration: motion(160) }}>
     <header>
       <div>
         <h2>Chat settings</h2>

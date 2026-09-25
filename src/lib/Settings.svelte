@@ -556,8 +556,8 @@
     color: var(--faint);
     cursor: pointer;
     transition:
-      color 0.15s ease,
-      background-color 0.15s ease;
+      color calc(0.15s * var(--motion-scale)) var(--ease),
+      background-color calc(0.15s * var(--motion-scale)) var(--ease);
   }
   .remove-account:hover {
     color: var(--danger);
@@ -638,7 +638,7 @@
     font-size: 11px;
     font-weight: 600;
     opacity: 0;
-    transition: opacity 0.15s ease;
+    transition: opacity calc(0.15s * var(--motion-scale)) var(--ease);
   }
   .picture-edit:hover .picture-overlay,
   .picture-edit:focus-visible .picture-overlay,

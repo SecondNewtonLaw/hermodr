@@ -1,5 +1,6 @@
 <script lang="ts">
   import { fade, scale } from "svelte/transition";
+  import { motion } from "$lib/theme.svelte";
   import Icon from "$lib/Icon.svelte";
   import type { ChatEvent } from "$lib/EventCard.svelte";
 
@@ -101,12 +102,12 @@
 <div
   class="backdrop"
   role="presentation"
-  transition:fade|global={{ duration: 140 }}
+  transition:fade|global={{ duration: motion(140) }}
   onclick={(e) => e.target === e.currentTarget && onclose()}>
   <form
     class="dialog"
     aria-label={heading}
-    transition:scale|global={{ start: 0.96, duration: 160 }}
+    transition:scale|global={{ start: 0.96, duration: motion(160) }}
     onsubmit={(e) => (e.preventDefault(), submit())}>
     <header>
       <h2>{heading}</h2>

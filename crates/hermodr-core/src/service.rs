@@ -1914,7 +1914,7 @@ impl Service {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("no media folder configured"))?;
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}.{}", id, extension_for(media.kind, media.media_type)));
+        let path = dir.join(format!("{}.{}", id, media.extension()));
         std::fs::write(&path, &data)?;
         self.store
             .set_media_path(chat, id, &path.to_string_lossy())?;
@@ -3241,6 +3241,25 @@ struct MediaInfo {
     downloadable: Box<dyn Downloadable + Send + Sync>,
     /// The small JPEG the message carries, available without downloading.
     thumb: Option<Vec<u8>>,
+    /// A document's own extension, so the file opens as what it is.
+    ext: Option<String>,
+}
+
+impl MediaInfo {
+    fn extension(&self) -> String {
+        self.ext.clone().unwrap_or_else(|| extension_for(self.kind, self.media_type).to_string())
+    }
+}
+
+/// A safe file extension from a document's name, or its MIME type for an SVG.
+fn document_extension(document: &wa::message::DocumentMessage) -> Option<String> {
+    let from_name = document
+        .file_name
+        .as_deref()
+        .and_then(|n| n.rsplit_once('.'))
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .filter(|ext| (1..=8).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric()));
+    from_name.or_else(|| (document.mimetype.as_deref() == Some("image/svg+xml")).then(|| "svg".to_string()))
 }
 
 fn detect_media(message: &wa::Message) -> Option<MediaInfo> {
@@ -3250,6 +3269,7 @@ fn detect_media(message: &wa::Message) -> Option<MediaInfo> {
             media_type: MediaType::Image,
             downloadable: Box::new(image.clone()),
             thumb: image.jpeg_thumbnail.clone(),
+            ext: None,
         });
     }
     if let Some(video) = message.video_message.as_option() {
@@ -3263,6 +3283,7 @@ fn detect_media(message: &wa::Message) -> Option<MediaInfo> {
             media_type: MediaType::Video,
             downloadable: Box::new(video.clone()),
             thumb: video.jpeg_thumbnail.clone(),
+            ext: None,
         });
     }
     if let Some(audio) = message.audio_message.as_option() {
@@ -3271,6 +3292,7 @@ fn detect_media(message: &wa::Message) -> Option<MediaInfo> {
             media_type: MediaType::Audio,
             downloadable: Box::new(audio.clone()),
             thumb: None,
+            ext: None,
         });
     }
     if let Some(document) = message.document_message.as_option() {
@@ -3279,6 +3301,7 @@ fn detect_media(message: &wa::Message) -> Option<MediaInfo> {
             media_type: MediaType::Document,
             downloadable: Box::new(document.clone()),
             thumb: document.jpeg_thumbnail.clone(),
+            ext: document_extension(document),
         });
     }
     if let Some(sticker) = message.sticker_message.as_option() {
@@ -3287,6 +3310,7 @@ fn detect_media(message: &wa::Message) -> Option<MediaInfo> {
             media_type: MediaType::Sticker,
             downloadable: Box::new(sticker.clone()),
             thumb: None,
+            ext: None,
         });
     }
     None
@@ -3384,11 +3408,7 @@ async fn stored_message(
                 match client.download(media.downloadable.as_ref()).await {
                     Ok(bytes) => {
                         if std::fs::create_dir_all(dir).is_ok() {
-                            let path = dir.join(format!(
-                                "{}.{}",
-                                id,
-                                extension_for(media.kind, media.media_type)
-                            ));
+                            let path = dir.join(format!("{}.{}", id, media.extension()));
                             if std::fs::write(&path, &bytes).is_ok() {
                                 media_path = Some(path.to_string_lossy().to_string());
                             }

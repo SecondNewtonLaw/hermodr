@@ -1744,14 +1744,19 @@
     }
   }
 
+  /** An SVG file sent as a document, which is drawn in place like a picture. */
+  function isSvg(m: StoredMessage) {
+    return m.media_kind === "document" && /\.svg$/i.test(m.media_path ?? m.text.split("\n")[0].trim());
+  }
+
   /** Fetches a message's media on demand. */
-  // Stickers and voice notes read as part of the conversation, so ones that
+  // Stickers, voice notes and SVG files read as part of the conversation, so ones that
   // arrived before automatic fetching are fetched as soon as they are shown.
   const autoFetched = new Set<string>();
   $effect(() => {
     if (!connected) return;
     for (const m of messages) {
-      if (m.media_path || !(m.media_kind === "sticker" || m.media_kind === "audio")) continue;
+      if (m.media_path || !(m.media_kind === "sticker" || m.media_kind === "audio" || isSvg(m))) continue;
       if (autoFetched.has(m.id) || marks.view_once.some((v) => v.id === m.id)) continue;
       autoFetched.add(m.id);
       void untrack(() => downloadMedia(m, true));
@@ -2982,6 +2987,11 @@
                             saveEvent(message.chat, message.id, { ...eventFields(event), canceled: true }),
                           )
                       : undefined} />
+                {:else if isSvg(message) && message.media_path}
+                  <!-- An <img> never runs an SVG's scripts, so drawing it in place is safe. -->
+                  <button class="media-button svg-file" title="Open" onclick={() => openMedia(message.media_path!)}>
+                    <img class="media" src={convertFileSrc(message.media_path)} alt={message.text} />
+                  </button>
                 {:else if message.media_kind && (message.media_path || message.media_thumb)}
                   <button
                     class="file"
@@ -3695,6 +3705,8 @@
     --radius-lg: 10px;
     --font: "Segoe UI", "Helvetica Neue", system-ui, sans-serif;
     --font-size: 14.2px;
+    --motion-scale: 1;
+    --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
     color-scheme: var(--scheme, dark);
   }
   :global(html, body) {
@@ -3714,10 +3726,10 @@
   }
   :global(button) {
     transition:
-      background-color 0.15s ease,
-      color 0.15s ease,
-      opacity 0.15s ease,
-      transform 0.1s ease;
+      background-color calc(0.15s * var(--motion-scale)) var(--ease),
+      color calc(0.15s * var(--motion-scale)) var(--ease),
+      opacity calc(0.15s * var(--motion-scale)) var(--ease),
+      transform calc(0.1s * var(--motion-scale)) var(--ease);
   }
   :global(button:not(:disabled):active) {
     transform: translateY(1px);
@@ -3821,7 +3833,7 @@
     border-radius: 16px;
     background: var(--surface);
     box-shadow: var(--shadow);
-    animation: intro-in 0.35s ease both;
+    animation: intro-in calc(0.35s * var(--motion-scale)) var(--ease) both;
   }
   @keyframes intro-in {
     from {
@@ -3883,9 +3895,9 @@
     text-align: left;
     cursor: pointer;
     transition:
-      background 0.15s,
-      border-color 0.15s,
-      transform 0.15s;
+      background calc(0.15s * var(--motion-scale)),
+      border-color calc(0.15s * var(--motion-scale)),
+      transform calc(0.15s * var(--motion-scale));
   }
   .account-choice:hover {
     background: var(--raised-2);
@@ -4886,13 +4898,13 @@
     flex-direction: column;
     gap: 2px;
     transition:
-      opacity 0.22s ease,
-      transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+      opacity calc(0.22s * var(--motion-scale)) var(--ease),
+      transform calc(0.22s * var(--motion-scale)) var(--ease);
   }
   .messages.switching {
     opacity: 0;
     transform: translateY(8px);
-    transition-duration: 0.08s;
+    transition-duration: calc(0.08s * var(--motion-scale));
   }
   @media (prefers-reduced-motion: reduce) {
     .messages,
@@ -4909,11 +4921,11 @@
     display: flex;
     flex-direction: column;
     padding: 1px var(--pad-r) 1px var(--pad-l);
-    transition: background-color 0.6s ease;
+    transition: background-color calc(0.6s * var(--motion-scale)) var(--ease);
   }
   .msg-row:hover {
     background: var(--row-hover);
-    transition-duration: 0.15s;
+    transition-duration: calc(0.15s * var(--motion-scale));
   }
   /* The message a reply is being drafted to. */
   .msg-row.replying {
@@ -4931,7 +4943,7 @@
   /* The message a quote or mention jump landed on. */
   .msg-row.jumped {
     background: var(--jump-soft);
-    transition-duration: 0.15s;
+    transition-duration: calc(0.15s * var(--motion-scale));
   }
   .sync-banner {
     flex: none;
@@ -4957,7 +4969,7 @@
   .sync-bar {
     height: 100%;
     background: var(--accent);
-    transition: width 0.2s ease;
+    transition: width calc(0.2s * var(--motion-scale)) var(--ease);
   }
   .bubble {
     max-width: 70%;
@@ -5295,6 +5307,15 @@
     font-size: 28px;
     text-shadow: 0 1px 6px rgba(0, 0, 0, 0.8);
     pointer-events: none;
+  }
+  .svg-file .media {
+    width: 280px;
+    max-width: 100%;
+    max-height: 320px;
+    object-fit: contain;
+    padding: 8px;
+    box-sizing: border-box;
+    background: repeating-conic-gradient(var(--raised) 0 25%, var(--raised-2) 0 50%) 0 0 / 16px 16px;
   }
   .media-fetch {
     display: grid;
@@ -5645,10 +5666,10 @@
     animation: blink 1.2s infinite ease-in-out;
   }
   .dots i:nth-child(2) {
-    animation-delay: 0.15s;
+    animation-delay: calc(0.15s * var(--motion-scale));
   }
   .dots i:nth-child(3) {
-    animation-delay: 0.3s;
+    animation-delay: calc(0.3s * var(--motion-scale));
   }
   @keyframes blink {
     0%,

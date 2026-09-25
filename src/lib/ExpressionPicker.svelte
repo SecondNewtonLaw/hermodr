@@ -5,6 +5,7 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
   import { fly } from "svelte/transition";
+  import { motion } from "$lib/theme.svelte";
   import { convertFileSrc, invoke } from "@tauri-apps/api/core";
   import Icon from "$lib/Icon.svelte";
   import ImageCropper from "$lib/ImageCropper.svelte";
@@ -189,7 +190,7 @@
   role="dialog"
   aria-label="Emoji, GIFs and stickers"
   style="width: min({size.w}px, calc(100vw - 32px)); height: min({size.h}px, calc(100vh - 120px)); --picker-h: {size.h}px"
-  transition:fly={{ y: 8, duration: 140 }}>
+  transition:fly={{ y: 8, duration: motion(140) }}>
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
     class="resize"
@@ -359,7 +360,7 @@
     border-left: 2px solid var(--faint);
     border-top-left-radius: 3px;
     opacity: 0;
-    transition: opacity 0.15s ease;
+    transition: opacity calc(0.15s * var(--motion-scale)) var(--ease);
   }
   .picker:hover .resize::before {
     opacity: 1;
