@@ -14,6 +14,7 @@
     text: string;
     media_kind: string | null;
     media_path: string | null;
+    media_thumb: string | null;
     reply_to_id: string | null;
     reply_to_text: string | null;
     reply_to_sender: string | null;
@@ -1257,27 +1258,34 @@
                   </button>
                 {/if}
 
-                {#if message.media_kind === "image" && message.media_path}
+                {#if message.media_kind === "image" && (message.media_path || message.media_thumb)}
                   <button
                     class="media-button"
                     title="Open in image viewer"
-                    onclick={() => openMedia(message.media_path!)}>
-                    <img class="media" src={convertFileSrc(message.media_path)} alt={message.text} />
+                    onclick={() => openMedia((message.media_path ?? message.media_thumb)!)}>
+                    <img
+                      class="media"
+                      src={convertFileSrc((message.media_path ?? message.media_thumb)!)}
+                      alt={message.text}
+                    />
                   </button>
-                {:else if message.media_kind === "video" && message.media_path}
+                {:else if (message.media_kind === "video" || message.media_kind === "gif") &&
+                (message.media_path || message.media_thumb)}
                   <button
                     class="media-button video"
-                    title="Open in video player"
-                    onclick={() => openMedia(message.media_path!)}>
-                    <span class="video-face">🎬</span>
-                    <span class="video-label">
-                      {message.text && !message.text.startsWith("[") ? message.text : "Video"}
-                    </span>
+                    title={message.media_kind === "gif" ? "Open GIF" : "Open in video player"}
+                    onclick={() => message.media_path && openMedia(message.media_path)}>
+                    {#if message.media_thumb}
+                      <img class="media" src={convertFileSrc(message.media_thumb)} alt="" />
+                    {/if}
+                    <span class="media-overlay">{message.media_kind === "gif" ? "GIF" : "▶"}</span>
                   </button>
                 {:else if message.media_kind === "audio" && message.media_path}
                   <AudioPlayer path={message.media_path} />
-                {:else if message.media_kind && message.media_path}
-                  <button class="file" onclick={() => openMedia(message.media_path!)}>
+                {:else if message.media_kind && (message.media_path || message.media_thumb)}
+                  <button
+                    class="file"
+                    onclick={() => message.media_path && openMedia(message.media_path)}>
                     {message.text || message.media_kind}
                   </button>
                 {:else}
@@ -2140,16 +2148,18 @@
     min-width: 180px;
     min-height: 100px;
   }
-  .video-face {
-    font-size: 28px;
-  }
-  .video-label {
-    font-size: 12px;
-    color: #a1a1aa;
-    max-width: 180px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+  .media-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #e4e4e7;
+    font-size: 26px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    text-shadow: 0 1px 6px rgba(0, 0, 0, 0.8);
+    pointer-events: none;
   }
   .play-badge {
     position: absolute;

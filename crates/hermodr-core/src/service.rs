@@ -871,6 +871,7 @@ impl Service {
             text,
             media_kind: None,
             media_path: None,
+            media_thumb: None,
             reply_to_id: None,
             reply_to_text: None,
             reply_to_sender: None,
@@ -1092,6 +1093,7 @@ impl Service {
             text,
             media_kind: None,
             media_path: None,
+            media_thumb: None,
             reply_to_id: Some(reply_to_id.to_string()),
             reply_to_text: Some(reply_to_text.to_string()),
             reply_to_sender: Some(if sender.to_string() == self.own_jid() {
@@ -1227,6 +1229,7 @@ impl Service {
             text: caption.unwrap_or_default(),
             media_kind: Some(kind.to_string()),
             media_path: stored_path,
+            media_thumb: None,
             reply_to_id: reply.as_ref().map(|(id, _, _)| id.clone()),
             reply_to_text: reply.as_ref().map(|(_, _, text)| text.clone()),
             reply_to_sender: reply.as_ref().map(|(_, sender, _)| sender.clone()),
@@ -1379,21 +1382,55 @@ fn unix_now() -> i64 {
 }
 
 /// The media carried by a message, if any.
-///
-/// Returns the kind and a boxed download reference: the four media protos are
-/// distinct types that each implement `Downloadable`.
-fn detect_media(message: &wa::Message) -> Option<(&'static str, MediaType, Box<dyn Downloadable + Send + Sync>)> {
+struct MediaInfo {
+    /// `image`, `video`, `gif`, `audio` or `document`. A video sent with
+    /// `gifPlayback` is a GIF, which WhatsApp keeps as a muted looping clip.
+    kind: &'static str,
+    media_type: MediaType,
+    /// The four media protos are distinct types that each implement
+    /// `Downloadable`.
+    downloadable: Box<dyn Downloadable + Send + Sync>,
+    /// The small JPEG the message carries, available without downloading.
+    thumb: Option<Vec<u8>>,
+}
+
+fn detect_media(message: &wa::Message) -> Option<MediaInfo> {
     if let Some(image) = message.image_message.as_option() {
-        return Some(("image", MediaType::Image, Box::new(image.clone())));
+        return Some(MediaInfo {
+            kind: "image",
+            media_type: MediaType::Image,
+            downloadable: Box::new(image.clone()),
+            thumb: image.jpeg_thumbnail.clone(),
+        });
     }
     if let Some(video) = message.video_message.as_option() {
-        return Some(("video", MediaType::Video, Box::new(video.clone())));
+        let kind = if video.gif_playback.unwrap_or(false) {
+            "gif"
+        } else {
+            "video"
+        };
+        return Some(MediaInfo {
+            kind,
+            media_type: MediaType::Video,
+            downloadable: Box::new(video.clone()),
+            thumb: video.jpeg_thumbnail.clone(),
+        });
     }
     if let Some(audio) = message.audio_message.as_option() {
-        return Some(("audio", MediaType::Audio, Box::new(audio.clone())));
+        return Some(MediaInfo {
+            kind: "audio",
+            media_type: MediaType::Audio,
+            downloadable: Box::new(audio.clone()),
+            thumb: None,
+        });
     }
     if let Some(document) = message.document_message.as_option() {
-        return Some(("document", MediaType::Document, Box::new(document.clone())));
+        return Some(MediaInfo {
+            kind: "document",
+            media_type: MediaType::Document,
+            downloadable: Box::new(document.clone()),
+            thumb: document.jpeg_thumbnail.clone(),
+        });
     }
     None
 }
@@ -1412,17 +1449,33 @@ async fn incoming_message(
 
     let mut media_kind = None;
     let mut media_path = None;
+    let mut media_thumb = None;
 
-    if let Some((kind, media_type, downloadable)) = detect_media(&inbound.message) {
-        media_kind = Some(kind.to_string());
+    if let Some(media) = detect_media(&inbound.message) {
+        media_kind = Some(media.kind.to_string());
+
+        // The thumbnail rides in the message, so it is kept even when the file
+        // itself is not downloaded.
+        if let (Some(dir), Some(bytes)) = (media_dir, media.thumb.as_ref()) {
+            if std::fs::create_dir_all(dir).is_ok() {
+                let path = dir.join(format!("{}_thumb.jpg", info.id));
+                if std::fs::write(&path, bytes).is_ok() {
+                    media_thumb = Some(path.to_string_lossy().to_string());
+                }
+            }
+        }
 
         // Download when a destination and a client are available. A failure
         // still records the message, so the text and metadata are not lost.
         if let (Some(client), Some(dir)) = (client, media_dir) {
-            match client.download(downloadable.as_ref()).await {
+            match client.download(media.downloadable.as_ref()).await {
                 Ok(bytes) => {
                     if std::fs::create_dir_all(dir).is_ok() {
-                        let path = dir.join(format!("{}.{}", info.id, extension_for(kind, media_type)));
+                        let path = dir.join(format!(
+                            "{}.{}",
+                            info.id,
+                            extension_for(media.kind, media.media_type)
+                        ));
                         if std::fs::write(&path, &bytes).is_ok() {
                             media_path = Some(path.to_string_lossy().to_string());
                         }
@@ -1433,7 +1486,7 @@ async fn incoming_message(
         }
 
         if text.is_empty() {
-            text = format!("[{kind}]");
+            text = format!("[{}]", media.kind);
         }
     }
 
@@ -1489,6 +1542,7 @@ async fn incoming_message(
         text,
         media_kind,
         media_path,
+        media_thumb,
         reply_to_id,
         reply_to_text,
         reply_to_sender,
@@ -1539,7 +1593,7 @@ fn link_preview(
 fn extension_for(kind: &str, media_type: MediaType) -> &'static str {
     match kind {
         "image" => "jpg",
-        "video" => "mp4",
+        "video" | "gif" => "mp4",
         "audio" => "ogg",
         "document" => "bin",
         _ => match media_type {
@@ -1825,6 +1879,7 @@ mod tests {
                 text: "hi".into(),
                 media_kind: None,
                 media_path: None,
+                media_thumb: None,
                 reply_to_id: None,
                 reply_to_text: None,
                 reply_to_sender: None,
