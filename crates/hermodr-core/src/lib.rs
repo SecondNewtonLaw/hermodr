@@ -17,7 +17,7 @@ pub use service::{
     ServiceEvent, VoiceNote,
 };
 pub use store::{
-    ChatMarks, ChatRetention, ChatSummary, MessageStore, NewEvent, Retention, StoredMessage,
+    ChatMarks, ChatRetention, ChatSummary, MessageReceipt, MessageStore, NewEvent, Retention, StoredMessage,
     ViewOnce,
 };
 

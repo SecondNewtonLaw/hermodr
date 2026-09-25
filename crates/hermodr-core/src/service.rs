@@ -867,6 +867,21 @@ impl Service {
                                     ReceiptType::Sent => Some("sent"),
                                     _ => None,
                                 };
+                                // Kept per recipient for the message info screen; our
+                                // own devices' receipts say nothing about the others.
+                                let kind = match receipt.r#type {
+                                    ReceiptType::Delivered => Some("delivered"),
+                                    ReceiptType::Read => Some("read"),
+                                    ReceiptType::Played => Some("played"),
+                                    _ => None,
+                                };
+                                if let Some(kind) = kind {
+                                    let recipient = receipt.source.sender.to_non_ad().to_string();
+                                    let at = receipt.timestamp.timestamp();
+                                    for id in receipt.message_ids.iter() {
+                                        let _ = store.record_receipt(id.as_str(), &recipient, kind, at);
+                                    }
+                                }
                                 if let Some(status) = status {
                                     let chat = receipt.source.chat.to_string();
                                     for id in receipt.message_ids.iter() {
@@ -1275,6 +1290,19 @@ impl Service {
                 .or_else(|| mention.ends_with("@s.whatsapp.net").then(|| mention.clone()))
                 .map(|j| j.split('@').next().unwrap_or(&j).to_string());
             let username = member.username.as_ref().map(|u| u.to_string());
+            // The name members see for each other in the group (WhatsApp Web's
+            // "~name"). Stored under every address so mentions and senders find it.
+            let display = member
+                .details
+                .as_ref()
+                .and_then(|d| d.display_name.as_ref())
+                .map(|n| n.to_string())
+                .filter(|n| !n.trim().is_empty());
+            if let Some(display) = &display {
+                for jid in candidates.iter().flatten() {
+                    let _ = self.store.set_name(&jid.to_non_ad().to_string(), display);
+                }
+            }
             // A name someone can read: saved/push name, then username, then the
             // phone number, and only last the LID.
             // A bare-number placeholder under one form must not hide a real
@@ -1284,6 +1312,7 @@ impl Service {
                 .flatten()
                 .filter_map(|j| self.store.name_for(&j.to_string()).ok().flatten())
                 .find(|n| !n.trim_start_matches('+').chars().all(|c| c.is_ascii_digit()))
+                .or_else(|| display.clone())
                 .or_else(|| username.clone())
                 .or_else(|| number.clone())
                 .unwrap_or_else(|| mention.split('@').next().unwrap_or(&mention).to_string());
@@ -2106,6 +2135,11 @@ impl Service {
         self.store.apply_edit(chat, id, &event.name)?;
         let _ = self.events.send(ServiceEvent::Marks { chat: chat.to_string() });
         Ok(())
+    }
+
+    /// Who got, read and played one of our messages.
+    pub fn message_info(&self, id: &str) -> Result<Vec<crate::store::MessageReceipt>> {
+        self.store.receipts(id)
     }
 
     /// Starred messages across every chat, newest first.

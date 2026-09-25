@@ -48,6 +48,7 @@
     "allow-user-profile",
     "allow-invite-info",
     "allow-join-invite",
+    "allow-message-info",
     "allow-own-jid",
     "allow-send-typing",
     "allow-set-online",

@@ -165,6 +165,16 @@ fn message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
     })
 }
 
+/// One recipient's receipts for a message we sent, as Unix times.
+#[derive(Debug, Clone, Serialize)]
+pub struct MessageReceipt {
+    pub recipient: String,
+    pub name: Option<String>,
+    pub delivered_at: Option<i64>,
+    pub read_at: Option<i64>,
+    pub played_at: Option<i64>,
+}
+
 /// A chat's own retention, overriding the global policy where set.
 /// `Some(0)` keeps without limit; `None` defers to the global setting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -396,6 +406,9 @@ impl MessageStore {
                  chat TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY (chat, id));
              CREATE TABLE IF NOT EXISTS edited (
                  chat TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY (chat, id));
+             CREATE TABLE IF NOT EXISTS receipts (
+                 id TEXT NOT NULL, recipient TEXT NOT NULL, delivered_at INTEGER,
+                 read_at INTEGER, played_at INTEGER, PRIMARY KEY (id, recipient));
              CREATE TABLE IF NOT EXISTS chat_retention (
                  jid TEXT PRIMARY KEY, max_age_hours INTEGER, max_messages INTEGER,
                  on_demand INTEGER NOT NULL DEFAULT 1);",
@@ -897,6 +910,47 @@ impl MessageStore {
         let edited = ids("edited")?;
 
         Ok(ChatMarks { reactions, starred, pinned, polls, events, view_once, forwarded, edited })
+    }
+
+    /// Records when one recipient got, read or played one of our messages.
+    /// Reading implies delivery, and playing implies reading.
+    pub fn record_receipt(&self, id: &str, recipient: &str, kind: &str, at: i64) -> Result<()> {
+        let (delivered, read, played) = match kind {
+            "played" => (Some(at), Some(at), Some(at)),
+            "read" => (Some(at), Some(at), None),
+            _ => (Some(at), None, None),
+        };
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO receipts (id, recipient, delivered_at, read_at, played_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id, recipient) DO UPDATE SET
+                 delivered_at = COALESCE(receipts.delivered_at, excluded.delivered_at),
+                 read_at = COALESCE(receipts.read_at, excluded.read_at),
+                 played_at = COALESCE(receipts.played_at, excluded.played_at)",
+            params![id, recipient, delivered, read, played],
+        )?;
+        Ok(())
+    }
+
+    /// Who got, read and played one of our messages, and when.
+    pub fn receipts(&self, id: &str) -> Result<Vec<MessageReceipt>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT r.recipient, n.name, r.delivered_at, r.read_at, r.played_at
+             FROM receipts r LEFT JOIN names n ON n.jid = r.recipient
+             WHERE r.id = ?1 ORDER BY COALESCE(r.read_at, r.delivered_at)",
+        )?;
+        let rows = stmt.query_map(params![id], |r| {
+            Ok(MessageReceipt {
+                recipient: r.get(0)?,
+                name: r.get(1)?,
+                delivered_at: r.get(2)?,
+                read_at: r.get(3)?,
+                played_at: r.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
     pub fn set_forwarded(&self, chat: &str, id: &str) -> Result<()> {
@@ -1538,6 +1592,20 @@ mod tests {
         assert_eq!(s.chat_retention("a").unwrap(), keep_all);
         s.set_chat_retention("a", &ChatRetention::default()).unwrap();
         assert_eq!(s.chat_retention("a").unwrap(), ChatRetention::default());
+    }
+
+    #[test]
+    fn receipts_only_move_forward() {
+        let s = store(Retention::unlimited());
+        s.record_receipt("m", "a", "delivered", 10).unwrap();
+        s.record_receipt("m", "a", "read", 20).unwrap();
+        s.record_receipt("m", "a", "delivered", 30).unwrap();
+        s.record_receipt("m", "b", "played", 40).unwrap();
+        let got = s.receipts("m").unwrap();
+        let a = got.iter().find(|r| r.recipient == "a").unwrap();
+        assert_eq!((a.delivered_at, a.read_at, a.played_at), (Some(10), Some(20), None));
+        let b = got.iter().find(|r| r.recipient == "b").unwrap();
+        assert_eq!((b.delivered_at, b.read_at, b.played_at), (Some(40), Some(40), Some(40)));
     }
 
     #[test]

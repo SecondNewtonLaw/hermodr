@@ -736,6 +736,12 @@ async fn edit_event(state: State<'_, AppState>, chat: String, id: String, event:
     state.service()?.edit_event(&chat, &id, event.into()).await.map_err(|e| e.to_string())
 }
 
+/// Who got, read and played one of our messages.
+#[tauri::command]
+fn message_info(state: State<'_, AppState>, id: String) -> Result<Vec<hermodr_core::MessageReceipt>, String> {
+    state.service()?.message_info(&id).map_err(|e| e.to_string())
+}
+
 /// Starred messages across every chat, newest first.
 #[tauri::command]
 fn starred_messages(state: State<'_, AppState>) -> Result<Vec<StoredMessage>, String> {
@@ -1288,6 +1294,7 @@ pub fn run() {
             user_profile,
             invite_info,
             join_invite,
+            message_info,
             own_jid,
             send_typing,
             set_online,

@@ -7,6 +7,7 @@
   import StarredList, { type StarredItem } from "$lib/StarredList.svelte";
   import ChatSettings, { type ChatRetention } from "$lib/ChatSettings.svelte";
   import ProfileCard from "$lib/ProfileCard.svelte";
+  import MessageInfo from "$lib/MessageInfo.svelte";
   import InviteCard, { inviteLink } from "$lib/InviteCard.svelte";
   import { displayName as phoneName, phoneLabel } from "$lib/phone";
   import { polyfillCountryFlagEmojis } from "country-flag-emoji-polyfill";
@@ -512,6 +513,14 @@
     // Group members power the @ autocomplete; a one-to-one chat returns none.
     try {
       participants = await invoke<Member[]>("participants", { chat });
+      // Loading members stores their group display names, so numbers looked up
+      // before now may have a name; ask again.
+      for (const [jid, name] of Object.entries(learnedNames)) {
+        if (/^\+?\d+$/.test(name)) {
+          delete learnedNames[jid];
+          requestedNames.delete(jid);
+        }
+      }
     } catch {
       participants = [];
     }
@@ -1680,20 +1689,21 @@
       if (m.media_path || !(m.media_kind === "sticker" || m.media_kind === "audio")) continue;
       if (autoFetched.has(m.id) || marks.view_once.some((v) => v.id === m.id)) continue;
       autoFetched.add(m.id);
-      void untrack(() => downloadMedia(m));
+      void untrack(() => downloadMedia(m, true));
     }
   });
 
   /** Media downloads in flight, so a second click does not start another. */
   let downloading = $state<Record<string, true>>({});
-  async function downloadMedia(message: StoredMessage) {
+  /** `quiet` for background fetches, whose failures only matter once clicked. */
+  async function downloadMedia(message: StoredMessage, quiet = false) {
     if (!selectedChat || downloading[message.id]) return;
     downloading[message.id] = true;
     try {
       await invoke("download_media", { chat: selectedChat, id: message.id });
       await reloadMessages();
     } catch (e) {
-      error = String(e);
+      if (!quiet) error = String(e);
     } finally {
       delete downloading[message.id];
     }
@@ -1788,6 +1798,15 @@
   let forwarding = $state<StoredMessage | null>(null);
   let deleting = $state<StoredMessage | null>(null);
   let reporting = $state<StoredMessage | null>(null);
+  /** Our message whose delivery and reads are shown; the version reloads it on new receipts. */
+  let infoFor = $state<StoredMessage | null>(null);
+  let infoVersion = $state(0);
+  // Later readers in a group change no status, so the open info refreshes itself.
+  $effect(() => {
+    if (!infoFor) return;
+    const timer = setInterval(() => (infoVersion += 1), 3000);
+    return () => clearInterval(timer);
+  });
 
   function target(m: StoredMessage) {
     return { chat: m.chat, id: m.id, sender: m.sender, fromMe: m.from_me };
@@ -1816,6 +1835,9 @@
         },
       },
     ];
+    if (m.from_me) {
+      items.push({ label: "Message info", icon: "check", action: () => (infoFor = m) });
+    }
     if (other) {
       items.push(
         {
@@ -3304,6 +3326,21 @@
       await refreshChats();
     }}
     onclose={() => (chatSettingsOpen = false)} />
+{/if}
+
+{#if infoFor}
+  {@const m = infoFor}
+  <MessageInfo
+    id={m.id}
+    sentAt={m.timestamp}
+    preview={replyPreviewText(m)}
+    voice={m.media_kind === "audio"}
+    group={m.chat.endsWith("@g.us")}
+    audience={m.chat === selectedChat ? Math.max(0, participants.length - 1) : 0}
+    version={infoVersion}
+    namer={(name, jid) => (name && !/^\+?\d+$/.test(name) ? name : senderName(jid))}
+    picture={(jid) => pictureOf(bare(jid))}
+    onclose={() => (infoFor = null)} />
 {/if}
 
 {#if profileCard}

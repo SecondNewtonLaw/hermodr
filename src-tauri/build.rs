@@ -36,6 +36,7 @@ const COMMANDS: &[&str] = &[
     "user_profile",
     "invite_info",
     "join_invite",
+    "message_info",
     "own_jid",
     "send_typing",
     "set_online",
