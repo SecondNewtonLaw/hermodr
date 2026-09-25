@@ -2323,12 +2323,12 @@ impl Service {
         self.store.pings(chat, 500)
     }
 
-    /// Messages in a chat containing `query`, newest first.
-    pub fn search_messages(&self, chat: &str, query: &str) -> Result<Vec<StoredMessage>> {
+    /// Up to `limit` messages in a chat containing `query`, newest first.
+    pub fn search_messages(&self, chat: &str, query: &str, limit: u32) -> Result<Vec<StoredMessage>> {
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
-        self.store.search_messages(chat, query.trim(), 200)
+        self.store.search_messages(chat, query.trim(), limit)
     }
 
     pub fn chat_retention(&self, chat: &str) -> Result<crate::store::ChatRetention> {

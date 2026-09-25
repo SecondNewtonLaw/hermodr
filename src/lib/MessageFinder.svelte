@@ -23,6 +23,7 @@
     items,
     empty,
     onquery,
+    onmore,
     onopen,
     onclose,
   }: {
@@ -35,11 +36,23 @@
     empty: string;
     /** Asks for fresh results; without it the query only filters `items`. */
     onquery?: (query: string) => void;
+    /** Present while more results can be fetched. */
+    onmore?: () => Promise<void>;
     onopen: (item: FoundItem) => void;
     onclose: () => void;
   } = $props();
 
   let query = $state("");
+  let loadingMore = $state(false);
+  async function more() {
+    if (!onmore || loadingMore) return;
+    loadingMore = true;
+    try {
+      await onmore();
+    } finally {
+      loadingMore = false;
+    }
+  }
   let timer: ReturnType<typeof setTimeout> | undefined;
   function typed() {
     if (!onquery) return;
@@ -127,6 +140,13 @@
           </button>
         </li>
       {/each}
+      {#if onmore && items && items.length > 0}
+        <li class="more-row">
+          <button class="more" disabled={loadingMore} onclick={more}>
+            {#if loadingMore}<span class="spinner"></span> Loading…{:else}Load more{/if}
+          </button>
+        </li>
+      {/if}
     </ul>
   </div>
 </div>
@@ -288,6 +308,44 @@
     overflow: hidden;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+  }
+  .more-row {
+    display: flex;
+    justify-content: center;
+    padding: 8px 0 4px;
+  }
+  .more {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 18px;
+    border: 1px solid var(--line-strong);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .more:hover:not(:disabled) {
+    background: var(--raised);
+  }
+  .more:disabled {
+    color: var(--muted);
+    cursor: default;
+  }
+  .spinner {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: 2px solid var(--line-strong);
+    border-top-color: var(--accent);
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
   mark {
     border-radius: 3px;

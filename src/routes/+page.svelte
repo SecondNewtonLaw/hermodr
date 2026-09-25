@@ -1779,7 +1779,16 @@
   }
 
   /** Mentions of us (everywhere or in one chat), or a search inside one chat. */
-  let finder = $state<{ mode: "pings" | "search"; chat: string | null; items: FoundItem[] | null } | null>(null);
+  let finder = $state<{
+    mode: "pings" | "search";
+    chat: string | null;
+    items: FoundItem[] | null;
+    /** Search only: the query shown and how many results were asked for. */
+    query?: string;
+    limit?: number;
+    more?: boolean;
+  } | null>(null);
+  const SEARCH_PAGE = 50;
   const unreadPings = $derived(chats.reduce((n, c) => n + c.mention_count, 0));
 
   function found(m: StoredMessage, across: boolean): FoundItem {
@@ -1805,17 +1814,26 @@
     }
   }
 
-  async function searchChat(query: string) {
-    const chat = finder?.chat;
-    if (!chat) return;
+  /** Searches the open finder's chat; `more` asks for the next page of the same query. */
+  async function searchChat(query: string, more = false) {
+    const current = finder;
+    const chat = current?.chat;
+    if (!current || !chat) return;
     if (!query.trim()) {
-      finder!.items = [];
+      Object.assign(current, { items: [], query, limit: SEARCH_PAGE, more: false });
       return;
     }
-    finder!.items = null;
+    const limit = more ? (current.limit ?? SEARCH_PAGE) + SEARCH_PAGE : SEARCH_PAGE;
+    if (!more) current.items = null;
     try {
-      const got = await invoke<StoredMessage[]>("search_messages", { chat, query });
-      if (finder?.mode === "search" && finder.chat === chat) finder.items = got.map((m) => found(m, false));
+      const got = await invoke<StoredMessage[]>("search_messages", { chat, query, limit });
+      if (finder !== current) return;
+      Object.assign(current, {
+        items: got.map((m) => found(m, false)),
+        query,
+        limit,
+        more: got.length === limit,
+      });
     } catch (e) {
       error = String(e);
     }
@@ -3679,7 +3697,8 @@
     placeholder={finder.mode === "search" ? "Search this chat" : "Filter mentions"}
     items={finder.items}
     empty={finder.mode === "search" ? "Type to search the messages kept on this computer." : "Nobody has mentioned you yet."}
-    onquery={finder.mode === "search" ? searchChat : undefined}
+    onquery={finder.mode === "search" ? (q) => searchChat(q) : undefined}
+    onmore={finder.mode === "search" && finder.more ? () => searchChat(finder?.query ?? "", true) : undefined}
     onopen={(item) => {
       finder = null;
       void jumpTo(item.chat, item.id);

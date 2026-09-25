@@ -813,10 +813,18 @@ fn pings(state: State<'_, AppState>, chat: Option<String>) -> Result<Vec<StoredM
     state.service()?.pings(chat.as_deref()).map_err(|e| e.to_string())
 }
 
-/// Messages in one chat whose text contains `query`.
+/// Up to `limit` (default 50) messages in one chat whose text contains `query`.
 #[tauri::command]
-fn search_messages(state: State<'_, AppState>, chat: String, query: String) -> Result<Vec<StoredMessage>, String> {
-    state.service()?.search_messages(&chat, &query).map_err(|e| e.to_string())
+fn search_messages(
+    state: State<'_, AppState>,
+    chat: String,
+    query: String,
+    limit: Option<u32>,
+) -> Result<Vec<StoredMessage>, String> {
+    state
+        .service()?
+        .search_messages(&chat, &query, limit.unwrap_or(50))
+        .map_err(|e| e.to_string())
 }
 
 #[derive(serde::Serialize)]
