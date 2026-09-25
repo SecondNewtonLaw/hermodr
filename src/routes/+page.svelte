@@ -690,6 +690,21 @@
   let recall: { chat: string; until: number; rounds: number; auto: boolean } | null = null;
 
   /** Asks the phone for about a day of older messages in the open chat. */
+  /** Resolved whenever a recall ends, however it ends. */
+  let recallWaiters: (() => void)[] = [];
+  function settleRecall() {
+    const waiters = recallWaiters;
+    recallWaiters = [];
+    for (const done of waiters) done();
+  }
+  /** Asks the phone for the chat's previous day and waits until it has landed or given up. */
+  function recallDay(): Promise<void> {
+    if (!selectedChat || olderExhausted) return Promise.resolve();
+    const done = new Promise<void>((resolve) => recallWaiters.push(resolve));
+    if (!loadingOlder) void loadOlder();
+    return done;
+  }
+
   async function loadOlder(auto = false) {
     if (!selectedChat || loadingOlder) return;
     const oldest = messages.at(-1)?.timestamp ?? Math.floor(Date.now() / 1000);
@@ -709,6 +724,7 @@
       recall = null;
       olderExhausted = true;
       if (!auto) error = "Your phone did not answer. It has to be online for older messages to load.";
+      settleRecall();
     }, 15000);
     try {
       await invoke("load_older", { chat: selectedChat, count: 50 });
@@ -716,16 +732,23 @@
       loadingOlder = false;
       recall = null;
       error = String(e);
+      settleRecall();
     }
   }
 
   /** After a batch lands: keep walking back until the day is covered. */
   function continueRecall(added: number) {
     const oldest = messages.at(-1)?.timestamp;
-    if (!recall || recall.chat !== selectedChat) return;
+    if (!recall || recall.chat !== selectedChat) {
+      settleRecall();
+      return;
+    }
     if (added === 0) olderExhausted = true;
     if (added > 0 && oldest && oldest > recall.until && ++recall.rounds < 10) void requestOlder();
-    else recall = null;
+    else {
+      recall = null;
+      settleRecall();
+    }
   }
 
   /** Runs the chat/contact/group search. */
@@ -1783,12 +1806,12 @@
     mode: "pings" | "search";
     chat: string | null;
     items: FoundItem[] | null;
-    /** Search only: the query shown and how many results were asked for. */
+    /** Search only: the query shown, how far back the chat is loaded, and whether the phone may have older days. */
     query?: string;
-    limit?: number;
+    reach?: number | null;
     more?: boolean;
   } | null>(null);
-  const SEARCH_PAGE = 50;
+  const SEARCH_LIMIT = 500;
   const unreadPings = $derived(chats.reduce((n, c) => n + c.mention_count, 0));
 
   function found(m: StoredMessage, across: boolean): FoundItem {
@@ -1814,25 +1837,30 @@
     }
   }
 
-  /** Searches the open finder's chat; `more` asks for the next page of the same query. */
+  /**
+   * Searches the open finder's chat. `more` first asks the phone for the
+   * previous 24 hours of the chat, then searches again over everything kept.
+   */
   async function searchChat(query: string, more = false) {
     const current = finder;
     const chat = current?.chat;
     if (!current || !chat) return;
+    if (more && chat === selectedChat) await recallDay();
+    if (finder !== current) return;
+    const reach = messages.at(-1)?.timestamp ?? null;
     if (!query.trim()) {
-      Object.assign(current, { items: [], query, limit: SEARCH_PAGE, more: false });
+      Object.assign(current, { items: [], query, reach, more: false });
       return;
     }
-    const limit = more ? (current.limit ?? SEARCH_PAGE) + SEARCH_PAGE : SEARCH_PAGE;
     if (!more) current.items = null;
     try {
-      const got = await invoke<StoredMessage[]>("search_messages", { chat, query, limit });
+      const got = await invoke<StoredMessage[]>("search_messages", { chat, query, limit: SEARCH_LIMIT });
       if (finder !== current) return;
       Object.assign(current, {
         items: got.map((m) => found(m, false)),
         query,
-        limit,
-        more: got.length === limit,
+        reach,
+        more: !olderExhausted,
       });
     } catch (e) {
       error = String(e);
@@ -2868,7 +2896,14 @@
               class="icon"
               title="Search in this chat"
               aria-label="Search in this chat"
-              onclick={() => (finder = { mode: "search", chat: selectedChat, items: [] })}
+              onclick={() =>
+                (finder = {
+                  mode: "search",
+                  chat: selectedChat,
+                  items: [],
+                  reach: messages.at(-1)?.timestamp ?? null,
+                  more: !olderExhausted,
+                })}
               ><Icon name="search" size={18} /></button>
             {#if selectedChat.endsWith("@g.us")}
               <button
@@ -3693,7 +3728,10 @@
   {@const inChat = finder.chat ? chatName(finder.chat) : null}
   <MessageFinder
     title={finder.mode === "search" ? "Search messages" : inChat ? "Your mentions" : "Mentions"}
-    subtitle={inChat ?? (finder.mode === "pings" ? "Every message that pinged you" : null)}
+    subtitle={finder.mode === "search" && finder.reach
+      ? `${inChat} · searched back to ${new Date(finder.reach * 1000).toLocaleDateString([], { day: "numeric", month: "short", year: "numeric" })}`
+      : (inChat ?? (finder.mode === "pings" ? "Every message that pinged you" : null))}
+    moreLabel="Load the previous day"
     placeholder={finder.mode === "search" ? "Search this chat" : "Filter mentions"}
     items={finder.items}
     empty={finder.mode === "search" ? "Type to search the messages kept on this computer." : "Nobody has mentioned you yet."}

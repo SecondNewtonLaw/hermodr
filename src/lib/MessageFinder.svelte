@@ -24,6 +24,7 @@
     empty,
     onquery,
     onmore,
+    moreLabel = "Load more",
     onopen,
     onclose,
   }: {
@@ -38,6 +39,7 @@
     onquery?: (query: string) => void;
     /** Present while more results can be fetched. */
     onmore?: () => Promise<void>;
+    moreLabel?: string;
     onopen: (item: FoundItem) => void;
     onclose: () => void;
   } = $props();
@@ -140,10 +142,10 @@
           </button>
         </li>
       {/each}
-      {#if onmore && items && items.length > 0}
+      {#if onmore && items !== null && needle}
         <li class="more-row">
           <button class="more" disabled={loadingMore} onclick={more}>
-            {#if loadingMore}<span class="spinner"></span> Loading…{:else}Load more{/if}
+            {#if loadingMore}<span class="spinner"></span> Asking your phone…{:else}{moreLabel}{/if}
           </button>
         </li>
       {/if}
