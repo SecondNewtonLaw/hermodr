@@ -178,6 +178,8 @@
   let connected = $state(false);
   let connecting = $state(false);
   let started = $state(false);
+  /** Launch chooser, shown when several linked accounts could be signed into. */
+  let choosingAccount = $state(false);
   /** True while a newly opened chat's messages load, so the old ones fade out. */
   let switching = $state(false);
   let qrSvg = $state<string | null>(null);
@@ -614,6 +616,13 @@
     showGroupInfo = false;
   }
 
+  /** Starts the account picked on the launch chooser. */
+  async function chooseAccount(id: string) {
+    choosingAccount = false;
+    if (id === activeAccount) await connect();
+    else await switchTo(id);
+  }
+
   async function switchTo(id: string) {
     if (id === activeAccount) return;
     try {
@@ -973,14 +982,31 @@
     for (const message of messages) if (!message.from_me) loadAvatar(bare(message.sender));
   });
 
+  /** Each account's own picture as last seen, so it shows before that account connects. */
+  function rememberedAvatar(id: string): string | null {
+    try {
+      return localStorage.getItem(`hermodr.avatar.${id}`);
+    } catch {
+      return null;
+    }
+  }
   const accountAvatars = $derived(
     Object.fromEntries(
       accountList.map((a) => {
         const jid = a.id === activeAccount ? (me ?? a.jid) : a.jid;
-        return [a.id, jid ? (avatars[jid] ?? null) : null];
+        return [a.id, (jid ? avatars[jid] : null) ?? rememberedAvatar(a.id)];
       }),
     ) as Record<string, string | null>,
   );
+  $effect(() => {
+    const own = activeAccount && me ? avatars[me] : null;
+    if (!own) return;
+    try {
+      localStorage.setItem(`hermodr.avatar.${activeAccount}`, own);
+    } catch {
+      // Storage may be unavailable; the picture then only shows once connected.
+    }
+  });
 
   /** Who is typing in each chat, until they pause or ten seconds pass. */
   let typing: Record<string, { sender: string; state: string }[]> = $state({});
@@ -2203,8 +2229,15 @@
 
       // Reuse a stored session automatically: pairing is only needed the very
       // first time, so the button should never be shown to a paired account.
-      await connect();
+      // With several linked accounts the user picks one first.
       await loadAccounts();
+      await syncState();
+      if (!started && accountList.filter((a) => a.jid).length > 1) {
+        choosingAccount = true;
+      } else {
+        await connect();
+        await loadAccounts();
+      }
     }
 
     setup();
@@ -2331,7 +2364,28 @@
       </button>
     </header>
 
-    {#if linked}
+    {#if choosingAccount}
+      <div class="intro-card resume">
+        <h2>Choose an account</h2>
+        <span class="resume-who">Several WhatsApp accounts are linked on this computer.</span>
+        <div class="account-choices">
+          {#each accountList.filter((a) => a.jid) as account (account.id)}
+            <button class="account-choice" onclick={() => chooseAccount(account.id)}>
+              {#if accountAvatars[account.id]}
+                <img class="choice-avatar" src={convertFileSrc(accountAvatars[account.id]!)} alt="" />
+              {:else}
+                <span class="choice-avatar">{initials(account.label)}</span>
+              {/if}
+              <span class="choice-text">
+                <strong>{account.label}</strong>
+                <small>{phoneName(null, account.jid!)}</small>
+              </span>
+              <Icon name="chevronRight" size={16} />
+            </button>
+          {/each}
+        </div>
+      </div>
+    {:else if linked}
       <div class="intro-card resume">
         {#if accountAvatars[linked.id]}
           <img class="resume-avatar" src={convertFileSrc(accountAvatars[linked.id]!)} alt="" />
@@ -3808,6 +3862,57 @@
   .resume-who {
     color: var(--muted);
     font-size: 13.5px;
+  }
+  .account-choices {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+    margin-top: 16px;
+  }
+  .account-choice {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--raised);
+    color: var(--text);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition:
+      background 0.15s,
+      border-color 0.15s,
+      transform 0.15s;
+  }
+  .account-choice:hover {
+    background: var(--raised-2);
+    border-color: var(--accent);
+  }
+  .account-choice:active {
+    transform: scale(0.99);
+  }
+  .choice-avatar {
+    display: grid;
+    place-items: center;
+    flex: none;
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    object-fit: cover;
+    background: var(--raised-2);
+    font-weight: 600;
+  }
+  .choice-text {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .choice-text small {
+    color: var(--muted);
   }
   .resume-bar {
     width: 220px;
