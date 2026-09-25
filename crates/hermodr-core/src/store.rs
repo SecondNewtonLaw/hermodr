@@ -124,6 +124,18 @@ pub struct ChatSummary {
     pub pinned: bool,
 }
 
+/// Ordering for outgoing delivery states. Higher means further along; unknown
+/// states rank below everything so any known state replaces them.
+fn status_rank(s: &str) -> i32 {
+    match s {
+        "pending" => 0,
+        "sent" => 1,
+        "delivered" => 2,
+        "read" => 3,
+        _ => -1,
+    }
+}
+
 /// SQLite-backed message store.
 pub struct MessageStore {
     conn: Mutex<Connection>,
@@ -744,13 +756,6 @@ impl MessageStore {
     /// Only moves forward: a late `delivered` receipt must not undo a `read`.
     /// Returns whether anything changed so the caller can skip a refresh.
     pub fn set_status(&self, chat: &str, id: &str, status: &str) -> Result<bool> {
-        let rank = |s: &str| match s {
-            "pending" => 0,
-            "sent" => 1,
-            "delivered" => 2,
-            "read" => 3,
-            _ => -1,
-        };
         let conn = self.conn.lock().unwrap();
         let current: Option<Option<String>> = conn
             .query_row(
@@ -762,8 +767,8 @@ impl MessageStore {
         let Some(current) = current else {
             return Ok(false);
         };
-        let current_rank = current.as_deref().map(rank).unwrap_or(-1);
-        if rank(status) <= current_rank {
+        let current_rank = current.as_deref().map(status_rank).unwrap_or(-1);
+        if status_rank(status) <= current_rank {
             return Ok(false);
         }
         conn.execute(
@@ -771,6 +776,46 @@ impl MessageStore {
             params![status, chat, id],
         )?;
         Ok(true)
+    }
+
+    /// Advances an outgoing message matched by id alone, whatever chat it was
+    /// stored under.
+    ///
+    /// Server acks carry the message id but only sometimes name the chat, and
+    /// the named JID can differ in form from the stored one (LID vs phone
+    /// number, device suffix, address mode). Matching on the id is what lets a
+    /// `pending` message still reach `sent` in those cases, including a message
+    /// sent to our own number. Returns the updated messages so the caller can
+    /// forward them without re-querying.
+    pub fn set_status_by_id(&self, id: &str, status: &str) -> Result<Vec<StoredMessage>> {
+        let chats: Vec<(String, Option<String>)> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT chat, status FROM messages WHERE id = ?1 AND from_me = 1",
+            )?;
+            let rows = stmt.query_map(params![id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut updated = Vec::new();
+        for (chat, current) in chats {
+            let current_rank = current.as_deref().map(status_rank).unwrap_or(-1);
+            if status_rank(status) <= current_rank {
+                continue;
+            }
+            {
+                let conn = self.conn.lock().unwrap();
+                conn.execute(
+                    "UPDATE messages SET status = ?1 WHERE chat = ?2 AND id = ?3",
+                    params![status, chat, id],
+                )?;
+            }
+            if let Ok(message) = self.message(&chat, id) {
+                updated.push(message);
+            }
+        }
+        Ok(updated)
     }
 
     /// Marks a message as deleted by its sender, clearing its content.
@@ -1067,6 +1112,32 @@ mod tests {
         let s = store(Retention::unlimited());
         s.upsert(&msg("a@s", "1", 0, "hi")).unwrap();
         assert!(!s.set_status("a@s", "1", "read").unwrap());
+    }
+
+    #[test]
+    fn status_by_id_advances_without_the_chat() {
+        // Server acks name the message id but only sometimes the chat, and the
+        // named JID can differ in form from the stored one. The id alone must
+        // still move a pending message to sent.
+        let s = store(Retention::unlimited());
+        let mut m = msg("a@s.whatsapp.net", "1", 0, "hi");
+        m.from_me = true;
+        m.status = Some("pending".into());
+        s.upsert(&m).unwrap();
+
+        // Wrong chat: the addressed update misses.
+        assert!(!s.set_status("b@s.whatsapp.net", "1", "sent").unwrap());
+        // Id-only update still advances it.
+        let updated = s.set_status_by_id("1", "sent").unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].status.as_deref(), Some("sent"));
+        assert_eq!(
+            s.message("a@s.whatsapp.net", "1").unwrap().status.as_deref(),
+            Some("sent")
+        );
+        // Forward-only still holds through the id path.
+        assert!(s.set_status_by_id("1", "delivered").unwrap().len() == 1);
+        assert!(s.set_status_by_id("1", "sent").unwrap().is_empty());
     }
 
     #[test]
