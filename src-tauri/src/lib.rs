@@ -51,7 +51,7 @@ impl Default for UiSettings {
     fn default() -> Self {
         Self {
             retention: Retention::default(),
-            accept_full_history: false,
+            accept_full_history: true,
             auto_download_media: true,
             media_dir: None,
             warn_missing_video_preview: true,

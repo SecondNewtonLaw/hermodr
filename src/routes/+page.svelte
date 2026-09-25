@@ -251,7 +251,7 @@
   let replyingTo: StoredMessage | null = $state(null);
   let settings: UiSettings = $state({
     retention: { max_age_hours: 24, max_messages_per_chat: 500 },
-    accept_full_history: false,
+    accept_full_history: true,
     auto_download_media: true,
     warn_missing_video_preview: true,
     media_dir: null,

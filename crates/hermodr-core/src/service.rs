@@ -35,6 +35,39 @@ use crate::{
     store::{MessageStore, Retention, StoredMessage},
 };
 
+/// What this device asks for when it links: named as Hermóðr on the phone's
+/// linked devices, and with full history the sync WhatsApp for Windows asks
+/// for (a year of backfill, then older history on demand). Only read at
+/// pairing; an existing link keeps what it was paired with.
+fn pairing_props(full_history: bool) -> whatsapp_rust::wacore::store::DevicePropsOverride {
+    use wa::device_props::{HistorySyncConfig, PlatformType};
+    let props = whatsapp_rust::wacore::store::DevicePropsOverride::new()
+        .with_os("Hermóðr")
+        .with_platform_type(PlatformType::UWP);
+    if !full_history {
+        return props;
+    }
+    props.with_require_full_sync(true).with_history_sync_config(HistorySyncConfig {
+        full_sync_days_limit: Some(365),
+        on_demand_ready: Some(true),
+        complete_on_demand_ready: Some(true),
+        // WhatsApp Web's own claims, which the library's default also makes.
+        inline_initial_payload_in_e2_ee_msg: Some(true),
+        support_bot_user_agent_chat_history: Some(true),
+        support_cag_reactions_and_polls: Some(true),
+        support_recent_sync_chunk_message_count_tuning: Some(true),
+        support_hosted_group_msg: Some(true),
+        support_biz_hosted_msg: Some(true),
+        support_fbid_bot_chat_history: Some(true),
+        support_message_association: Some(true),
+        support_call_log_history: Some(true),
+        support_group_history: Some(true),
+        support_manus_history: Some(true),
+        support_hatch_history: Some(true),
+        ..Default::default()
+    })
+}
+
 /// Builds the cache configuration for a given retention window.
 ///
 /// `msg_secrets` are the decryption keys kept so edits, reactions and poll
@@ -433,6 +466,7 @@ impl Service {
         let bot = Bot::builder()
             .with_backend(SqliteStore::new(config.session_path.to_string_lossy().as_ref()).await?)
             .with_history_sync_admission(policy)
+            .with_device_props(pairing_props(config.accept_full_history))
             .with_cache_config(cache_config_for(&config.retention))
             .on_qr_code({
                 let events = events.clone();
