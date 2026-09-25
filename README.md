@@ -99,6 +99,10 @@ scripts/install-dev.sh          # build a release and install it
 scripts/install-dev.sh --dev    # start the dev server
 ```
 
+The release bundles, AppImage included, are built with `scripts/build-release.sh`,
+which sets the two environment variables the AppImage tooling needs on current
+distros. `install-dev.sh` never bundles, so it does not run into them.
+
 Dependencies are declared in `Cargo.toml`: Tauri comes from crates.io, and
 `whatsapp-rust` is pinned to a git revision because per-chunk history control
 (`HistorySyncAdmission`) is newer than its last release. Cargo fetches both, so
