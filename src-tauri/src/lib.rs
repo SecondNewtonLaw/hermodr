@@ -658,6 +658,15 @@ fn flush_media(state: State<'_, AppState>) -> Result<usize, String> {
     state.service()?.flush_media().map_err(|e| e.to_string())
 }
 
+/// The chat a stored message id belongs to.
+#[tauri::command]
+fn chat_for_message(state: State<'_, AppState>, id: String) -> Result<Option<String>, String> {
+    state
+        .service()?
+        .chat_for_message(&id)
+        .map_err(|e| e.to_string())
+}
+
 /// Downloads a message's media on demand.
 #[tauri::command]
 async fn download_media(
@@ -802,6 +811,7 @@ pub fn run() {
             flush_media,
             download_media,
             set_chat_auto_download,
+            chat_for_message,
             search,
             open_url,
             qr_svg,

@@ -18,6 +18,7 @@
     reply_to_id: string | null;
     reply_to_text: string | null;
     reply_to_sender: string | null;
+    reply_to_chat: string | null;
     reply_to_kind: string | null;
     reply_to_thumb: string | null;
     read: boolean;
@@ -121,6 +122,8 @@
   let showAccounts = $state(false);
   /** A transient notice, such as a video sent without a preview. */
   let notice = $state<string | null>(null);
+  /** A quote whose target is not loaded yet, offered as a load action. */
+  let pendingJump: { chat: string; id: string } | null = $state(null);
   let searchQuery = $state("");
   let searchResults: SearchResult[] = $state([]);
   let titleOverride = $state<string | null>(null);
@@ -915,6 +918,57 @@
     }
   }
 
+  /** The display name of a chat, for cross chat quotes. */
+  function chatName(jid: string) {
+    return chats.find((c) => c.chat === jid)?.display_name ?? bareJid(jid);
+  }
+
+  /**
+   * Opens the chat a quoted message lives in and jumps to it. A private reply
+   * is a direct message quoting a group message, so the target is often in a
+   * different chat.
+   */
+  async function jumpToQuoted(message: StoredMessage) {
+    const id = message.reply_to_id;
+    if (!id) return;
+    let chat = message.reply_to_chat;
+    if (!chat) {
+      try {
+        chat = await invoke<string | null>("chat_for_message", { id });
+      } catch {
+        chat = null;
+      }
+    }
+    if (chat && chat !== selectedChat) await openChat(chat);
+    await tick();
+    if (scroller?.querySelector(`[data-id="${id}"]`)) {
+      scrollToMessage(id);
+      return;
+    }
+    // Older than the loaded window, so offer to fetch it.
+    if (chat ?? selectedChat) {
+      pendingJump = { chat: chat ?? selectedChat!, id };
+    }
+  }
+
+  /** Loads older messages, then retries the pending jump. */
+  async function loadAndJump() {
+    if (!pendingJump) return;
+    const { chat, id } = pendingJump;
+    pendingJump = null;
+    try {
+      await invoke("load_older", { chat, count: 50 });
+      // The older messages arrive as events, so retry once they land.
+      window.setTimeout(async () => {
+        await reloadMessages();
+        if (scroller?.querySelector(`[data-id="${id}"]`)) scrollToMessage(id);
+        else error = "That message is still not loaded.";
+      }, 2000);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   /** Fetches a message's media on demand. */
   async function downloadMedia(message: StoredMessage) {
     if (!selectedChat) return;
@@ -1285,7 +1339,7 @@
                     type="button"
                     class="quote"
                     title="Go to message"
-                    onclick={() => message.reply_to_id && scrollToMessage(message.reply_to_id)}>
+                    onclick={() => jumpToQuoted(message)}>
                     {#if message.reply_to_kind === "image" && message.reply_to_thumb}
                       <img
                         class="quote-thumb"
@@ -1299,6 +1353,9 @@
                       {quoteAuthor(message.reply_to_sender)}
                     </span>
                     <span class="quote-text">{message.reply_to_text}</span>
+                    {#if message.reply_to_chat && message.reply_to_chat !== selectedChat}
+                      <span class="quote-where">in {chatName(message.reply_to_chat)}</span>
+                    {/if}
                   </button>
                 {/if}
 
@@ -1578,6 +1635,14 @@
       />
       <button class="primary" onclick={() => (previewId = null)}>Done</button>
     </div>
+  </div>
+{/if}
+
+{#if pendingJump}
+  <div class="notice">
+    <span>That message is not loaded yet.</span>
+    <button class="link" onclick={loadAndJump}>Load older</button>
+    <button class="icon" title="Dismiss" onclick={() => (pendingJump = null)}>×</button>
   </div>
 {/if}
 
@@ -2414,6 +2479,15 @@
     object-fit: cover;
     border-radius: 4px;
     flex: none;
+  }
+  .quote-where {
+    flex: none;
+    max-width: 16ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+    color: #71717a;
   }
   .quote-icon {
     font-size: 14px;

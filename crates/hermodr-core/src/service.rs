@@ -887,6 +887,7 @@ impl Service {
             reply_to_id: None,
             reply_to_text: None,
             reply_to_sender: None,
+            reply_to_chat: None,
             reply_to_kind: None,
             reply_to_thumb: None,
             // Not `true`: we cannot know whether the recipient has read it, and
@@ -1050,6 +1051,11 @@ impl Service {
         Ok(())
     }
 
+    /// The chat a stored message id belongs to.
+    pub fn chat_for_message(&self, id: &str) -> Result<Option<String>> {
+        self.store.chat_of_message(id)
+    }
+
     /// Sets a chat's auto download override.
     pub fn set_chat_auto_download(&self, chat: &str, enabled: bool) -> Result<()> {
         self.store.set_chat_auto_download(chat, enabled)
@@ -1168,6 +1174,7 @@ impl Service {
             } else {
                 reply_to_sender.to_string()
             }),
+            reply_to_chat: None,
             reply_to_kind: None,
             reply_to_thumb: None,
             read: false,
@@ -1313,6 +1320,7 @@ impl Service {
             reply_to_id: reply.as_ref().map(|(id, _, _)| id.clone()),
             reply_to_text: reply.as_ref().map(|(_, _, text)| text.clone()),
             reply_to_sender: reply.as_ref().map(|(_, sender, _)| sender.clone()),
+            reply_to_chat: None,
             reply_to_kind: None,
             reply_to_thumb: None,
             read: false,
@@ -1365,7 +1373,7 @@ fn revoke_target(message: &wa::Message) -> Option<String> {
 ///
 /// `context_info` lives on each inner message type rather than on `Message`
 /// itself, so the carriers a reply can arrive on are checked in turn.
-fn quote_of(message: &wa::Message) -> Option<(String, String, String, String, Option<Vec<u8>>)> {
+fn quote_of(message: &wa::Message) -> Option<(String, String, String, String, Option<Vec<u8>>, Option<String>)> {
     let base = message.get_base_message();
     let context = base
         .extended_text_message
@@ -1439,7 +1447,7 @@ fn quote_of(message: &wa::Message) -> Option<(String, String, String, String, Op
                 .as_option()
                 .and_then(|m| m.jpeg_thumbnail.clone())
         });
-    Some((id, author, text, kind.to_string(), thumb))
+    Some((id, author, text, kind.to_string(), thumb, context.remote_jid.clone()))
 }
 
 /// The user part of a JID, without the device suffix or server.
@@ -1583,9 +1591,15 @@ async fn incoming_message(
 
     // A reply carries the quote in the message context. We do not keep the
     // original protobuf, so the text is copied out for display.
-    let (reply_to_id, reply_to_text, reply_to_sender, reply_to_kind, reply_to_thumb) =
-        quote_of(&inbound.message)
-            .map(|(id, sender, text, kind, thumb)| {
+    let (
+        reply_to_id,
+        reply_to_text,
+        reply_to_sender,
+        reply_to_kind,
+        reply_to_thumb,
+        reply_to_chat,
+    ) = quote_of(&inbound.message)
+            .map(|(id, sender, text, kind, thumb, chat)| {
                 // Quoting our own message should read "You", not our phone number.
                 let mine = client
                     .map(|c| {
@@ -1610,9 +1624,10 @@ async fn incoming_message(
                     Some(sender),
                     if kind.is_empty() { None } else { Some(kind) },
                     thumb_path,
+                    chat,
                 )
             })
-            .unwrap_or((None, None, None, None, None));
+            .unwrap_or((None, None, None, None, None, None));
 
     // A link preview rides on the extended text message.
     let (preview_url, preview_title, preview_desc, preview_thumb) =
@@ -1634,6 +1649,7 @@ async fn incoming_message(
         reply_to_id,
         reply_to_text,
         reply_to_sender,
+        reply_to_chat,
         reply_to_kind,
         reply_to_thumb,
         // Newly arrived, so unseen until the chat is opened.
@@ -2018,6 +2034,7 @@ mod tests {
                 reply_to_id: None,
                 reply_to_text: None,
                 reply_to_sender: None,
+                reply_to_chat: None,
                 reply_to_kind: None,
                 reply_to_thumb: None,
                 read: false,

@@ -80,6 +80,9 @@ pub struct StoredMessage {
     pub reply_to_text: Option<String>,
     /// Author of the quoted message, so the quote can be attributed.
     pub reply_to_sender: Option<String>,
+    /// Chat the quoted message lives in. Different from this chat for a private
+    /// reply, which is a direct message quoting a group message.
+    pub reply_to_chat: Option<String>,
     /// Media kind of the quoted message, when it carried media.
     pub reply_to_kind: Option<String>,
     /// Path to the quoted media's thumbnail, when one was available.
@@ -187,6 +190,7 @@ impl MessageStore {
             "reply_to_id",
             "reply_to_text",
             "reply_to_sender",
+            "reply_to_chat",
             "reply_to_kind",
             "reply_to_thumb",
             "preview_url",
@@ -284,9 +288,9 @@ impl MessageStore {
                   media_kind, media_path, reply_to_id, reply_to_text, reply_to_sender,
                   read, revoked, mentioned, status,
                   preview_url, preview_title, preview_desc, preview_thumb,
-                  reply_to_kind, reply_to_thumb, media_thumb, media_ref)
+                  reply_to_kind, reply_to_thumb, media_thumb, media_ref, reply_to_chat)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
              ON CONFLICT(chat, id) DO UPDATE SET
                  sender = excluded.sender,
                  timestamp = excluded.timestamp,
@@ -308,7 +312,8 @@ impl MessageStore {
                  reply_to_kind = excluded.reply_to_kind,
                  reply_to_thumb = excluded.reply_to_thumb,
                  media_thumb = excluded.media_thumb,
-                 media_ref = excluded.media_ref",
+                 media_ref = excluded.media_ref,
+                 reply_to_chat = excluded.reply_to_chat",
             params![
                 message.chat,
                 message.id,
@@ -333,6 +338,7 @@ impl MessageStore {
                 message.reply_to_thumb,
                 message.media_thumb,
                 message.media_ref,
+                message.reply_to_chat,
             ],
         )?;
         Ok(())
@@ -459,7 +465,7 @@ impl MessageStore {
                     n.name, m.media_kind, m.media_path, m.reply_to_id, m.reply_to_text,
                     m.read, m.revoked, m.status, m.reply_to_sender, m.mentioned,
                     m.preview_url, m.preview_title, m.preview_desc, m.preview_thumb,
-                    m.reply_to_kind, m.reply_to_thumb, m.media_thumb, m.media_ref
+                    m.reply_to_kind, m.reply_to_thumb, m.media_thumb, m.media_ref, m.reply_to_chat
              FROM messages m
              LEFT JOIN names n ON n.jid = m.sender
              WHERE m.chat = ?1
@@ -491,6 +497,7 @@ impl MessageStore {
                 reply_to_thumb: row.get(21)?,
                 media_thumb: row.get(22)?,
                 media_ref: row.get(23)?,
+                reply_to_chat: row.get(24)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -514,6 +521,20 @@ impl MessageStore {
             )
             .ok();
         Ok(row)
+    }
+
+    /// The chat a stored message id belongs to, when it is known locally. A
+    /// quoted message in another chat can be located with this.
+    pub fn chat_of_message(&self, id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let chat = conn
+            .query_row(
+                "SELECT chat FROM messages WHERE id = ?1 LIMIT 1",
+                params![id],
+                |r| r.get::<_, String>(0),
+            )
+            .ok();
+        Ok(chat)
     }
 
     /// The per chat auto download override, if one is set.
@@ -613,7 +634,7 @@ impl MessageStore {
                     n.name, m.media_kind, m.media_path, m.reply_to_id, m.reply_to_text,
                     m.read, m.revoked, m.status, m.reply_to_sender, m.mentioned,
                     m.preview_url, m.preview_title, m.preview_desc, m.preview_thumb,
-                    m.reply_to_kind, m.reply_to_thumb, m.media_thumb, m.media_ref
+                    m.reply_to_kind, m.reply_to_thumb, m.media_thumb, m.media_ref, m.reply_to_chat
              FROM messages m
              LEFT JOIN names n ON n.jid = m.sender
              WHERE m.chat = ?1 AND m.id = ?2",
@@ -644,6 +665,7 @@ impl MessageStore {
                 reply_to_thumb: row.get(21)?,
                 media_thumb: row.get(22)?,
                 media_ref: row.get(23)?,
+                reply_to_chat: row.get(24)?,
                 })
             },
         )?;
@@ -854,6 +876,7 @@ mod tests {
             reply_to_id: None,
             reply_to_text: None,
             reply_to_sender: None,
+            reply_to_chat: None,
             reply_to_kind: None,
             reply_to_thumb: None,
             read: false,

@@ -25,6 +25,7 @@ const COMMANDS: &[&str] = &[
     "flush_media",
     "download_media",
     "set_chat_auto_download",
+    "chat_for_message",
     "qr_svg",
     "get_settings",
     "set_settings",
