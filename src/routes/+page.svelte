@@ -1403,9 +1403,37 @@
     return canvas.toDataURL("image/jpeg", 0.7);
   }
 
+  /** Draws an SVG to a PNG whose longer side is Full HD, since WhatsApp cannot show SVGs. */
+  async function rasterizeSvg(file: File): Promise<File> {
+    const LONG_SIDE = 1920;
+    const url = URL.createObjectURL(file);
+    try {
+      const image = new Image();
+      image.src = url;
+      await image.decode();
+      // An SVG without width and height has no intrinsic size; treat it as square.
+      const naturalWidth = image.naturalWidth || LONG_SIDE;
+      const naturalHeight = image.naturalHeight || LONG_SIDE;
+      const scale = LONG_SIDE / Math.max(naturalWidth, naturalHeight);
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(naturalWidth * scale));
+      canvas.height = Math.max(1, Math.round(naturalHeight * scale));
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("no 2d context to draw the SVG");
+      context.imageSmoothingQuality = "high";
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise<Blob | null>((done) => canvas.toBlob(done, "image/png"));
+      if (!blob) throw new Error("the SVG could not be drawn");
+      return new File([blob], `${file.name.replace(/\.svg$/i, "")}.png`, { type: "image/png" });
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+
   /** Stages a file for review rather than sending it straight away. */
   async function stageFile(file: File) {
     try {
+      if (file.type === "image/svg+xml" || /\.svg$/i.test(file.name)) file = await rasterizeSvg(file);
       const kind = file.type.startsWith("image/")
         ? "image"
         : file.type.startsWith("video/")
@@ -1431,7 +1459,7 @@
   }
 
   /** Media extensions that can be staged from a pasted file path. */
-  const PASTABLE = /\.(jpe?g|png|gif|webp|mp4|mov|m4v|webm|mkv|ogg|opus|mp3|m4a|aac|wav)$/i;
+  const PASTABLE = /\.(jpe?g|png|gif|webp|svg|mp4|mov|m4v|webm|mkv|ogg|opus|mp3|m4a|aac|wav)$/i;
 
   function mimeForName(name: string) {
     const extension = name.slice(name.lastIndexOf(".") + 1).toLowerCase();
@@ -1441,6 +1469,7 @@
       png: "image/png",
       gif: "image/gif",
       webp: "image/webp",
+      svg: "image/svg+xml",
       mp4: "video/mp4",
       mov: "video/mp4",
       m4v: "video/mp4",
