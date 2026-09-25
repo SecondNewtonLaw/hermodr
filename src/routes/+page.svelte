@@ -1635,7 +1635,10 @@
     if (chat !== selectedChat) await openChat(chat);
     await tick();
     if (scroller?.querySelector(`[data-id="${id}"]`)) scrollToMessage(id);
-    else pendingJump = { chat, id };
+    else {
+      pendingJump = { chat, id };
+      void loadAndJump();
+    }
   }
 
   let starredItems = $state<StarredItem[] | null>(null);
@@ -1661,21 +1664,35 @@
     }
   }
 
-  /** Loads older messages, then retries the pending jump. */
+  /** Walks the chat's past back from the phone until the pending jump's message lands. */
+  let seeking = $state(false);
   async function loadAndJump() {
-    if (!pendingJump) return;
+    if (!pendingJump || seeking) return;
     const { chat, id } = pendingJump;
-    pendingJump = null;
+    seeking = true;
     try {
-      await invoke("load_older", { chat, count: 50 });
-      // The older messages arrive as events, so retry once they land.
-      window.setTimeout(async () => {
-        await reloadMessages();
-        if (scroller?.querySelector(`[data-id="${id}"]`)) scrollToMessage(id);
-        else error = "That message is still not loaded.";
-      }, 2000);
+      // Ten rounds of 50 reach about 500 messages back before giving up.
+      for (let round = 0; round < 10 && selectedChat === chat; round++) {
+        const before = messages.length;
+        await invoke("load_older", { chat, count: 50 });
+        // The phone answers as a history sync event; give it a moment to land.
+        await new Promise((r) => setTimeout(r, 2500));
+        messageLimit += 50;
+        await reloadMessages(true);
+        await tick();
+        if (scroller?.querySelector(`[data-id="${id}"]`)) {
+          pendingJump = null;
+          scrollToMessage(id);
+          return;
+        }
+        if (messages.length === before) break;
+      }
+      error = "Your phone did not send that message; it may be older than it keeps, or deleted.";
     } catch (e) {
       error = String(e);
+    } finally {
+      seeking = false;
+      pendingJump = null;
     }
   }
 
@@ -3487,9 +3504,8 @@
 
 {#if pendingJump}
   <div class="notice">
-    <span>That message is not loaded yet.</span>
-    <button class="link" onclick={loadAndJump}>Load older</button>
-    <button class="icon" title="Dismiss" onclick={() => (pendingJump = null)}>×</button>
+    <span class="spinner"></span>
+    <span>Fetching older messages from your phone to find it…</span>
   </div>
 {/if}
 

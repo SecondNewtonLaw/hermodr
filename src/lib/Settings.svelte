@@ -432,9 +432,9 @@
             <div>
               <span class="setting-title">Download full history when pairing</span>
               <span class="setting-desc">
-                The next time an account is linked, asks the phone for a year of history as WhatsApp
-                for Windows does, with older messages on demand; every chat shows up. The limits
-                above still decide what stays on this computer. Off asks for the recent window only.
+                The next time an account is linked, every chat comes over with its last couple of
+                days; anything older is fetched from your phone when you scroll up or open a reply
+                to it. Off asks for the recent window only, which can leave quiet chats out.
               </span>
             </div>
             <input class="switch" type="checkbox" bind:checked={draft.accept_full_history} />

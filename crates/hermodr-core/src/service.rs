@@ -35,9 +35,40 @@ use crate::{
     store::{MessageStore, Retention, StoredMessage},
 };
 
+/// Asks the phone for `count` messages older than the oldest one stored in
+/// `chat`; they arrive later as a history sync.
+async fn fetch_older(client: &Client, store: &MessageStore, chat: &str, count: i32) -> Result<()> {
+    let Some((id, from_me, timestamp)) = store.oldest_message(chat)? else {
+        return Ok(());
+    };
+    let jid: Jid = chat.parse()?;
+    let session = client
+        .fetch_message_history(&jid, &id, from_me, timestamp * 1000, count)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    eprintln!("[hermodr] asked the phone for {count} messages before {id} in {chat} (session {session})");
+    Ok(())
+}
+
+/// Whether a chat may pull its past again for an unknown quote: once a minute,
+/// so a burst of replies to the same old message asks the phone once.
+fn recall_allowed(chat: &str) -> bool {
+    use std::collections::HashMap;
+    use std::time::Instant;
+    static LAST: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> = std::sync::OnceLock::new();
+    let mut last = LAST.get_or_init(Default::default).lock().unwrap();
+    let now = Instant::now();
+    if last.get(chat).is_some_and(|at| now.duration_since(*at) < Duration::from_secs(60)) {
+        return false;
+    }
+    last.insert(chat.to_string(), now);
+    true
+}
+
 /// What this device asks for when it links: named as Hermóðr on the phone's
-/// linked devices, and with full history the sync WhatsApp for Windows asks
-/// for (a year of backfill, then older history on demand). Only read at
+/// linked devices, and with full history a backfill of every chat but only
+/// its recent days, telling the phone older history will be asked for on
+/// demand (a reply to something older fetches that chat's past). Only read at
 /// pairing; an existing link keeps what it was paired with.
 fn pairing_props(full_history: bool) -> whatsapp_rust::wacore::store::DevicePropsOverride {
     use wa::device_props::{HistorySyncConfig, PlatformType};
@@ -48,7 +79,8 @@ fn pairing_props(full_history: bool) -> whatsapp_rust::wacore::store::DeviceProp
         return props;
     }
     props.with_require_full_sync(true).with_history_sync_config(HistorySyncConfig {
-        full_sync_days_limit: Some(365),
+        full_sync_days_limit: Some(2),
+        recent_sync_days_limit: Some(2),
         on_demand_ready: Some(true),
         complete_on_demand_ready: Some(true),
         // WhatsApp Web's own claims, which the library's default also makes.
@@ -870,6 +902,17 @@ impl Service {
                                     }
                                     if is_forwarded(&inbound.message) {
                                         let _ = store.set_forwarded(&chat, &message.id);
+                                    }
+                                    // Pairing only brings recent days; a reply to something
+                                    // older pulls that chat's past so the quote can be opened.
+                                    if let (Some(quoted), Some(client)) = (message.reply_to_id.clone(), client.clone()) {
+                                        let quoted_chat = message.reply_to_chat.clone().unwrap_or_else(|| chat.clone());
+                                        if store.message(&quoted_chat, &quoted).is_err() && recall_allowed(&quoted_chat) {
+                                            let store = store.clone();
+                                            tokio::spawn(async move {
+                                                let _ = fetch_older(&client, &store, &quoted_chat, 50).await;
+                                            });
+                                        }
                                     }
                                     let _ = store.upsert(&message);
                                     let _ = events.send(ServiceEvent::Message { message: Box::new(message) });
@@ -1844,17 +1887,7 @@ impl Service {
     /// The request goes to our own primary device, and the messages arrive
     /// asynchronously through the normal event stream.
     pub async fn load_older(&self, chat: &str, count: i32) -> Result<()> {
-        let Some((id, from_me, timestamp)) = self.store.oldest_message(chat)? else {
-            return Ok(());
-        };
-        let jid: Jid = chat.parse()?;
-        let session = self
-            .client
-            .fetch_message_history(&jid, &id, from_me, timestamp * 1000, count)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        eprintln!("[hermodr] asked the phone for {count} messages before {id} in {chat} (session {session})");
-        Ok(())
+        fetch_older(&self.client, &self.store, chat, count).await
     }
 
     /// The key that names a message to the server: groups need its sender.
