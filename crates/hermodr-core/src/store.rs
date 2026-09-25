@@ -70,6 +70,10 @@ pub struct StoredMessage {
     /// Path to the media's thumbnail, which is embedded in the message and
     /// available without downloading the full file.
     pub media_thumb: Option<String>,
+    /// The media submessage, kept so the file can be downloaded on demand when
+    /// automatic downloads are off. Internal: not handed to the UI.
+    #[serde(skip)]
+    pub media_ref: Option<Vec<u8>>,
     /// Id of the message this one quotes.
     pub reply_to_id: Option<String>,
     /// Text of the quoted message, stored so a quote renders without a lookup.
@@ -205,6 +209,26 @@ impl MessageStore {
         // Chat pins, mirrored from the account so they match the phone.
         conn.execute("CREATE TABLE IF NOT EXISTS pins (jid TEXT PRIMARY KEY)", [])?;
 
+        // Per chat overrides. Absent means the global setting applies.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS chat_settings (
+                 jid TEXT PRIMARY KEY,
+                 auto_download INTEGER NOT NULL DEFAULT 1
+             )",
+            [],
+        )?;
+
+        // The media reference is a blob, so it cannot go through the TEXT
+        // migration loop above.
+        let message_columns: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if !message_columns.iter().any(|c| c == "media_ref") {
+            conn.execute("ALTER TABLE messages ADD COLUMN media_ref BLOB", [])?;
+        }
+
         let existing_names: Vec<String> = {
             let mut stmt = conn.prepare("PRAGMA table_info(names)")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -260,9 +284,9 @@ impl MessageStore {
                   media_kind, media_path, reply_to_id, reply_to_text, reply_to_sender,
                   read, revoked, mentioned, status,
                   preview_url, preview_title, preview_desc, preview_thumb,
-                  reply_to_kind, reply_to_thumb, media_thumb)
+                  reply_to_kind, reply_to_thumb, media_thumb, media_ref)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
              ON CONFLICT(chat, id) DO UPDATE SET
                  sender = excluded.sender,
                  timestamp = excluded.timestamp,
@@ -283,7 +307,8 @@ impl MessageStore {
                  preview_thumb = excluded.preview_thumb,
                  reply_to_kind = excluded.reply_to_kind,
                  reply_to_thumb = excluded.reply_to_thumb,
-                 media_thumb = excluded.media_thumb",
+                 media_thumb = excluded.media_thumb,
+                 media_ref = excluded.media_ref",
             params![
                 message.chat,
                 message.id,
@@ -307,6 +332,7 @@ impl MessageStore {
                 message.reply_to_kind,
                 message.reply_to_thumb,
                 message.media_thumb,
+                message.media_ref,
             ],
         )?;
         Ok(())
@@ -433,7 +459,7 @@ impl MessageStore {
                     n.name, m.media_kind, m.media_path, m.reply_to_id, m.reply_to_text,
                     m.read, m.revoked, m.status, m.reply_to_sender, m.mentioned,
                     m.preview_url, m.preview_title, m.preview_desc, m.preview_thumb,
-                    m.reply_to_kind, m.reply_to_thumb, m.media_thumb
+                    m.reply_to_kind, m.reply_to_thumb, m.media_thumb, m.media_ref
              FROM messages m
              LEFT JOIN names n ON n.jid = m.sender
              WHERE m.chat = ?1
@@ -464,6 +490,7 @@ impl MessageStore {
                 reply_to_kind: row.get(20)?,
                 reply_to_thumb: row.get(21)?,
                 media_thumb: row.get(22)?,
+                media_ref: row.get(23)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -487,6 +514,54 @@ impl MessageStore {
             )
             .ok();
         Ok(row)
+    }
+
+    /// The per chat auto download override, if one is set.
+    pub fn chat_auto_download(&self, jid: &str) -> Result<Option<bool>> {
+        let conn = self.conn.lock().unwrap();
+        let value = conn
+            .query_row(
+                "SELECT auto_download FROM chat_settings WHERE jid = ?1",
+                params![jid],
+                |r| r.get::<_, i32>(0),
+            )
+            .ok();
+        Ok(value.map(|v| v != 0))
+    }
+
+    /// Sets the per chat auto download override.
+    pub fn set_chat_auto_download(&self, jid: &str, enabled: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO chat_settings (jid, auto_download) VALUES (?1, ?2)
+             ON CONFLICT(jid) DO UPDATE SET auto_download = excluded.auto_download",
+            params![jid, enabled as i32],
+        )?;
+        Ok(())
+    }
+
+    /// The stored media reference for a message.
+    pub fn media_ref_for(&self, chat: &str, id: &str) -> Result<Option<Vec<u8>>> {
+        let conn = self.conn.lock().unwrap();
+        let value = conn
+            .query_row(
+                "SELECT media_ref FROM messages WHERE chat = ?1 AND id = ?2",
+                params![chat, id],
+                |r| r.get::<_, Option<Vec<u8>>>(0),
+            )
+            .ok()
+            .flatten();
+        Ok(value)
+    }
+
+    /// Records where a downloaded file was written.
+    pub fn set_media_path(&self, chat: &str, id: &str, path: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE messages SET media_path = ?3 WHERE chat = ?1 AND id = ?2",
+            params![chat, id, path],
+        )?;
+        Ok(())
     }
 
     /// Forgets every stored media path, returning how many rows changed.
@@ -538,7 +613,7 @@ impl MessageStore {
                     n.name, m.media_kind, m.media_path, m.reply_to_id, m.reply_to_text,
                     m.read, m.revoked, m.status, m.reply_to_sender, m.mentioned,
                     m.preview_url, m.preview_title, m.preview_desc, m.preview_thumb,
-                    m.reply_to_kind, m.reply_to_thumb, m.media_thumb
+                    m.reply_to_kind, m.reply_to_thumb, m.media_thumb, m.media_ref
              FROM messages m
              LEFT JOIN names n ON n.jid = m.sender
              WHERE m.chat = ?1 AND m.id = ?2",
@@ -568,6 +643,7 @@ impl MessageStore {
                 reply_to_kind: row.get(20)?,
                 reply_to_thumb: row.get(21)?,
                 media_thumb: row.get(22)?,
+                media_ref: row.get(23)?,
                 })
             },
         )?;
@@ -773,6 +849,8 @@ mod tests {
             text: text.into(),
             media_kind: None,
             media_path: None,
+            media_thumb: None,
+            media_ref: None,
             reply_to_id: None,
             reply_to_text: None,
             reply_to_sender: None,

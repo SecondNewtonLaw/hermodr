@@ -31,6 +31,7 @@ async fn main() -> Result<()> {
         messages_path: data_dir.join("messages.db"),
         retention,
         accept_full_history: false,
+        auto_download_media: true,
         media_dir: Some(data_dir.join("media")),
     };
 

@@ -22,4 +22,5 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 ureq = "3"
 # Renders outgoing image thumbnails so recipients see a preview before the
 # file finishes downloading.
+buffa = "0.9"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }

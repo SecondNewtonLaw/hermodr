@@ -915,6 +915,17 @@
     }
   }
 
+  /** Fetches a message's media on demand. */
+  async function downloadMedia(message: StoredMessage) {
+    if (!selectedChat) return;
+    try {
+      await invoke("download_media", { chat: selectedChat, id: message.id });
+      await reloadMessages();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   /** Opens a downloaded media file in the desktop's default application. */
   async function openMedia(path: string) {
     try {
@@ -1295,7 +1306,8 @@
                   <button
                     class="media-button"
                     title="Open in image viewer"
-                    onclick={() => openMedia((message.media_path ?? message.media_thumb)!)}>
+                    onclick={() =>
+                      message.media_path ? openMedia(message.media_path) : downloadMedia(message)}>
                     <img
                       class="media"
                       src={convertFileSrc((message.media_path ?? message.media_thumb)!)}
@@ -1332,6 +1344,12 @@
                           }}>{part.text}</a
                         >{:else}{part.text}{/if}{/each}</span
                   >
+                {/if}
+
+                {#if message.media_kind && !message.media_path}
+                  <button class="download" onclick={() => downloadMedia(message)}>
+                    Download {message.media_kind}
+                  </button>
                 {/if}
 
                 {#if message.preview_url}
@@ -2250,6 +2268,17 @@
     font-size: 28px;
     text-shadow: 0 1px 6px rgba(0, 0, 0, 0.8);
     pointer-events: none;
+  }
+  .download {
+    align-self: flex-start;
+    background: #27272a;
+    border: 0;
+    border-radius: 6px;
+    color: #93c5fd;
+    font: inherit;
+    font-size: 12px;
+    padding: 4px 10px;
+    cursor: pointer;
   }
   .file-icon {
     font-size: 28px;

@@ -204,6 +204,9 @@ pub struct ServiceConfig {
     pub accept_full_history: bool,
     /// Where downloaded media is written. `None` disables media downloads.
     pub media_dir: Option<PathBuf>,
+    /// Whether incoming media is downloaded when it arrives. A chat can
+    /// override this in the store.
+    pub auto_download_media: bool,
 }
 
 impl ServiceConfig {
@@ -215,6 +218,7 @@ impl ServiceConfig {
             messages_path: data_dir.join("messages.db"),
             retention: Retention::default(),
             accept_full_history: false,
+            auto_download_media: true,
             media_dir: Some(data_dir.join("media")),
         }
     }
@@ -310,6 +314,7 @@ impl Service {
             Arc::new(std::sync::OnceLock::new());
 
         let media_dir = config.media_dir.clone();
+        let auto_download_default = config.auto_download_media;
         let store_for_events = store.clone();
         let events_for_events = events.clone();
         let connected_for_events = connected_state.clone();
@@ -518,10 +523,16 @@ impl Service {
                                         continue;
                                     }
 
+                                    let auto_download = store
+                                        .chat_auto_download(&chat)
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or(auto_download_default);
                                     let Some(mut message) = incoming_message(
                                         inbound,
                                         client.as_deref(),
                                         media_dir.as_deref(),
+                                        auto_download,
                                     )
                                     .await
                                     else {
@@ -872,6 +883,7 @@ impl Service {
             media_kind: None,
             media_path: None,
             media_thumb: None,
+            media_ref: None,
             reply_to_id: None,
             reply_to_text: None,
             reply_to_sender: None,
@@ -1007,6 +1019,42 @@ impl Service {
         result.map_err(|e| anyhow::anyhow!(e.to_string()))
     }
 
+    /// Downloads a message's media on demand, when automatic downloads were
+    /// off or the earlier attempt failed.
+    pub async fn download_media(&self, chat: &str, id: &str) -> Result<()> {
+        let Some(bytes) = self.store.media_ref_for(chat, id)? else {
+            return Err(anyhow::anyhow!("no stored media reference"));
+        };
+        let message = <wa::Message as buffa::Message>::decode(&mut bytes.as_slice())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let Some(media) = detect_media(&message) else {
+            return Err(anyhow::anyhow!("message carries no media"));
+        };
+        let client = self.client.clone();
+        let data = client
+            .download(media.downloadable.as_ref())
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let dir = self
+            .media_dir
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no media folder configured"))?;
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.{}", id, extension_for(media.kind, media.media_type)));
+        std::fs::write(&path, &data)?;
+        self.store
+            .set_media_path(chat, id, &path.to_string_lossy())?;
+        if let Ok(updated) = self.store.message(chat, id) {
+            let _ = self.events.send(ServiceEvent::Message { message: Box::new(updated) });
+        }
+        Ok(())
+    }
+
+    /// Sets a chat's auto download override.
+    pub fn set_chat_auto_download(&self, chat: &str, enabled: bool) -> Result<()> {
+        self.store.set_chat_auto_download(chat, enabled)
+    }
+
     /// Deletes downloaded media and forgets the paths, keeping the messages.
     pub fn flush_media(&self) -> Result<usize> {
         let cleared = self.store.clear_media_paths()?;
@@ -1112,6 +1160,7 @@ impl Service {
             media_kind: None,
             media_path: None,
             media_thumb: None,
+            media_ref: None,
             reply_to_id: Some(reply_to_id.to_string()),
             reply_to_text: Some(reply_to_text.to_string()),
             reply_to_sender: Some(if sender.to_string() == self.own_jid() {
@@ -1260,6 +1309,7 @@ impl Service {
             media_kind: Some(kind.to_string()),
             media_path: stored_path,
             media_thumb: None,
+            media_ref: None,
             reply_to_id: reply.as_ref().map(|(id, _, _)| id.clone()),
             reply_to_text: reply.as_ref().map(|(_, _, text)| text.clone()),
             reply_to_sender: reply.as_ref().map(|(_, sender, _)| sender.clone()),
@@ -1473,6 +1523,7 @@ async fn incoming_message(
     inbound: &InboundMessage,
     client: Option<&Client>,
     media_dir: Option<&Path>,
+    auto_download: bool,
 ) -> Option<StoredMessage> {
     let info = &inbound.info;
     let mut text = inbound.message.text_content().unwrap_or_default().to_string();
@@ -1480,6 +1531,7 @@ async fn incoming_message(
     let mut media_kind = None;
     let mut media_path = None;
     let mut media_thumb = None;
+    let mut media_ref = None;
 
     if let Some(media) = detect_media(&inbound.message) {
         media_kind = Some(media.kind.to_string());
@@ -1495,24 +1547,29 @@ async fn incoming_message(
             }
         }
 
-        // Download when a destination and a client are available. A failure
-        // still records the message, so the text and metadata are not lost.
-        if let (Some(client), Some(dir)) = (client, media_dir) {
-            match client.download(media.downloadable.as_ref()).await {
-                Ok(bytes) => {
-                    if std::fs::create_dir_all(dir).is_ok() {
-                        let path = dir.join(format!(
-                            "{}.{}",
-                            info.id,
-                            extension_for(media.kind, media.media_type)
-                        ));
-                        if std::fs::write(&path, &bytes).is_ok() {
-                            media_path = Some(path.to_string_lossy().to_string());
+        if auto_download {
+            // Download when a destination and a client are available. A failure
+            // still records the message, so the text and metadata are not lost.
+            if let (Some(client), Some(dir)) = (client, media_dir) {
+                match client.download(media.downloadable.as_ref()).await {
+                    Ok(bytes) => {
+                        if std::fs::create_dir_all(dir).is_ok() {
+                            let path = dir.join(format!(
+                                "{}.{}",
+                                info.id,
+                                extension_for(media.kind, media.media_type)
+                            ));
+                            if std::fs::write(&path, &bytes).is_ok() {
+                                media_path = Some(path.to_string_lossy().to_string());
+                            }
                         }
                     }
+                    Err(e) => log::warn!("failed to download {} media: {e}", info.id),
                 }
-                Err(e) => log::warn!("failed to download {} media: {e}", info.id),
             }
+        } else {
+            // Keep the message so the file can be fetched on demand later.
+            media_ref = Some(buffa::Message::encode_to_vec(&*inbound.message));
         }
 
         if text.is_empty() {
@@ -1573,6 +1630,7 @@ async fn incoming_message(
         media_kind,
         media_path,
         media_thumb,
+        media_ref,
         reply_to_id,
         reply_to_text,
         reply_to_sender,
@@ -1956,6 +2014,7 @@ mod tests {
                 media_kind: None,
                 media_path: None,
                 media_thumb: None,
+                media_ref: None,
                 reply_to_id: None,
                 reply_to_text: None,
                 reply_to_sender: None,

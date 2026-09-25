@@ -23,6 +23,8 @@ const COMMANDS: &[&str] = &[
     "unread_mentions",
     "load_older",
     "flush_media",
+    "download_media",
+    "set_chat_auto_download",
     "qr_svg",
     "get_settings",
     "set_settings",

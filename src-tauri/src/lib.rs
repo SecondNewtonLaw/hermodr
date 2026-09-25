@@ -42,8 +42,8 @@ impl Default for UiSettings {
         Self {
             retention: Retention::default(),
             accept_full_history: false,
-            media_dir: None,
             auto_download_media: true,
+            media_dir: None,
             warn_missing_video_preview: true,
         }
     }
@@ -167,6 +167,7 @@ fn config_for(app: &AppHandle, settings: &UiSettings, account: &str) -> ServiceC
         messages_path: base.join("messages.db"),
         retention: settings.retention,
         accept_full_history: settings.accept_full_history,
+        auto_download_media: settings.auto_download_media,
         // An unset or empty setting falls back to the app data directory.
         media_dir: settings
             .media_dir
@@ -628,6 +629,33 @@ fn flush_media(state: State<'_, AppState>) -> Result<usize, String> {
     state.service()?.flush_media().map_err(|e| e.to_string())
 }
 
+/// Downloads a message's media on demand.
+#[tauri::command]
+async fn download_media(
+    state: State<'_, AppState>,
+    chat: String,
+    id: String,
+) -> Result<(), String> {
+    state
+        .service()?
+        .download_media(&chat, &id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Sets a chat's auto download override.
+#[tauri::command]
+fn set_chat_auto_download(
+    state: State<'_, AppState>,
+    chat: String,
+    enabled: bool,
+) -> Result<(), String> {
+    state
+        .service()?
+        .set_chat_auto_download(&chat, enabled)
+        .map_err(|e| e.to_string())
+}
+
 /// Asks the phone for older messages in a chat.
 #[tauri::command]
 async fn load_older(
@@ -741,6 +769,8 @@ pub fn run() {
             unread_mentions,
             load_older,
             flush_media,
+            download_media,
+            set_chat_auto_download,
             search,
             open_url,
             qr_svg,
