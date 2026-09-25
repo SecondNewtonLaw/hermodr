@@ -575,33 +575,70 @@ impl Service {
                             // outgoing row can move to delivered or read.
                             Event::Receipt(receipt) => {
                                 let status = match receipt.r#type {
-                                    ReceiptType::Read | ReceiptType::ReadSelf => "read",
-                                    ReceiptType::Delivered => "delivered",
-                                    _ => "sent",
+                                    ReceiptType::Read
+                                    | ReceiptType::ReadSelf
+                                    | ReceiptType::Played
+                                    | ReceiptType::PlayedSelf => Some("read"),
+                                    ReceiptType::Delivered | ReceiptType::Sender => {
+                                        Some("delivered")
+                                    }
+                                    ReceiptType::Sent => Some("sent"),
+                                    _ => None,
                                 };
-                                let chat = receipt.source.chat.to_string();
-                                for id in receipt.message_ids.iter() {
-                                    if let Ok(true) =
-                                        store.set_status(&chat, id.as_str(), status)
-                                    {
-                                        if let Ok(updated) = store.message(&chat, id.as_str()) {
-                                            let _ = events.send(ServiceEvent::Message {
-                                                message: Box::new(updated),
-                                            });
+                                if let Some(status) = status {
+                                    let chat = receipt.source.chat.to_string();
+                                    for id in receipt.message_ids.iter() {
+                                        if let Ok(true) =
+                                            store.set_status(&chat, id.as_str(), status)
+                                        {
+                                            if let Ok(updated) = store.message(&chat, id.as_str()) {
+                                                let _ = events.send(ServiceEvent::Message {
+                                                    message: Box::new(updated),
+                                                });
+                                            }
+                                        } else if let Ok(updated) =
+                                            store.set_status_by_id(id.as_str(), status)
+                                        {
+                                            for message in updated {
+                                                let _ = events.send(ServiceEvent::Message {
+                                                    message: Box::new(message),
+                                                });
+                                            }
                                         }
                                     }
                                 }
                             }
                             // The server accepted our stanza, so it is at least sent.
+                            // The ack only sometimes names the chat, and the named
+                            // JID can differ in form from the stored one, so the
+                            // id alone is the reliable correlator.
                             Event::ServerAck(ack) => {
                                 let accepted = ack.error.is_none();
-                                if let (true, Some(chat)) = (accepted, ack.from.as_ref()) {
-                                    let chat = chat.to_string();
-                                    if let Ok(true) = store.set_status(&chat, &ack.id, "sent") {
-                                        if let Ok(updated) = store.message(&chat, &ack.id) {
-                                            let _ = events.send(ServiceEvent::Message {
-                                                message: Box::new(updated),
-                                            });
+                                let is_message =
+                                    matches!(ack.class.as_deref(), None | Some("message"));
+                                if accepted && is_message {
+                                    let mut done = false;
+                                    if let Some(chat) = ack.from.as_ref() {
+                                        let chat = chat.to_string();
+                                        if let Ok(true) = store.set_status(&chat, &ack.id, "sent")
+                                        {
+                                            if let Ok(updated) = store.message(&chat, &ack.id) {
+                                                let _ = events.send(ServiceEvent::Message {
+                                                    message: Box::new(updated),
+                                                });
+                                            }
+                                            done = true;
+                                        }
+                                    }
+                                    if !done {
+                                        if let Ok(updated) =
+                                            store.set_status_by_id(&ack.id, "sent")
+                                        {
+                                            for message in updated {
+                                                let _ = events.send(ServiceEvent::Message {
+                                                    message: Box::new(message),
+                                                });
+                                            }
                                         }
                                     }
                                 }
@@ -807,6 +844,7 @@ impl Service {
         mentions: Vec<String>,
     ) -> Result<()> {
         let to: Jid = chat.parse()?;
+        let to_self = self.is_self_jid(&to);
         let text = text.into();
         // `@all` is a group mention, carried separately from member mentions.
         let mention_all = mentions.iter().any(|m| m == "@all");
@@ -898,7 +936,9 @@ impl Service {
             preview_title: None,
             preview_desc: None,
             preview_thumb: None,
-            status: Some("pending".into()),
+            // A message to ourselves is already where it needs to be; leaving
+            // it pending would wait for a receipt that never arrives.
+            status: Some(if to_self { "delivered".into() } else { "pending".into() }),
         };
         if let Some(p) = &preview {
             message.preview_url = Some(p.url.clone());
@@ -918,6 +958,19 @@ impl Service {
             .or_else(|| self.client.lid())
             .map(|j| j.to_non_ad().to_string())
             .unwrap_or_default()
+    }
+
+    /// Whether a destination is our own account, in either addressing form.
+    ///
+    /// A message to ourselves needs no network receipt to be delivered, so it
+    /// is stored as delivered rather than left pending.
+    fn is_self_jid(&self, jid: &Jid) -> bool {
+        match (self.client.pn(), self.client.lid()) {
+            (Some(pn), Some(lid)) => jid.matches_user_or_lid(&pn, Some(&lid)),
+            (Some(pn), None) => jid.matches_user_or_lid(&pn, None),
+            (None, Some(lid)) => jid.matches_user_or_lid(&lid, None),
+            (None, None) => false,
+        }
     }
 
     /// Chats, contacts and groups matching a query.
@@ -1118,6 +1171,7 @@ impl Service {
         mentions: Vec<String>,
     ) -> Result<()> {
         let to: Jid = chat.parse()?;
+        let to_self = self.is_self_jid(&to);
         // The quoted author must be the address without a device suffix: a
         // participant like `123:98@lid` is not resolvable by recipients, who
         // then attribute the quoted message to the sender of the reply.
@@ -1177,7 +1231,7 @@ impl Service {
             preview_title: None,
             preview_desc: None,
             preview_thumb: None,
-            status: Some("pending".into()),
+            status: Some(if to_self { "delivered".into() } else { "pending".into() }),
         };
         self.store.upsert(&stored)?;
         let _ = self.events.send(ServiceEvent::Message { message: Box::new(stored) });
@@ -1197,6 +1251,7 @@ impl Service {
         reply: Option<(String, String, String)>,
     ) -> Result<Option<String>> {
         let to: Jid = chat.parse()?;
+        let to_self = self.is_self_jid(&to);
         let file_name = file_name.to_string();
         let extension = std::path::Path::new(&file_name)
             .extension()
@@ -1322,7 +1377,7 @@ impl Service {
             preview_title: None,
             preview_desc: None,
             preview_thumb: None,
-            status: Some("pending".into()),
+            status: Some(if to_self { "delivered".into() } else { "pending".into() }),
         };
         self.store.upsert(&stored)?;
         let _ = self.events.send(ServiceEvent::Message { message: Box::new(stored) });
