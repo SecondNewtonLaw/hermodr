@@ -150,35 +150,6 @@ fn now_millis() -> u128 {
         .unwrap_or(0)
 }
 
-/// The identifier used before the `.app` suffix was dropped.
-const OLD_IDENTIFIER: &str = "com.hermodr.app";
-
-/// Moves the previous identifier's data, config and cache directories over,
-/// once, so an upgrade keeps its session and history.
-fn migrate_app_identifier(app: &AppHandle) {
-    for dir in [
-        app.path().data_dir(),
-        app.path().config_dir(),
-        app.path().cache_dir(),
-    ] {
-        let Ok(current) = dir else { continue };
-        let Some(base) = current.parent() else { continue };
-        let old = base.join(OLD_IDENTIFIER);
-        if old.is_dir() && !current.exists() {
-            if std::fs::rename(&old, &current).is_err() {
-                // A different filesystem cannot be renamed across.
-                if std::fs::create_dir_all(&current).is_ok() {
-                    if let Ok(entries) = std::fs::read_dir(&old) {
-                        for entry in entries.flatten() {
-                            let _ = std::fs::copy(entry.path(), current.join(entry.file_name()));
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Where downloads live by default. The cache, because media is regenerable and
 /// should not be carried in a backup of the account.
 fn media_cache_dir(app: &AppHandle) -> PathBuf {
@@ -747,8 +718,6 @@ pub fn run() {
 
     tauri::Builder::default()
         .setup(|app| {
-            migrate_app_identifier(app.handle());
-
             app.manage(AppState {
                 service: Mutex::new(None),
                 settings: Mutex::new(UiSettings::default()),
