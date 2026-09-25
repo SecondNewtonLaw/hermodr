@@ -37,7 +37,7 @@ use crate::{
 
 /// Asks the phone for `count` messages older than the oldest one stored in
 /// `chat`; they arrive later as a history sync.
-async fn fetch_older(client: &Client, store: &MessageStore, chat: &str, count: i32) -> Result<()> {
+async fn fetch_older(client: &Arc<Client>, store: &MessageStore, chat: &str, count: i32) -> Result<()> {
     let Some((id, from_me, timestamp)) = store.oldest_message(chat)? else {
         return Ok(());
     };
