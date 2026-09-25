@@ -5,6 +5,7 @@
   import AudioPlayer from "$lib/AudioPlayer.svelte";
   import VoiceRecorder, { type Recording } from "$lib/VoiceRecorder.svelte";
   import StarredList, { type StarredItem } from "$lib/StarredList.svelte";
+  import MessageFinder, { type FoundItem } from "$lib/MessageFinder.svelte";
   import ChatSettings, { type ChatRetention } from "$lib/ChatSettings.svelte";
   import ProfileCard from "$lib/ProfileCard.svelte";
   import MessageInfo from "$lib/MessageInfo.svelte";
@@ -1777,6 +1778,49 @@
     }
   }
 
+  /** Mentions of us (everywhere or in one chat), or a search inside one chat. */
+  let finder = $state<{ mode: "pings" | "search"; chat: string | null; items: FoundItem[] | null } | null>(null);
+  const unreadPings = $derived(chats.reduce((n, c) => n + c.mention_count, 0));
+
+  function found(m: StoredMessage, across: boolean): FoundItem {
+    return {
+      chat: m.chat,
+      id: m.id,
+      where: across ? chatName(m.chat) : null,
+      author: m.from_me ? "You" : displayName(m.sender_name, m.sender),
+      text: replyPreviewText(m),
+      timestamp: m.timestamp,
+      unread: !m.read && !m.from_me,
+    };
+  }
+
+  async function openPings(chat: string | null) {
+    finder = { mode: "pings", chat, items: null };
+    try {
+      const got = await invoke<StoredMessage[]>("pings", { chat });
+      if (finder?.mode === "pings" && finder.chat === chat) finder.items = got.map((m) => found(m, chat === null));
+    } catch (e) {
+      finder = null;
+      error = String(e);
+    }
+  }
+
+  async function searchChat(query: string) {
+    const chat = finder?.chat;
+    if (!chat) return;
+    if (!query.trim()) {
+      finder!.items = [];
+      return;
+    }
+    finder!.items = null;
+    try {
+      const got = await invoke<StoredMessage[]>("search_messages", { chat, query });
+      if (finder?.mode === "search" && finder.chat === chat) finder.items = got.map((m) => found(m, false));
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   /** Walks the chat's past back from the phone until the pending jump's message lands. */
   let seeking = $state(false);
   async function loadAndJump() {
@@ -2575,6 +2619,10 @@
     <aside class="chats">
       <header>
         <h1 class="title">Chats</h1>
+        <button class="icon badge-host" title="Mentions" aria-label="Mentions" onclick={() => openPings(null)}>
+          <Icon name="at" size={18} />
+          {#if unreadPings > 0}<span class="icon-badge">{unreadPings > 99 ? "99+" : unreadPings}</span>{/if}
+        </button>
         <button class="icon" title="Starred messages" aria-label="Starred messages" onclick={openStarred}>
           <Icon name="star" size={18} />
         </button>
@@ -2797,11 +2845,26 @@
               </span>
             {/if}
           </div>
-          <button
-            class="icon header-tool"
-            title="Chat settings"
-            aria-label="Chat settings"
-            onclick={() => (chatSettingsOpen = true)}><Icon name="sliders" size={18} /></button>
+          <div class="header-tools">
+            <button
+              class="icon"
+              title="Search in this chat"
+              aria-label="Search in this chat"
+              onclick={() => (finder = { mode: "search", chat: selectedChat, items: [] })}
+              ><Icon name="search" size={18} /></button>
+            {#if selectedChat.endsWith("@g.us")}
+              <button
+                class="icon"
+                title="Your mentions in this group"
+                aria-label="Your mentions in this group"
+                onclick={() => openPings(selectedChat)}><Icon name="at" size={18} /></button>
+            {/if}
+            <button
+              class="icon"
+              title="Chat settings"
+              aria-label="Chat settings"
+              onclick={() => (chatSettingsOpen = true)}><Icon name="sliders" size={18} /></button>
+          </div>
           {#if mentionQueue.length > 0}
             <button class="jump-mention" title="Jump to mention" onclick={jumpNextMention}>
               <Icon name="at" size={14} />
@@ -3608,6 +3671,22 @@
     onclose={() => (showStarred = false)} />
 {/if}
 
+{#if finder}
+  {@const inChat = finder.chat ? chatName(finder.chat) : null}
+  <MessageFinder
+    title={finder.mode === "search" ? "Search messages" : inChat ? "Your mentions" : "Mentions"}
+    subtitle={inChat ?? (finder.mode === "pings" ? "Every message that pinged you" : null)}
+    placeholder={finder.mode === "search" ? "Search this chat" : "Filter mentions"}
+    items={finder.items}
+    empty={finder.mode === "search" ? "Type to search the messages kept on this computer." : "Nobody has mentioned you yet."}
+    onquery={finder.mode === "search" ? searchChat : undefined}
+    onopen={(item) => {
+      finder = null;
+      void jumpTo(item.chat, item.id);
+    }}
+    onclose={() => (finder = null)} />
+{/if}
+
 {#if onceOpen && onceOpen.media_kind !== "audio" && onceOpen.media_path}
   <MediaViewer
     items={[viewerItem(onceOpen)]}
@@ -4255,9 +4334,32 @@
     gap: 10px;
     min-width: 0;
   }
-  .header-tool {
+  .header-tools {
+    display: flex;
+    align-items: center;
+    gap: 2px;
     margin-left: auto;
     flex: none;
+  }
+  .badge-host {
+    position: relative;
+  }
+  .icon-badge {
+    position: absolute;
+    top: 2px;
+    right: 0;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 4px;
+    box-sizing: border-box;
+    border-radius: 999px;
+    background: var(--mention);
+    color: var(--accent-ink);
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 16px;
+    text-align: center;
+    pointer-events: none;
   }
   .heading-avatar {
     flex: none;

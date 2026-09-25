@@ -807,6 +807,18 @@ fn starred_messages(state: State<'_, AppState>) -> Result<Vec<StoredMessage>, St
     state.service()?.starred_messages().map_err(|e| e.to_string())
 }
 
+/// Messages that mention us, in one chat or (without `chat`) all of them.
+#[tauri::command]
+fn pings(state: State<'_, AppState>, chat: Option<String>) -> Result<Vec<StoredMessage>, String> {
+    state.service()?.pings(chat.as_deref()).map_err(|e| e.to_string())
+}
+
+/// Messages in one chat whose text contains `query`.
+#[tauri::command]
+fn search_messages(state: State<'_, AppState>, chat: String, query: String) -> Result<Vec<StoredMessage>, String> {
+    state.service()?.search_messages(&chat, &query).map_err(|e| e.to_string())
+}
+
 #[derive(serde::Serialize)]
 struct ChatSettings {
     /// The chat's auto download override, `None` when it follows the global one.
@@ -1344,6 +1356,8 @@ pub fn run() {
             open_view_once,
             mark_played,
             starred_messages,
+            pings,
+            search_messages,
             edit_event,
             set_chat_retention,
             chat_settings,

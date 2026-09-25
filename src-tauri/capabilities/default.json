@@ -39,6 +39,8 @@
     "allow-open-view-once",
     "allow-mark-played",
     "allow-starred-messages",
+    "allow-pings",
+    "allow-search-messages",
     "allow-edit-event",
     "allow-set-chat-retention",
     "allow-chat-settings",

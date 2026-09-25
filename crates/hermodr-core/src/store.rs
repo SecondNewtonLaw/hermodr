@@ -701,6 +701,36 @@ impl MessageStore {
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
+    /// Messages that mention us, in one chat or all of them, newest first.
+    pub fn pings(&self, chat: Option<&str>, limit: u32) -> Result<Vec<StoredMessage>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS}
+             FROM messages m
+             LEFT JOIN names n ON n.jid = m.sender
+             WHERE m.mentioned = 1 AND m.from_me = 0 AND (?1 IS NULL OR m.chat = ?1)
+             ORDER BY m.timestamp DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![chat, limit], message_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    /// Messages in a chat whose text contains `query`, ignoring case, newest first.
+    pub fn search_messages(&self, chat: &str, query: &str, limit: u32) -> Result<Vec<StoredMessage>> {
+        let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("%{}%", escaped.to_lowercase());
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS}
+             FROM messages m
+             LEFT JOIN names n ON n.jid = m.sender
+             WHERE m.chat = ?1 AND lower(m.text) LIKE ?2 ESCAPE '\\'
+             ORDER BY m.timestamp DESC LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(params![chat, pattern, limit], message_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
     /// Starred messages across every chat, newest first.
     pub fn starred_messages(&self) -> Result<Vec<StoredMessage>> {
         let conn = self.conn.lock().unwrap();
@@ -1659,6 +1689,23 @@ mod tests {
         assert!(!s.apply_edit("a", "missing", "new").unwrap());
         assert_eq!(s.messages_for("a", 1).unwrap()[0].text, "new");
         assert_eq!(s.marks("a").unwrap().edited, vec!["1".to_string()]);
+    }
+
+    #[test]
+    fn pings_and_message_search() {
+        let s = store(Retention::unlimited());
+        let mut ping = msg("g", "1", 1, "hey @123 look");
+        ping.mentioned = true;
+        s.upsert(&ping).unwrap();
+        s.upsert(&msg("g", "2", 0, "100% done_ok")).unwrap();
+        let mut elsewhere = msg("h", "3", 0, "@123");
+        elsewhere.mentioned = true;
+        s.upsert(&elsewhere).unwrap();
+        assert_eq!(s.pings(Some("g"), 10).unwrap().len(), 1);
+        assert_eq!(s.pings(None, 10).unwrap().len(), 2);
+        assert_eq!(s.search_messages("g", "LOOK", 10).unwrap()[0].id, "1");
+        assert_eq!(s.search_messages("g", "0% d", 10).unwrap()[0].id, "2");
+        assert!(s.search_messages("g", "_", 10).unwrap().iter().all(|m| m.text.contains('_')));
     }
 
     #[test]

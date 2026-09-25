@@ -27,6 +27,8 @@ const COMMANDS: &[&str] = &[
     "open_view_once",
     "mark_played",
     "starred_messages",
+    "pings",
+    "search_messages",
     "edit_event",
     "set_chat_retention",
     "chat_settings",

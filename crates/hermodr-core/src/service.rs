@@ -2321,6 +2321,19 @@ impl Service {
         self.store.starred_messages()
     }
 
+    /// Messages that mention us, in one chat or all of them, newest first.
+    pub fn pings(&self, chat: Option<&str>) -> Result<Vec<StoredMessage>> {
+        self.store.pings(chat, 500)
+    }
+
+    /// Messages in a chat containing `query`, newest first.
+    pub fn search_messages(&self, chat: &str, query: &str) -> Result<Vec<StoredMessage>> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        self.store.search_messages(chat, query.trim(), 200)
+    }
+
     pub fn chat_retention(&self, chat: &str) -> Result<crate::store::ChatRetention> {
         self.store.chat_retention(chat)
     }
