@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-own-jid"
+description = "Enables the own_jid command without any pre-configured scope."
+commands.allow = ["own_jid"]
+
+[[permission]]
+identifier = "deny-own-jid"
+description = "Denies the own_jid command without any pre-configured scope."
+commands.deny = ["own_jid"]

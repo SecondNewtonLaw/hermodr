@@ -1,0 +1,388 @@
+<script lang="ts" module>
+  export type Member = {
+    jid: string;
+    name: string;
+    admin: boolean;
+    number: string | null;
+    username: string | null;
+    label: string | null;
+  };
+  export type GroupInfoData = {
+    subject: string | null;
+    description: string | null;
+    created_at: number | null;
+    participants: Member[];
+  };
+</script>
+
+<script lang="ts">
+  import { convertFileSrc } from "@tauri-apps/api/core";
+  import Icon from "$lib/Icon.svelte";
+  import Panel from "$lib/Panel.svelte";
+  import { displayName, phoneLabel } from "$lib/phone";
+
+  let {
+    jid,
+    title,
+    info,
+    error,
+    avatars,
+    pinned,
+    onavatar,
+    onretry,
+    onpin,
+    onopenurl,
+    onmessage,
+    onlabel,
+    me,
+    namer = displayName,
+    onclose,
+  }: {
+    jid: string;
+    title: string;
+    info: GroupInfoData | null;
+    error: string | null;
+    avatars: Record<string, string | null>;
+    pinned: boolean;
+    onavatar: (jid: string) => void;
+    onretry: () => void;
+    onpin: () => void;
+    onopenurl: (url: string) => void;
+    onmessage: (jid: string) => void;
+    /** Sets our own tag in this group; empty clears it. */
+    onlabel: (label: string) => Promise<void>;
+    /** Our own JID, to find ourselves in the member list. */
+    me: string | null;
+    /** Readable name for a member; the default formats bare numbers only. */
+    namer?: (name: string | null, jid: string) => string;
+    onclose: () => void;
+  } = $props();
+
+  const self = $derived(
+    info?.participants.find((p) => p.jid === me || (me && p.number === me.split("@")[0])),
+  );
+  let tagDraft = $state<string | null>(null);
+  let tagBusy = $state(false);
+  let tagError = $state<string | null>(null);
+  const tagValue = $derived(tagDraft ?? self?.label ?? "");
+
+  async function saveTag() {
+    tagBusy = true;
+    tagError = null;
+    try {
+      await onlabel(tagValue.trim());
+      tagDraft = null;
+    } catch (e) {
+      tagError = String(e);
+    } finally {
+      tagBusy = false;
+    }
+  }
+
+  type Section = "overview" | "members";
+  let section = $state<Section>("overview");
+  const nav = $derived<{ id: Section; label: string; group: string }[]>([
+    { id: "overview", label: "Overview", group: title },
+    {
+      id: "members",
+      label: info ? `Members (${info.participants.length})` : "Members",
+      group: title,
+    },
+  ]);
+
+  let query = $state("");
+  const members = $derived(
+    (info?.participants ?? [])
+      // Our own entry may carry a nickname from our address book; show our push name.
+      .map((m) => ({ ...m, display: me && m === self ? namer(null, me) : namer(m.name, m.jid) }))
+      .filter((m) => {
+        const q = query.trim().toLowerCase();
+        return !q || m.display.toLowerCase().includes(q) || (m.number ?? "").includes(q);
+      })
+      .sort((a, b) => Number(b.admin) - Number(a.admin) || a.display.localeCompare(b.display)),
+  );
+
+  $effect(() => {
+    if (section === "members") for (const m of info?.participants ?? []) onavatar(m.jid);
+  });
+
+  /** Up to two letters, or null for a label with none (a bare number). */
+  function initials(label: string) {
+    const words = label.replace(/[^\p{L}\s]/gu, "").trim().split(/\s+/).filter(Boolean);
+    if (words.length === 0) return null;
+    return (words.length === 1 ? words[0].slice(0, 2) : words[0][0] + words[1][0]).toUpperCase();
+  }
+  function hue(id: string) {
+    let h = 0;
+    for (const c of id) h = (h * 31 + c.charCodeAt(0)) % 360;
+    return h;
+  }
+
+  function linkParts(text: string) {
+    return text.split(/(https?:\/\/[^\s<>()\[\]{}"']+)/g).filter(Boolean);
+  }
+</script>
+
+{#snippet avatar(id: string, label: string, size: number)}
+  {#if avatars[id]}
+    <img class="avatar" style="--size: {size}px" src={convertFileSrc(avatars[id]!)} alt="" />
+  {:else}
+    {@const letters = initials(label)}
+    <span class="avatar placeholder" style="--size: {size}px; --hue: {hue(id)}"
+      >{#if letters}{letters}{:else}<Icon name="user" size={Math.round(size * 0.5)} />{/if}</span
+    >
+  {/if}
+{/snippet}
+
+<Panel label="Group info" {nav} bind:section {onclose}>
+  {#snippet header()}
+    <div class="head">
+      {@render avatar(jid, title, 44)}
+      <span class="head-text">
+        <span class="head-name">{title}</span>
+        <span class="head-sub">Group · {info ? `${info.participants.length} members` : "…"}</span>
+      </span>
+    </div>
+  {/snippet}
+
+  {#if !info}
+    {#if error}
+      <h2>Could not load this group</h2>
+      <p class="lede">{error}</p>
+      <div class="actions-row"><button class="button primary" onclick={onretry}>Retry</button></div>
+    {:else}
+      <p class="muted">Loading group info…</p>
+    {/if}
+  {:else if section === "overview"}
+    <div class="hero">
+      {@render avatar(jid, title, 96)}
+      <div>
+        <h2>{info.subject ?? title}</h2>
+        <span class="muted">
+          Group · {info.participants.length} members{#if info.created_at}
+            · created {new Date(info.created_at * 1000).toLocaleDateString()}{/if}
+        </span>
+      </div>
+    </div>
+
+    {#if info.description}
+      <h3>Description</h3>
+      <p class="description">
+        {#each linkParts(info.description) as part}{#if /^https?:\/\//.test(part)}<a
+              href={part}
+              onclick={(e) => {
+                e.preventDefault();
+                onopenurl(part);
+              }}>{part}</a
+            >{:else}{part}{/if}{/each}
+      </p>
+    {/if}
+
+    <div class="setting stack">
+      <div>
+        <span class="setting-title">Your tag in this group</span>
+        <span class="setting-desc">Shown under your name on your messages here. Leave empty to remove it.</span>
+      </div>
+      <div class="tag-row">
+        <input
+          class="field"
+          maxlength="30"
+          placeholder="Add a tag"
+          value={tagValue}
+          oninput={(e) => (tagDraft = e.currentTarget.value)}
+          onkeydown={(e) => e.key === "Enter" && saveTag()} />
+        <button
+          class="button primary"
+          disabled={tagBusy || tagValue.trim() === (self?.label ?? "")}
+          onclick={saveTag}>{tagBusy ? "Saving…" : "Save"}</button>
+      </div>
+      {#if tagError}<p class="error-text">{tagError}</p>{/if}
+    </div>
+
+    <label class="setting">
+      <div>
+        <span class="setting-title">Pin chat</span>
+        <span class="setting-desc">Keeps it at the top of the list, on every linked device.</span>
+      </div>
+      <input class="switch" type="checkbox" checked={pinned} onchange={onpin} />
+    </label>
+  {:else}
+    <h2>Members</h2>
+    <label class="member-search">
+      <Icon name="search" size={15} />
+      <input placeholder="Search members" bind:value={query} />
+    </label>
+    <ul class="members">
+      {#each members as member (member.jid)}
+        <li class="member">
+          {@render avatar(member.jid, member.display, 36)}
+          <span class="member-text">
+            <span class="member-name">
+              {member.display}
+              {#if member.admin}<span class="tag">Admin</span>{/if}
+            </span>
+            {#if member.label}<span class="member-tag">{member.label}</span>{/if}
+            <span class="muted">
+              {#if member.number && member.display !== phoneLabel(member.number)}
+                {phoneLabel(member.number) ?? member.number}
+              {/if}
+              {#if member.username}@{member.username}{/if}
+            </span>
+          </span>
+          <button
+            class="message"
+            title="Message"
+            aria-label="Message {member.display}"
+            onclick={() => onmessage(member.jid)}><Icon name="message" size={16} /></button>
+        </li>
+      {/each}
+      {#if members.length === 0}
+        <li class="muted">No members match.</li>
+      {/if}
+    </ul>
+  {/if}
+</Panel>
+
+<style>
+  .avatar {
+    width: var(--size);
+    height: var(--size);
+    border-radius: 50%;
+    object-fit: cover;
+    flex: none;
+  }
+  .placeholder {
+    display: grid;
+    place-items: center;
+    background: hsl(var(--hue) 28% 24%);
+    color: hsl(var(--hue) 45% 80%);
+    font-size: calc(var(--size) * 0.36);
+    font-weight: 600;
+  }
+  .head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 4px 6px 12px;
+  }
+  .head-text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .head-name {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .head-sub {
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+  .hero {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    margin-bottom: 16px;
+  }
+  .hero h2 {
+    margin: 0 0 4px;
+  }
+  h3 {
+    margin: 12px 0 6px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+  }
+  .description {
+    margin: 0 0 8px;
+    padding: 14px 16px;
+    background: var(--surface);
+    border-radius: var(--radius);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    line-height: 1.5;
+  }
+  .description a {
+    color: var(--link);
+  }
+  .member-search {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 4px 0 8px;
+    padding: 0 12px;
+    height: 36px;
+    background: var(--surface);
+    border-radius: 999px;
+    color: var(--muted);
+  }
+  .member-search input {
+    flex: 1;
+    background: transparent;
+    border: 0;
+    outline: none;
+    color: var(--text);
+    font: inherit;
+  }
+  .members {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+  .member {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 10px;
+    border-radius: var(--radius);
+  }
+  .member:hover {
+    background: var(--surface);
+  }
+  .member-text {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .member-name {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .member-tag {
+    font-size: 12.5px;
+    color: var(--accent-text);
+  }
+  .tag-row {
+    display: flex;
+    gap: 8px;
+  }
+  .tag-row .field {
+    flex: 1;
+  }
+  .message {
+    display: grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    background: var(--raised);
+    border: 0;
+    border-radius: 50%;
+    color: var(--muted);
+    cursor: pointer;
+    opacity: 0;
+  }
+  .member:hover .message,
+  .message:focus-visible {
+    opacity: 1;
+  }
+  .message:hover {
+    color: var(--text);
+  }
+</style>

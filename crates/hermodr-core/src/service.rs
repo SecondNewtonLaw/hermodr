@@ -21,7 +21,8 @@ use whatsapp_rust::{
     media::{self, AudioOptions, DocumentOptions, ImageOptions, VideoOptions},
     prelude::*,
     wacore::msg_secret::MsgSecretRetention,
-    wacore::types::presence::ReceiptType,
+    wacore::iq::privacy::{PrivacyCategory, PrivacyValue},
+    wacore::types::presence::{ChatPresence, ChatPresenceMedia, ReceiptType},
     wacore::types::events::Event,
     wacore_binary::builder::NodeBuilder,
     CacheConfig,
@@ -150,6 +151,48 @@ pub enum ServiceEvent {
     Syncing { pending: usize },
     /// The backlog finished draining.
     Synced,
+    /// History sync stored older messages for these chats.
+    HistoryLoaded { chats: Vec<String> },
+    /// A chat's profile picture changed, so its cached avatar is stale.
+    AvatarChanged { jid: String },
+    /// Someone started or stopped typing; `state` is `typing`, `recording` or
+    /// `paused`.
+    Typing { chat: String, sender: String, state: String },
+    /// A group member changed their tag; empty means they cleared it.
+    MemberLabel { chat: String, jid: String, label: String },
+    /// Reactions, stars or the pinned message of a chat changed.
+    Marks { chat: String },
+}
+
+/// The account's own profile and privacy, as the settings panel edits them.
+#[derive(Debug, Clone, Serialize)]
+pub struct Profile {
+    pub name: String,
+    pub about: Option<String>,
+    /// The account's username, without the `@`, if one is set or reserved.
+    pub username: Option<String>,
+    /// Reserved but not yet active.
+    pub username_reserved: bool,
+    /// Privacy category (`last`, `profile`, `readreceipts`, …) to its value.
+    pub privacy: std::collections::BTreeMap<String, String>,
+}
+
+/// How [`Service::send_media`] sends a file beyond its type.
+#[derive(Debug, Default)]
+pub struct SendOptions {
+    /// A video that plays muted and looping, as WhatsApp's GIFs are.
+    pub gif: bool,
+    /// Opens once for the recipient, then is gone.
+    pub view_once: bool,
+    /// Present for a recorded voice note (an Ogg/Opus file).
+    pub voice: Option<VoiceNote>,
+}
+
+#[derive(Debug)]
+pub struct VoiceNote {
+    pub seconds: u32,
+    /// 64 loudness levels, 0 to 100, drawn as the note's waveform.
+    pub waveform: Vec<u8>,
 }
 
 /// A group member, as the mention autocomplete needs it.
@@ -165,6 +208,8 @@ pub struct Participant {
     pub number: Option<String>,
     /// WhatsApp username, when the member has one.
     pub username: Option<String>,
+    /// The member's own tag in this group, such as "Long live EclipseOS".
+    pub label: Option<String>,
 }
 
 /// One row of the chat/contact search.
@@ -272,7 +317,8 @@ pub struct Service {
     /// Group metadata for this run, so opening a chat does not re-query the
     /// server and trip its rate limit. Group membership changes rarely enough
     /// that a session-lifetime cache is fine.
-    group_cache: Mutex<std::collections::HashMap<String, GroupInfo>>,
+    /// Shared with the event handler, which patches member tags as they change.
+    group_cache: std::sync::Arc<Mutex<std::collections::HashMap<String, GroupInfo>>>,
     /// Every group the account is in, `(jid, subject)`, filled on first search.
     groups_cache: Mutex<Vec<(String, String)>>,
 }
@@ -320,6 +366,8 @@ impl Service {
         let connected_for_events = connected_state.clone();
         let client_for_events = client_slot.clone();
         let media_dir_for_events = media_dir.clone();
+        let group_cache: Arc<Mutex<std::collections::HashMap<String, GroupInfo>>> = Arc::default();
+        let group_cache_for_events = group_cache.clone();
 
         let bot = Bot::builder()
             .with_backend(SqliteStore::new(config.session_path.to_string_lossy().as_ref()).await?)
@@ -409,6 +457,12 @@ impl Service {
                     EventKind::OfflineSyncPreview,
                     EventKind::OfflineSyncCompleted,
                     EventKind::PinUpdate,
+                    // Unlisted kinds never reach the handler: history ("load
+                    // older" included), typing and picture changes need these.
+                    EventKind::HistorySync,
+                    EventKind::ChatPresence,
+                    EventKind::PictureUpdate,
+                    EventKind::UndecryptableMessage,
                 ],
                 move |event, _client| {
                     let store = store_for_events.clone();
@@ -416,6 +470,7 @@ impl Service {
                     let connected = connected_for_events.clone();
                     let client_for_events = client_for_events.clone();
                     let media_dir = media_dir_for_events.clone();
+                    let group_cache = group_cache_for_events.clone();
                     async move {
                         match event.as_ref() {
                             Event::Messages(batch) => {
@@ -472,8 +527,16 @@ impl Service {
                                                 let _ = store.set_saved_name(&chat, &name);
                                             }
                                         } else {
-                                            let _ = store.set_name(&sender, &name);
-                                            if !is_group && !from_me {
+                                            // The bare number is only a placeholder;
+                                            // it must not replace a push name that a
+                                            // message without one would otherwise erase.
+                                            let unnamed = |jid: &str| {
+                                                store.name_for(jid).ok().flatten().is_none()
+                                            };
+                                            if unnamed(&sender) {
+                                                let _ = store.set_name(&sender, &name);
+                                            }
+                                            if !is_group && !from_me && unnamed(&chat) {
                                                 let _ = store.set_name(&chat, &name);
                                             }
                                         }
@@ -504,6 +567,153 @@ impl Service {
                                         if !is_group && !from_me {
                                             let _ = store.set_name(&chat, &push_name);
                                         }
+                                    }
+
+                                    let base = inbound.message.get_base_message();
+                                    let message_id = inbound.info.id.to_string();
+                                    let author = if from_me {
+                                        own.first().cloned().unwrap_or_else(|| sender.clone())
+                                    } else {
+                                        inbound.info.source.sender.to_non_ad().to_string()
+                                    };
+                                    remember_structures(&store, &chat, &message_id, &author, &inbound.message);
+
+                                    if let Some(update) = base.poll_update_message.as_option() {
+                                        use whatsapp_rust::wacore::poll::{compute_option_hash, PollVoteCiphertext};
+                                        let poll_id = update.poll_creation_message_key.as_option().and_then(|k| k.id.clone());
+                                        let def = poll_id.as_deref().and_then(|id| store.poll_secret(&chat, id).ok().flatten());
+                                        if let (Some(poll_id), Some(def), Some(vote), Some(client)) = (
+                                            poll_id,
+                                            def,
+                                            update.vote.as_option(),
+                                            client.as_deref(),
+                                        ) {
+                                            // The key is derived from the creator's and voter's
+                                            // addresses, and an LID-addressed group uses the LID
+                                            // form, so try every form either side is known by.
+                                            let mut creators = vec![def.creator.clone()];
+                                            if own.contains(&def.creator) {
+                                                creators.extend(own.iter().filter(|j| **j != def.creator).cloned());
+                                            }
+                                            let mut voters = vec![inbound.info.source.sender.to_non_ad()];
+                                            if let Some(alt) = inbound.info.source.sender_alt.as_ref() {
+                                                voters.push(alt.to_non_ad());
+                                            }
+                                            if from_me {
+                                                voters.extend(own.iter().filter_map(|j| j.parse::<Jid>().ok()));
+                                            }
+                                            let voter = voters[0].clone();
+                                            let mut opened = Err(anyhow::anyhow!("no address pair opened it"));
+                                            'pairs: for creator in creators.iter().filter_map(|c| c.parse::<Jid>().ok()) {
+                                                for voter in &voters {
+                                                    let cipher = PollVoteCiphertext {
+                                                        enc_payload: vote.enc_payload.as_deref().unwrap_or_default(),
+                                                        enc_iv: vote.enc_iv.as_deref().unwrap_or_default(),
+                                                    };
+                                                    if let Ok(hashes) = client
+                                                        .polls()
+                                                        .decrypt_vote(cipher, &def.secret, &poll_id, &creator, voter)
+                                                        .await
+                                                    {
+                                                        opened = Ok(hashes);
+                                                        break 'pairs;
+                                                    }
+                                                }
+                                            }
+                                            match opened {
+                                                Ok(hashes) => {
+                                                    let chosen: Vec<String> = def
+                                                        .options
+                                                        .iter()
+                                                        .filter(|o| hashes.iter().any(|h| h.as_slice() == compute_option_hash(o)))
+                                                        .cloned()
+                                                        .collect();
+                                                    let who = if from_me { "@me".to_string() } else { voter.to_string() };
+                                                    let _ = store.set_poll_vote(&chat, &poll_id, &who, &chosen);
+                                                    let _ = events.send(ServiceEvent::Marks { chat: chat.clone() });
+                                                }
+                                                Err(e) => log::warn!("could not open a vote on poll {poll_id}: {e}"),
+                                            }
+                                        }
+                                        continue;
+                                    }
+
+                                    if let Some(response) = base.enc_event_response_message.as_option() {
+                                        let event_id = response.event_creation_message_key.as_option().and_then(|k| k.id.clone());
+                                        let def = event_id.as_deref().and_then(|id| store.event_secret(&chat, id).ok().flatten());
+                                        if let (Some(event_id), Some(def)) = (event_id, def) {
+                                            let responder = inbound.info.source.sender.to_non_ad().to_string();
+                                            // Our own events may have been answered under our other address.
+                                            let mut creators = vec![def.creator.clone()];
+                                            if own.contains(&def.creator) {
+                                                creators.extend(own.iter().filter(|j| **j != def.creator).cloned());
+                                            }
+                                            let opened = creators.iter().find_map(|creator| {
+                                                whatsapp_rust::wacore::event::decrypt_event_response_with_secret(
+                                                    response.enc_payload.as_deref().unwrap_or_default(),
+                                                    response.enc_iv.as_deref().unwrap_or_default(),
+                                                    &def.secret,
+                                                    &event_id,
+                                                    creator,
+                                                    &responder,
+                                                )
+                                                .ok()
+                                            });
+                                            match opened {
+                                                Some(answer) => {
+                                                    let who = if from_me { "@me".to_string() } else { responder };
+                                                    let _ = store.set_event_response(&chat, &event_id, &who, response_name(answer.response));
+                                                    let _ = events.send(ServiceEvent::Marks { chat: chat.clone() });
+                                                }
+                                                None => log::warn!("could not open an RSVP to event {event_id}"),
+                                            }
+                                        }
+                                        continue;
+                                    }
+
+                                    if let Some(reaction) = base.reaction_message.as_option() {
+                                        if let Some(target) =
+                                            reaction.key.as_option().and_then(|k| k.id.clone())
+                                        {
+                                            let who = if from_me {
+                                                "@me".to_string()
+                                            } else {
+                                                inbound.info.source.sender.to_non_ad().to_string()
+                                            };
+                                            let emoji = reaction.text.clone().unwrap_or_default();
+                                            let _ = store.set_reaction(&chat, &target, &who, &emoji);
+                                            let _ = events.send(ServiceEvent::Marks { chat: chat.clone() });
+                                        }
+                                        continue;
+                                    }
+                                    if let Some(pin) = base.pin_in_chat_message.as_option() {
+                                        use wa::message::pin_in_chat_message::Type;
+                                        let target = pin.key.as_option().and_then(|k| k.id.clone());
+                                        let pinned = pin.r#type == Some(Type::PIN_FOR_ALL);
+                                        let _ = store.set_message_pin(
+                                            &chat,
+                                            target.as_deref().filter(|_| pinned),
+                                        );
+                                        let _ = events.send(ServiceEvent::Marks { chat: chat.clone() });
+                                        continue;
+                                    }
+
+                                    if let Some(label) = member_label_change(&inbound.message) {
+                                        let member =
+                                            inbound.info.source.sender.to_non_ad().to_string();
+                                        if let Some(info) = group_cache.lock().unwrap().get_mut(&chat) {
+                                            if let Some(p) =
+                                                info.participants.iter_mut().find(|p| p.jid == member)
+                                            {
+                                                p.label = (!label.is_empty()).then(|| label.clone());
+                                            }
+                                        }
+                                        let _ = events.send(ServiceEvent::MemberLabel {
+                                            chat: chat.clone(),
+                                            jid: member,
+                                            label,
+                                        });
+                                        continue;
                                     }
 
                                     // A revoke is a protocol message naming the
@@ -538,23 +748,12 @@ impl Service {
                                     else {
                                         continue;
                                     };
-                                    // The wire text names mentions by number;
-                                    // store the display form so the conversation
-                                    // shows the name.
-                                    let mentions = mentioned_jids(&inbound.message);
-                                    if !mentions.is_empty() {
-                                        message.text =
-                                            replace_mentions(&message.text, &mentions, &store);
-                                    }
-                                    // A quote carries no mentioned_jid, and some
-                                    // senders omit it, so resolve bare @number
-                                    // tokens too.
-                                    message.text = resolve_mention_tokens(&message.text, &store);
-                                    if let Some(reply) = message.reply_to_text.take() {
-                                        message.reply_to_text =
-                                            Some(resolve_mention_tokens(&reply, &store));
-                                    }
+                                    // Mentions stay `@<number>` as on the wire; the UI
+                                    // resolves them when drawn, so later names apply.
                                     message.mentioned = mentions_me(&inbound.message, &own);
+                                    if inbound.message.is_view_once() {
+                                        let _ = store.set_view_once(&chat, &message.id, from_me);
+                                    }
                                     let _ = store.upsert(&message);
                                     let _ = events.send(ServiceEvent::Message { message: Box::new(message) });
                                 }
@@ -670,6 +869,181 @@ impl Service {
                             Event::OfflineSyncCompleted(_) => {
                                 let _ = events.send(ServiceEvent::Synced);
                             }
+                            // Pairing's recent window and "load older" answers
+                            // arrive here, never as `Messages`.
+                            Event::HistorySync(sync) => {
+                                let Some(history) = sync.get() else {
+                                    eprintln!("[hermodr] history sync type {} failed to decode", sync.sync_type());
+                                    return;
+                                };
+                                eprintln!(
+                                    "[hermodr] history sync type {} ({:?}): {} conversation(s), {} message(s)",
+                                    sync.sync_type(),
+                                    sync.peer_data_request_session_id(),
+                                    history.conversations.len(),
+                                    history.conversations.iter().map(|c| c.messages.len()).sum::<usize>(),
+                                );
+                                let client = client_for_events.get().cloned();
+                                let own = client
+                                    .as_deref()
+                                    .and_then(|c| c.pn())
+                                    .map(|j| j.to_non_ad().to_string());
+                                for push in &history.pushnames {
+                                    if let (Some(id), Some(name)) = (&push.id, &push.pushname) {
+                                        if !name.is_empty() {
+                                            let _ = store.set_name(id, name);
+                                        }
+                                    }
+                                }
+                                let mut chats = Vec::new();
+                                for conversation in &history.conversations {
+                                    let chat = conversation.id.clone();
+                                    if chat == "status@broadcast" {
+                                        continue;
+                                    }
+                                    if let Some(subject) =
+                                        conversation.name.as_deref().filter(|n| !n.is_empty())
+                                    {
+                                        if chat.ends_with("@g.us") {
+                                            let _ = store.set_name(&chat, subject);
+                                        }
+                                    }
+                                    let mut added = false;
+                                    for entry in &conversation.messages {
+                                        let Some(web) = entry.message.as_option() else { continue };
+                                        let Some(key) = web.key.as_option() else { continue };
+                                        let (Some(id), Some(message)) =
+                                            (key.id.clone(), web.message.as_option())
+                                        else {
+                                            continue;
+                                        };
+                                        // A stored row keeps its read state and
+                                        // downloaded file; upsert would reset both.
+                                        if store.message(&chat, &id).is_ok() {
+                                            continue;
+                                        }
+                                        if let Some(target) = revoke_target(message) {
+                                            let _ = store.revoke(&chat, &target);
+                                            continue;
+                                        }
+                                        let from_me = key.from_me.unwrap_or(false);
+                                        let sender = if from_me {
+                                            own.clone().unwrap_or_else(|| chat.clone())
+                                        } else {
+                                            web.participant
+                                                .clone()
+                                                .or_else(|| key.participant.clone())
+                                                .unwrap_or_else(|| chat.clone())
+                                        };
+                                        if let Some(push) =
+                                            web.push_name.as_deref().filter(|p| !p.is_empty())
+                                        {
+                                            if !from_me {
+                                                let _ = store.set_name(&sender, push);
+                                            }
+                                        }
+                                        remember_structures(&store, &chat, &id, &sender, message);
+                                        let envelope = Envelope {
+                                            chat: chat.clone(),
+                                            id,
+                                            sender,
+                                            timestamp: web.message_timestamp.unwrap_or(0) as i64,
+                                            from_me,
+                                        };
+                                        // History media is never bulk downloaded;
+                                        // it is fetched on demand like any other.
+                                        let Some(mut stored) = stored_message(
+                                            message,
+                                            envelope,
+                                            client.as_deref(),
+                                            media_dir.as_deref(),
+                                            false,
+                                        )
+                                        .await
+                                        else {
+                                            continue;
+                                        };
+                                        // Old messages must not raise unread counts.
+                                        stored.read = true;
+                                        added |= store.upsert(&stored).is_ok();
+                                    }
+                                    if added {
+                                        chats.push(chat);
+                                    }
+                                }
+                                // Retention is left to the next live write, so
+                                // what was just loaded can be seen first.
+                                if !chats.is_empty() {
+                                    let _ = events.send(ServiceEvent::HistoryLoaded { chats });
+                                }
+                            }
+                            Event::ChatPresence(update) => {
+                                let state = match (update.state, update.media) {
+                                    (ChatPresence::Composing, ChatPresenceMedia::Audio) => "recording",
+                                    (ChatPresence::Composing, _) => "typing",
+                                    _ => "paused",
+                                };
+                                let _ = events.send(ServiceEvent::Typing {
+                                    chat: update.source.chat.to_non_ad().to_string(),
+                                    sender: update.source.sender.to_non_ad().to_string(),
+                                    state: state.to_string(),
+                                });
+                            }
+                            Event::PictureUpdate(update) => {
+                                let jid = update.jid.to_non_ad().to_string();
+                                if let Some(dir) = media_dir.as_deref() {
+                                    let path = avatar_path(dir, &jid);
+                                    let _ = std::fs::remove_file(path.with_extension("none"));
+                                    let _ = std::fs::remove_file(path);
+                                }
+                                let _ = events.send(ServiceEvent::AvatarChanged { jid });
+                            }
+                            // Linked devices never receive view-once media: the
+                            // server sends a stub instead, kept as a placeholder
+                            // that points at the phone.
+                            Event::UndecryptableMessage(stub)
+                                if stub.unavailable_type
+                                    == whatsapp_rust::wacore::types::events::UnavailableType::ViewOnce =>
+                            {
+                                let info = &stub.info;
+                                let chat = info.source.chat.to_string();
+                                let id = info.id.to_string();
+                                if store.message(&chat, &id).is_ok() {
+                                    return;
+                                }
+                                let from_me = info.source.is_from_me;
+                                let message = StoredMessage {
+                                    chat: chat.clone(),
+                                    id: id.clone(),
+                                    sender: info.source.sender.to_string(),
+                                    sender_name: None,
+                                    timestamp: info.timestamp.timestamp(),
+                                    from_me,
+                                    text: String::new(),
+                                    media_kind: Some("view_once".into()),
+                                    media_path: None,
+                                    media_thumb: None,
+                                    media_ref: None,
+                                    reply_to_id: None,
+                                    reply_to_text: None,
+                                    reply_to_sender: None,
+                                    reply_to_chat: None,
+                                    reply_to_kind: None,
+                                    reply_to_thumb: None,
+                                    read: from_me,
+                                    revoked: false,
+                                    mentioned: false,
+                                    preview_url: None,
+                                    preview_title: None,
+                                    preview_desc: None,
+                                    preview_thumb: None,
+                                    status: None,
+                                };
+                                let _ = store.set_view_once(&chat, &id, from_me);
+                                if store.upsert(&message).is_ok() {
+                                    let _ = events.send(ServiceEvent::Message { message: Box::new(message) });
+                                }
+                            }
                             // Chat pins are account state; mirror them so the
                             // list matches the phone.
                             Event::PinUpdate(pin) => {
@@ -709,7 +1083,7 @@ impl Service {
                 media_dir,
                 qr: qr_state,
                 connected: connected_state,
-                group_cache: Mutex::new(std::collections::HashMap::new()),
+                group_cache,
                 groups_cache: Mutex::new(Vec::new()),
             },
             initial_rx,
@@ -804,19 +1178,29 @@ impl Service {
             let username = member.username.as_ref().map(|u| u.to_string());
             // A name someone can read: saved/push name, then username, then the
             // phone number, and only last the LID.
+            // A bare-number placeholder under one form must not hide a real
+            // name stored under the other.
             let name = candidates
                 .into_iter()
                 .flatten()
-                .find_map(|j| self.store.name_for(&j.to_string()).ok().flatten())
+                .filter_map(|j| self.store.name_for(&j.to_string()).ok().flatten())
+                .find(|n| !n.trim_start_matches('+').chars().all(|c| c.is_ascii_digit()))
                 .or_else(|| username.clone())
                 .or_else(|| number.clone())
                 .unwrap_or_else(|| mention.split('@').next().unwrap_or(&mention).to_string());
+            let label = member
+                .details
+                .as_ref()
+                .and_then(|d| d.participant_label.as_ref())
+                .map(|l| l.to_string())
+                .filter(|l| !l.is_empty());
             participants.push(Participant {
                 jid: mention.clone(),
                 name,
                 admin: member.is_admin(),
                 number,
                 username,
+                label,
             });
         }
         participants.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -902,14 +1286,6 @@ impl Service {
             Some(path.to_string_lossy().to_string())
         });
 
-        // The wire text names mentions by number; store the display form so the
-        // conversation reads the same as the rest of the UI.
-        let text = if mentioned.is_empty() {
-            text
-        } else {
-            replace_mentions(&text, &mentioned, &self.store)
-        };
-
         let mut message = StoredMessage {
             chat: chat.to_string(),
             id: result.message_id.clone(),
@@ -953,7 +1329,8 @@ impl Service {
     }
 
     /// Our own JID, used as the sender of messages we send.
-    fn own_jid(&self) -> String {
+    /// Our own JID without a device suffix, or empty before pairing.
+    pub fn own_jid(&self) -> String {
         self.client
             .pn()
             .or_else(|| self.client.lid())
@@ -972,6 +1349,51 @@ impl Service {
             (None, Some(lid)) => jid.matches_user_or_lid(&lid, None),
             (None, None) => false,
         }
+    }
+
+    /// Best known name per JID, looked up under both its LID and phone form;
+    /// our own addresses read as our push name. Falls back to the phone number
+    /// digits, and leaves out JIDs nothing is known about.
+    pub async fn names_for(&self, jids: &[String]) -> std::collections::HashMap<String, String> {
+        let numeric = |n: &str| n.trim_start_matches('+').chars().all(|c| c.is_ascii_digit());
+        let own: Vec<String> = [self.client.pn(), self.client.lid()]
+            .into_iter()
+            .flatten()
+            .map(|j| j.to_non_ad().to_string())
+            .collect();
+        let push_name = self.client.push_name();
+        let mut out = std::collections::HashMap::new();
+        for jid in jids {
+            let Ok(parsed) = jid.parse::<Jid>() else { continue };
+            let bare = parsed.to_non_ad();
+            let key = bare.to_string();
+            if own.contains(&key) && !push_name.is_empty() {
+                out.insert(jid.clone(), push_name.clone());
+                continue;
+            }
+            let mut name = self.store.name_for(&key).ok().flatten();
+            let mut number = bare.is_pn().then(|| bare.user.to_string());
+            if name.as_deref().is_none_or(numeric) {
+                if let Ok(Some(entry)) = self.client.get_lid_pn_entry(&bare).await {
+                    number = Some(entry.phone_number.to_string());
+                    let other = if bare.is_lid() {
+                        format!("{}@s.whatsapp.net", entry.phone_number)
+                    } else {
+                        format!("{}@lid", entry.lid)
+                    };
+                    if let Some(found) = self.store.name_for(&other).ok().flatten() {
+                        if !numeric(&found) {
+                            name = Some(found);
+                        }
+                    }
+                }
+            }
+            let name = name.filter(|n| !numeric(n)).or(number);
+            if let Some(name) = name {
+                out.insert(jid.clone(), name);
+            }
+        }
+        out
     }
 
     /// Chats, contacts and groups matching a query.
@@ -1141,11 +1563,474 @@ impl Service {
             return Ok(());
         };
         let jid: Jid = chat.parse()?;
-        self.client
+        let session = self
+            .client
             .fetch_message_history(&jid, &id, from_me, timestamp * 1000, count)
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        eprintln!("[hermodr] asked the phone for {count} messages before {id} in {chat} (session {session})");
         Ok(())
+    }
+
+    /// The key that names a message to the server: groups need its sender.
+    fn message_key(chat: &str, id: &str, sender: &str, from_me: bool) -> wa::MessageKey {
+        let participant = (chat.ends_with("@g.us") && !from_me)
+            .then(|| sender.parse::<Jid>().map(|j| j.to_non_ad().to_string()).unwrap_or_default());
+        wa::MessageKey {
+            remote_jid: Some(chat.to_string()),
+            from_me: Some(from_me),
+            id: Some(id.to_string()),
+            participant,
+            ..Default::default()
+        }
+    }
+
+    /// The sender as the app-state actions want it: set only for others in groups.
+    fn participant(chat: &str, sender: &str, from_me: bool) -> Option<Jid> {
+        (chat.ends_with("@g.us") && !from_me)
+            .then(|| sender.parse::<Jid>().ok().map(|j| j.to_non_ad()))
+            .flatten()
+    }
+
+    /// Reacts to a message; an empty emoji takes our reaction back.
+    pub async fn react(&self, chat: &str, id: &str, sender: &str, from_me: bool, emoji: &str) -> Result<()> {
+        let jid: Jid = chat.parse()?;
+        self.client
+            .send_reaction(jid, Self::message_key(chat, id, sender, from_me), emoji)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        self.store.set_reaction(chat, id, "@me", emoji)?;
+        let _ = self.events.send(ServiceEvent::Marks { chat: chat.to_string() });
+        Ok(())
+    }
+
+    pub async fn star(&self, chat: &str, id: &str, sender: &str, from_me: bool, starred: bool) -> Result<()> {
+        let jid: Jid = chat.parse()?;
+        let participant = Self::participant(chat, sender, from_me);
+        let actions = self.client.chat_actions();
+        let done = if starred {
+            actions.star_message(&jid, participant.as_ref(), id, from_me).await
+        } else {
+            actions.unstar_message(&jid, participant.as_ref(), id, from_me).await
+        };
+        done.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        self.store.set_starred(chat, id, starred)?;
+        let _ = self.events.send(ServiceEvent::Marks { chat: chat.to_string() });
+        Ok(())
+    }
+
+    /// Pins a message for everyone in the chat for a week, or unpins it.
+    pub async fn pin_message(&self, chat: &str, id: &str, sender: &str, from_me: bool, pinned: bool) -> Result<()> {
+        use whatsapp_rust::send::PinDuration;
+        let jid: Jid = chat.parse()?;
+        let key = Self::message_key(chat, id, sender, from_me);
+        let sent = if pinned {
+            self.client.pin_message(jid, key, PinDuration::Days7).await
+        } else {
+            self.client.unpin_message(jid, key).await
+        };
+        sent.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        self.store.set_message_pin(chat, pinned.then_some(id))?;
+        let _ = self.events.send(ServiceEvent::Marks { chat: chat.to_string() });
+        Ok(())
+    }
+
+    /// Deletes a message for everyone: ours as the sender, anyone's as an admin.
+    pub async fn delete_for_everyone(&self, chat: &str, id: &str, sender: &str, from_me: bool) -> Result<()> {
+        use whatsapp_rust::send::RevokeType;
+        let jid: Jid = chat.parse()?;
+        let kind = if from_me {
+            RevokeType::Sender
+        } else {
+            RevokeType::Admin { original_sender: sender.parse::<Jid>()?.to_non_ad() }
+        };
+        self.client
+            .revoke_message(jid, id, kind)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        self.store.revoke(chat, id)?;
+        if let Ok(updated) = self.store.message(chat, id) {
+            let _ = self.events.send(ServiceEvent::Message { message: Box::new(updated) });
+        }
+        Ok(())
+    }
+
+    /// Deletes a message from our devices only.
+    pub async fn delete_for_me(&self, chat: &str, id: &str, sender: &str, from_me: bool, timestamp: i64) -> Result<()> {
+        let jid: Jid = chat.parse()?;
+        let participant = Self::participant(chat, sender, from_me);
+        self.client
+            .chat_actions()
+            .delete_message_for_me(&jid, participant.as_ref(), id, from_me, true, Some(timestamp))
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        self.store.delete_message(chat, id)
+    }
+
+    /// Reports a group message to the group's admins.
+    pub async fn report_to_admins(&self, chat: &str, id: &str) -> Result<()> {
+        let jid: Jid = chat.parse()?;
+        self.client
+            .groups()
+            .report_messages_to_admins(jid, &[id.to_string()])
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+
+    /// Sends a copy of a stored message to another chat.
+    pub async fn forward(&self, from_chat: &str, id: &str, to_chat: &str) -> Result<()> {
+        let message = self.store.message(from_chat, id)?;
+        // Uncaptioned media is stored as `[kind]`, which must not become a caption.
+        let placeholder = message.media_kind.as_ref().map(|kind| format!("[{kind}]"));
+        let text = message.text.trim();
+        let caption = (!text.is_empty() && placeholder.as_deref() != Some(text))
+            .then(|| message.text.clone());
+        match message.media_path.as_deref().filter(|p| Path::new(p).is_file()) {
+            Some(path) => {
+                let bytes = std::fs::read(path)?;
+                let name = Path::new(path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "file".into());
+                let gif = message.media_kind.as_deref() == Some("gif");
+                if message.media_kind.as_deref() == Some("sticker") {
+                    self.send_sticker(to_chat, bytes).await?;
+                } else {
+                    let options = SendOptions { gif, ..Default::default() };
+                    self.send_media(to_chat, &name, bytes, caption, None, options).await?;
+                }
+            }
+            None if message.media_kind.is_some() => {
+                anyhow::bail!("download the media before forwarding it")
+            }
+            None => self.send_text(to_chat, message.text, Vec::new()).await?,
+        }
+        Ok(())
+    }
+
+    pub fn marks(&self, chat: &str) -> Result<crate::store::ChatMarks> {
+        self.store.marks(chat)
+    }
+
+    /// A message we just sent, as the store keeps it until the server confirms.
+    /// Marks a view-once message opened and deletes its media.
+    pub fn open_view_once(&self, chat: &str, id: &str) -> Result<()> {
+        if let Some(path) = self.store.open_view_once(chat, id)? {
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = self.events.send(ServiceEvent::Marks { chat: chat.to_string() });
+        Ok(())
+    }
+
+    fn own_message(&self, chat: &str, id: &str, text: String, kind: &str) -> StoredMessage {
+        StoredMessage {
+            chat: chat.to_string(),
+            id: id.to_string(),
+            sender: self.own_jid(),
+            sender_name: None,
+            timestamp: unix_now(),
+            from_me: true,
+            text,
+            media_kind: Some(kind.to_string()),
+            media_path: None,
+            media_thumb: None,
+            media_ref: None,
+            reply_to_id: None,
+            reply_to_text: None,
+            reply_to_sender: None,
+            reply_to_chat: None,
+            reply_to_kind: None,
+            reply_to_thumb: None,
+            read: false,
+            revoked: false,
+            mentioned: false,
+            preview_url: None,
+            preview_title: None,
+            preview_desc: None,
+            preview_thumb: None,
+            status: Some("pending".into()),
+        }
+    }
+
+    pub async fn create_poll(&self, chat: &str, question: &str, options: Vec<String>, multi: bool) -> Result<()> {
+        let to: Jid = chat.parse()?;
+        let selectable = if multi { options.len() as u32 } else { 1 };
+        let (result, secret) = self
+            .client
+            .polls()
+            .create(to, question, &options, selectable)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let id = result.message_id.clone();
+        self.store
+            .save_poll(chat, &id, &self.own_jid(), question, &options, multi, Some(&secret))?;
+        let stored = self.own_message(chat, &id, question.to_string(), "poll");
+        self.store.upsert(&stored)?;
+        let _ = self.events.send(ServiceEvent::Message { message: Box::new(stored) });
+        Ok(())
+    }
+
+    /// Casts or changes our vote; no options withdraws it.
+    pub async fn vote_poll(&self, chat: &str, id: &str, options: Vec<String>) -> Result<()> {
+        let def = self
+            .store
+            .poll_secret(chat, id)?
+            .ok_or_else(|| anyhow::anyhow!("this poll arrived without its key, so it cannot be voted on here"))?;
+        let jid: Jid = chat.parse()?;
+        let creator: Jid = def.creator.parse()?;
+        self.client
+            .polls()
+            .vote(jid, id, &creator, &def.secret, &options)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        self.store.set_poll_vote(chat, id, "@me", &options)?;
+        let _ = self.events.send(ServiceEvent::Marks { chat: chat.to_string() });
+        Ok(())
+    }
+
+    pub async fn create_event(&self, chat: &str, event: crate::store::NewEvent) -> Result<()> {
+        use whatsapp_rust::EventCreationParams;
+        let to: Jid = chat.parse()?;
+        let params = EventCreationParams {
+            name: event.name.clone(),
+            description: event.description.clone(),
+            start_time: event.start,
+            end_time: event.end,
+            join_link: event.link.clone(),
+            location: event.location.clone().map(|name| wa::message::LocationMessage {
+                name: Some(name),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (result, secret) = self
+            .client
+            .events()
+            .create(to, params)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let id = result.message_id.clone();
+        self.store.save_event(chat, &id, &self.own_jid(), &event, Some(&secret))?;
+        let stored = self.own_message(chat, &id, event.name, "event");
+        self.store.upsert(&stored)?;
+        let _ = self.events.send(ServiceEvent::Message { message: Box::new(stored) });
+        Ok(())
+    }
+
+    /// Answers an event: `going`, `not_going` or `maybe`.
+    pub async fn respond_event(&self, chat: &str, id: &str, response: &str) -> Result<()> {
+        use wa::message::event_response_message::EventResponseType;
+        let answer = match response {
+            "going" => EventResponseType::GOING,
+            "not_going" => EventResponseType::NOT_GOING,
+            "maybe" => EventResponseType::MAYBE,
+            other => anyhow::bail!("unknown response {other}"),
+        };
+        let def = self
+            .store
+            .event_secret(chat, id)?
+            .ok_or_else(|| anyhow::anyhow!("this event arrived without its key, so it cannot be answered here"))?;
+        let jid: Jid = chat.parse()?;
+        let creator: Jid = def.creator.parse()?;
+        self.client
+            .events()
+            .respond(jid, id, &creator, &def.secret, answer, None)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        self.store.set_event_response(chat, id, "@me", response)?;
+        let _ = self.events.send(ServiceEvent::Marks { chat: chat.to_string() });
+        Ok(())
+    }
+
+    /// Sets our own tag in a group; empty clears it.
+    pub async fn set_member_label(&self, chat: &str, label: &str) -> Result<()> {
+        let jid: Jid = chat.parse()?;
+        self.client
+            .groups()
+            .update_member_label(jid, label)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let own: Vec<String> = [self.client.pn(), self.client.lid()]
+            .into_iter()
+            .flatten()
+            .map(|j| j.to_non_ad().to_string())
+            .collect();
+        if let Some(info) = self.group_cache.lock().unwrap().get_mut(chat) {
+            if let Some(p) = info.participants.iter_mut().find(|p| own.contains(&p.jid)) {
+                p.label = (!label.is_empty()).then(|| label.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Tells the chat we are typing, or that we stopped.
+    pub async fn send_typing(&self, chat: &str, typing: bool) -> Result<()> {
+        let jid: Jid = chat.parse()?;
+        let chatstate = self.client.chatstate();
+        let sent = if typing {
+            chatstate.send_composing(&jid).await
+        } else {
+            chatstate.send_paused(&jid).await
+        };
+        sent.map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+
+    /// Marks us online or away, as WhatsApp Web does on window focus. Typing
+    /// indicators only arrive while we are online.
+    pub async fn set_online(&self, online: bool) -> Result<()> {
+        let presence = self.client.presence();
+        let set = if online {
+            presence.set_available().await
+        } else {
+            presence.set_unavailable().await
+        };
+        set.map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+
+    /// Subscribes to a contact's presence, which one-to-one typing needs.
+    pub async fn watch_presence(&self, jid: &str) -> Result<()> {
+        let jid: Jid = jid.parse()?;
+        self.client
+            .presence()
+            .subscribe(jid)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+
+    /// Our own name, about text and privacy settings.
+    pub async fn profile(&self) -> Result<Profile> {
+        let own: Jid = self.own_jid().parse()?;
+        let about = self
+            .client
+            .contacts()
+            .get_user_info(std::slice::from_ref(&own))
+            .await
+            .ok()
+            .and_then(|mut info| info.drain().next())
+            .and_then(|(_, info)| info.status);
+        let privacy = self
+            .client
+            .fetch_privacy_settings()
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            .settings
+            .into_iter()
+            .map(|s| (s.category.to_string(), s.value.to_string()))
+            .collect();
+        let own_username = self.client.mex().get_username().await.ok().flatten();
+        let username_reserved = own_username
+            .as_ref()
+            .and_then(|u| u.state.as_deref())
+            .is_some_and(|state| state.eq_ignore_ascii_case("reserved"));
+        Ok(Profile {
+            name: self.client.push_name(),
+            about,
+            username: own_username.and_then(|u| u.username),
+            username_reserved,
+            privacy,
+        })
+    }
+
+    /// Replaces our profile picture with any image, cropped square and sized
+    /// the way WhatsApp expects. Empty bytes remove the picture.
+    pub async fn set_own_picture(&self, bytes: Vec<u8>) -> Result<()> {
+        let profile = self.client.profile();
+        let sent = if bytes.is_empty() {
+            profile.remove_profile_picture().await
+        } else {
+            let jpeg = square_jpeg(&bytes, 640)
+                .ok_or_else(|| anyhow::anyhow!("that file is not an image we can read"))?;
+            profile.set_profile_picture(jpeg).await
+        };
+        sent.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if let Some(dir) = &self.media_dir {
+            let path = avatar_path(dir, &self.own_jid());
+            let _ = std::fs::remove_file(path.with_extension("none"));
+            let _ = std::fs::remove_file(path);
+        }
+        Ok(())
+    }
+
+    pub async fn set_about(&self, text: &str) -> Result<()> {
+        self.client
+            .profile()
+            .set_status_text(text)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+
+    pub async fn set_push_name(&self, name: &str) -> Result<()> {
+        self.client
+            .profile()
+            .set_push_name(name)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+
+    pub async fn set_privacy(&self, category: &str, value: &str) -> Result<()> {
+        let (category, value) = (PrivacyCategory::from(category), PrivacyValue::from(value));
+        if !category.is_valid_value(&value) {
+            anyhow::bail!("{value} is not a valid setting for {category}");
+        }
+        self.client
+            .set_privacy_setting(category, value)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+
+    /// Path to a chat's profile picture, cached for a day in the media folder.
+    ///
+    /// `None` when the chat has no picture, hides it from us, or media is off.
+    pub async fn avatar(&self, jid: &str) -> Result<Option<String>> {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+        let Some(dir) = self.media_dir.clone() else {
+            return Ok(None);
+        };
+        let path = avatar_path(&dir, jid);
+        // Marks a chat known to have no picture, so it is not asked again.
+        let none = path.with_extension("none");
+        let fresh = |p: &Path| {
+            p.metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age < TTL)
+        };
+        if fresh(path.as_path()) {
+            return Ok(Some(path.to_string_lossy().into_owned()));
+        }
+        if fresh(none.as_path()) {
+            return Ok(None);
+        }
+
+        let target: Jid = jid.parse()?;
+        let picture = self
+            .client
+            .contacts()
+            .get_profile_picture(&target, true)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let Some(picture) = picture else {
+            let _ = std::fs::remove_file(&path);
+            std::fs::write(&none, b"")?;
+            return Ok(None);
+        };
+        let url = picture.url;
+        let bytes = tokio::task::spawn_blocking(move || {
+            let mut response = ureq::get(&url).call().ok()?;
+            response.body_mut().read_to_vec().ok()
+        })
+        .await
+        .ok()
+        .flatten()
+        .ok_or_else(|| anyhow::anyhow!("could not download the profile picture"))?;
+        std::fs::write(&path, bytes)?;
+        let _ = std::fs::remove_file(&none);
+        Ok(Some(path.to_string_lossy().into_owned()))
     }
 
     /// Unread messages that mention us, oldest first.
@@ -1175,9 +2060,16 @@ impl Service {
         reply_to_sender: &str,
         reply_to_text: &str,
         mentions: Vec<String>,
+        // The chat the quoted message is in, when it is not this one (a group
+        // message answered privately).
+        quote_chat: Option<&str>,
     ) -> Result<()> {
         let to: Jid = chat.parse()?;
         let to_self = self.is_self_jid(&to);
+        let quoted_chat: Jid = match quote_chat {
+            Some(other) => other.parse()?,
+            None => to.clone(),
+        };
         // The quoted author must be the address without a device suffix: a
         // participant like `123:98@lid` is not resolvable by recipients, who
         // then attribute the quoted message to the sender of the reply.
@@ -1188,7 +2080,8 @@ impl Service {
         let quoted = wa::Message::text(reply_to_text);
         let mention_all = mentions.iter().any(|m| m == "@all");
         let mentioned: Vec<String> = mentions.iter().filter(|m| *m != "@all").cloned().collect();
-        let mut context = build_quote_context_with_info(reply_to_id, &sender, &to, &to, &quoted);
+        let mut context =
+            build_quote_context_with_info(reply_to_id, &sender, &quoted_chat, &to, &quoted);
         if !mentioned.is_empty() {
             context.mentioned_jid = mentioned.clone();
         }
@@ -1202,12 +2095,6 @@ impl Service {
         use whatsapp_rust::wacore::proto_helpers::MessageBuilderExt;
         let message = wa::Message::text_with_context(text.clone(), context);
         let result = self.client.send_message(to, message).await?;
-
-        let text = if mentioned.is_empty() {
-            text
-        } else {
-            replace_mentions(&text, &mentioned, &self.store)
-        };
 
         let stored = StoredMessage {
             chat: chat.to_string(),
@@ -1228,7 +2115,7 @@ impl Service {
             } else {
                 reply_to_sender.to_string()
             }),
-            reply_to_chat: None,
+            reply_to_chat: quote_chat.map(str::to_string),
             reply_to_kind: None,
             reply_to_thumb: None,
             read: false,
@@ -1256,7 +2143,9 @@ impl Service {
         bytes: Vec<u8>,
         caption: Option<String>,
         reply: Option<(String, String, String)>,
+        options: SendOptions,
     ) -> Result<Option<String>> {
+        let SendOptions { gif, view_once, voice } = options;
         let to: Jid = chat.parse()?;
         let to_self = self.is_self_jid(&to);
         let file_name = file_name.to_string();
@@ -1285,7 +2174,12 @@ impl Service {
             .then(|| thumb.is_none())
             .filter(|missing| *missing)
             .map(|_| {
-                "The video was sent without a preview because ffmpeg is not installed.".to_string()
+                if cfg!(windows) {
+                    "The video was sent without a preview because Windows could not decode it."
+                } else {
+                    "The video was sent without a preview because ffmpeg is not installed."
+                }
+                .to_string()
             });
 
         // An attachment can carry a quote, the same as a text reply.
@@ -1301,7 +2195,7 @@ impl Service {
             None => None,
         };
 
-        let message = match kind {
+        let mut message = match kind {
             "image" => media::image_message(
                 upload,
                 ImageOptions {
@@ -1318,6 +2212,7 @@ impl Service {
                     caption: caption.clone(),
                     mimetype,
                     jpeg_thumbnail: thumb.clone(),
+                    gif_playback: gif.then_some(true),
                     context_info: context,
                     ..Default::default()
                 },
@@ -1325,12 +2220,13 @@ impl Service {
             "audio" => media::audio_message(
                 upload,
                 AudioOptions {
-                    mimetype,
+                    mimetype: if voice.is_some() { Some("audio/ogg; codecs=opus".into()) } else { mimetype },
                     // An ogg/opus attachment is a voice note, which is how
                     // WhatsApp records and replays them.
                     ptt: Some(extension == "ogg"),
+                    duration_seconds: voice.as_ref().map(|v| v.seconds),
+                    waveform: voice.map(|v| v.waveform),
                     context_info: context,
-                    ..Default::default()
                 },
             ),
             _ => media::document_message(
@@ -1345,12 +2241,28 @@ impl Service {
                 },
             ),
         };
+        if view_once {
+            if let Some(m) = message.image_message.as_option_mut() {
+                m.view_once = Some(true);
+            }
+            if let Some(m) = message.video_message.as_option_mut() {
+                m.view_once = Some(true);
+            }
+            if let Some(m) = message.audio_message.as_option_mut() {
+                m.view_once = Some(true);
+            }
+        }
 
         let result = self.client.send_message(to, message).await?;
+        // The sender cannot reopen view-once media either, so no copy is kept.
+        if view_once {
+            self.store.set_view_once(chat, &result.message_id, true)?;
+        }
 
         // Keep our own copy so the sender sees what they sent.
         let mut stored_path = None;
-        if let Some(dir) = &self.media_dir() {
+        if let Some(dir) = self.media_dir().filter(|_| !view_once) {
+            let dir = &dir;
             if std::fs::create_dir_all(dir).is_ok() {
                 let name = if extension.is_empty() { "bin".to_string() } else { extension.clone() };
                 let dest = dir.join(format!("{}.{}", result.message_id, name));
@@ -1368,7 +2280,7 @@ impl Service {
             timestamp: unix_now(),
             from_me: true,
             text: caption.unwrap_or_default(),
-            media_kind: Some(kind.to_string()),
+            media_kind: Some(if gif && kind == "video" { "gif" } else { kind }.to_string()),
             media_path: stored_path,
             media_thumb: None,
             media_ref: None,
@@ -1392,6 +2304,124 @@ impl Service {
         Ok(warning)
     }
 
+    /// Sends a picture as a sticker (see [`sticker_webp`]).
+    pub async fn send_sticker(&self, chat: &str, bytes: Vec<u8>) -> Result<()> {
+        let to: Jid = chat.parse()?;
+        let webp = sticker_webp(&bytes)
+            .ok_or_else(|| anyhow::anyhow!("that file is not an image we can turn into a sticker"))?;
+        let upload = self
+            .client
+            .upload(webp.clone(), MediaType::Sticker, Default::default())
+            .await?;
+        let message = wa::Message {
+            sticker_message: buffa::MessageField::some(wa::message::StickerMessage {
+                url: Some(upload.url),
+                direct_path: Some(upload.direct_path),
+                media_key: Some(upload.media_key.to_vec()),
+                file_sha256: Some(upload.file_sha256.to_vec()),
+                file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+                file_length: Some(upload.file_length),
+                media_key_timestamp: Some(upload.media_key_timestamp),
+                mimetype: Some("image/webp".into()),
+                width: Some(512),
+                height: Some(512),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let result = self.client.send_message(to, message).await?;
+
+        let media_path = self.media_dir().and_then(|dir| {
+            std::fs::create_dir_all(&dir).ok()?;
+            let dest = dir.join(format!("{}.webp", result.message_id));
+            std::fs::write(&dest, &webp).ok()?;
+            Some(dest.to_string_lossy().into_owned())
+        });
+        let stored = StoredMessage {
+            chat: chat.to_string(),
+            id: result.message_id.clone(),
+            sender: self.own_jid(),
+            sender_name: None,
+            timestamp: unix_now(),
+            from_me: true,
+            text: "[sticker]".into(),
+            media_kind: Some("sticker".into()),
+            media_path,
+            media_thumb: None,
+            media_ref: None,
+            reply_to_id: None,
+            reply_to_text: None,
+            reply_to_sender: None,
+            reply_to_chat: None,
+            reply_to_kind: None,
+            reply_to_thumb: None,
+            read: false,
+            revoked: false,
+            mentioned: false,
+            preview_url: None,
+            preview_title: None,
+            preview_desc: None,
+            preview_thumb: None,
+            status: Some("pending".into()),
+        };
+        self.store.upsert(&stored)?;
+        let _ = self.events.send(ServiceEvent::Message { message: Box::new(stored) });
+        Ok(())
+    }
+
+    /// Stickers or GIFs already on this device, newest first, for the picker.
+    /// Recent stickers or GIFs, newest first, one per distinct file. Copies of a
+    /// path in `prefer` (the favourites) are dropped in its favour.
+    pub fn media_library(&self, kind: &str, prefer: &[String]) -> Result<Vec<String>> {
+        use std::hash::{Hash, Hasher};
+        use std::io::Read;
+        let recent = self.store.recent_media(kind, 200)?;
+        let dir = self.media_dir().and_then(|d| std::fs::canonicalize(d).ok());
+        // Favourites come from the UI, so only files in the media folder count.
+        let preferred = prefer.iter().filter(|p| {
+            dir.as_ref()
+                .is_some_and(|d| std::fs::canonicalize(p).is_ok_and(|f| f.starts_with(d)))
+        });
+        // The same sticker sent or received again is a new file; show it once.
+        // Length plus the first 64 KiB identifies it without reading whole videos.
+        let mut seen = std::collections::HashSet::new();
+        let mut listed = std::collections::HashSet::new();
+        Ok(preferred
+            .cloned()
+            .chain(recent)
+            .filter(|p| listed.insert(p.clone()))
+            .filter(|p| {
+                let Ok(file) = std::fs::File::open(p) else { return false };
+                let length = file.metadata().map(|m| m.len()).unwrap_or(0);
+                let mut head = Vec::new();
+                if file.take(64 * 1024).read_to_end(&mut head).is_err() {
+                    return false;
+                }
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                (length, head).hash(&mut hasher);
+                seen.insert(hasher.finish())
+            })
+            .collect())
+    }
+
+    /// Re-sends a sticker or GIF from the media folder.
+    pub async fn send_from_library(&self, chat: &str, path: &str, kind: &str) -> Result<()> {
+        let dir = self.media_dir().ok_or_else(|| anyhow::anyhow!("no media folder is configured"))?;
+        let file = std::fs::canonicalize(path)?;
+        if !file.starts_with(std::fs::canonicalize(&dir)?) {
+            anyhow::bail!("refusing to send a file from outside the media folder");
+        }
+        let bytes = std::fs::read(&file)?;
+        match kind {
+            "sticker" => self.send_sticker(chat, bytes).await,
+            "gif" => {
+                let options = SendOptions { gif: true, ..Default::default() };
+                self.send_media(chat, "gif.mp4", bytes, None, None, options).await.map(|_| ())
+            }
+            _ => anyhow::bail!("only stickers and GIFs are sent from the library"),
+        }
+    }
+
     /// Stored messages for a chat, newest first.
     pub fn messages(&self, chat: &str, limit: u32) -> Result<Vec<StoredMessage>> {
         self.store.messages_for(chat, limit)
@@ -1408,6 +2438,79 @@ impl Service {
             let _ = tx.send(());
         }
     }
+}
+
+/// A poll's question, its options, and whether more than one may be chosen.
+fn poll_of(message: &wa::Message) -> Option<(String, Vec<String>, bool)> {
+    let base = message.get_base_message();
+    let poll = base
+        .poll_creation_message
+        .as_option()
+        .or_else(|| base.poll_creation_message_v2.as_option())
+        .or_else(|| base.poll_creation_message_v3.as_option())?;
+    let options = poll.options.iter().filter_map(|o| o.option_name.clone()).collect();
+    Some((
+        poll.name.clone().unwrap_or_default(),
+        options,
+        poll.selectable_options_count.unwrap_or(0) != 1,
+    ))
+}
+
+fn event_of(message: &wa::Message) -> Option<crate::store::NewEvent> {
+    let event = message.get_base_message().event_message.as_option()?;
+    Some(crate::store::NewEvent {
+        name: event.name.clone().unwrap_or_default(),
+        description: event.description.clone(),
+        start: event.start_time,
+        end: event.end_time,
+        location: event
+            .location
+            .as_option()
+            .and_then(|l| l.name.clone().or_else(|| l.address.clone())),
+        link: event.join_link.clone(),
+        canceled: event.is_canceled.unwrap_or(false),
+    })
+}
+
+/// The per-message secret polls and events key their votes and RSVPs with.
+fn message_secret(message: &wa::Message) -> Option<Vec<u8>> {
+    let secret = |m: &wa::Message| {
+        m.message_context_info
+            .as_option()
+            .and_then(|c| c.message_secret.clone())
+    };
+    secret(message).or_else(|| secret(message.get_base_message()))
+}
+
+/// Keeps a poll's or event's definition, which its later votes and RSVPs need.
+fn remember_structures(store: &MessageStore, chat: &str, id: &str, creator: &str, message: &wa::Message) {
+    let secret = message_secret(message);
+    if let Some((name, options, multi)) = poll_of(message) {
+        let _ = store.save_poll(chat, id, creator, &name, &options, multi, secret.as_deref());
+    }
+    if let Some(event) = event_of(message) {
+        let _ = store.save_event(chat, id, creator, &event, secret.as_deref());
+    }
+}
+
+fn response_name(response: Option<wa::message::event_response_message::EventResponseType>) -> &'static str {
+    use wa::message::event_response_message::EventResponseType;
+    match response {
+        Some(EventResponseType::GOING) => "going",
+        Some(EventResponseType::NOT_GOING) => "not_going",
+        Some(EventResponseType::MAYBE) => "maybe",
+        _ => "",
+    }
+}
+
+/// The new group member tag, if this message sets one; empty clears it.
+fn member_label_change(message: &wa::Message) -> Option<String> {
+    use wa::message::protocol_message::Type;
+    let protocol = message.get_base_message().protocol_message.as_option()?;
+    if protocol.r#type != Some(Type::GROUP_MEMBER_LABEL_CHANGE) {
+        return None;
+    }
+    Some(protocol.member_label.as_option()?.label.clone().unwrap_or_default())
 }
 
 /// The id of the message a revoke refers to, if this message is a revoke.
@@ -1575,7 +2678,32 @@ fn detect_media(message: &wa::Message) -> Option<MediaInfo> {
             thumb: document.jpeg_thumbnail.clone(),
         });
     }
+    if let Some(sticker) = message.sticker_message.as_option() {
+        return Some(MediaInfo {
+            kind: "sticker",
+            media_type: MediaType::Sticker,
+            downloadable: Box::new(sticker.clone()),
+            thumb: None,
+        });
+    }
     None
+}
+
+/// Any picture as a WhatsApp sticker: fitted into 512×512 on transparency, as
+/// WebP. A WebP is sent unchanged, so an animated sticker stays animated.
+fn sticker_webp(bytes: &[u8]) -> Option<Vec<u8>> {
+    if image::guess_format(bytes).ok()? == image::ImageFormat::WebP {
+        return Some(bytes.to_vec());
+    }
+    let fitted = image::load_from_memory(bytes).ok()?.thumbnail(512, 512).to_rgba8();
+    let mut canvas = image::RgbaImage::new(512, 512);
+    let (x, y) = ((512 - fitted.width()) / 2, (512 - fitted.height()) / 2);
+    image::imageops::overlay(&mut canvas, &fitted, x.into(), y.into());
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(canvas)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::WebP)
+        .ok()?;
+    Some(out)
 }
 
 /// Converts a protocol message into a storable one, downloading any media.
@@ -1589,21 +2717,57 @@ async fn incoming_message(
     auto_download: bool,
 ) -> Option<StoredMessage> {
     let info = &inbound.info;
-    let mut text = inbound.message.text_content().unwrap_or_default().to_string();
+    let envelope = Envelope {
+        chat: info.source.chat.to_string(),
+        id: info.id.to_string(),
+        sender: info.source.sender.to_string(),
+        timestamp: info.timestamp.timestamp(),
+        from_me: info.source.is_from_me,
+    };
+    stored_message(&inbound.message, envelope, client, media_dir, auto_download).await
+}
+
+/// Where a chat's cached profile picture lives.
+fn avatar_path(media_dir: &Path, jid: &str) -> PathBuf {
+    let name: String = jid
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    media_dir.join("avatars").join(format!("{name}.jpg"))
+}
+
+/// Where a message came from, whether it arrived live or through history sync.
+struct Envelope {
+    chat: String,
+    id: String,
+    sender: String,
+    timestamp: i64,
+    from_me: bool,
+}
+
+async fn stored_message(
+    message: &wa::Message,
+    envelope: Envelope,
+    client: Option<&Client>,
+    media_dir: Option<&Path>,
+    auto_download: bool,
+) -> Option<StoredMessage> {
+    let id = envelope.id.as_str();
+    let mut text = message.text_content().unwrap_or_default().to_string();
 
     let mut media_kind = None;
     let mut media_path = None;
     let mut media_thumb = None;
     let mut media_ref = None;
 
-    if let Some(media) = detect_media(&inbound.message) {
+    if let Some(media) = detect_media(message) {
         media_kind = Some(media.kind.to_string());
 
         // The thumbnail rides in the message, so it is kept even when the file
         // itself is not downloaded.
         if let (Some(dir), Some(bytes)) = (media_dir, media.thumb.as_ref()) {
             if std::fs::create_dir_all(dir).is_ok() {
-                let path = dir.join(format!("{}_thumb.jpg", info.id));
+                let path = dir.join(format!("{id}_thumb.jpg"));
                 if std::fs::write(&path, bytes).is_ok() {
                     media_thumb = Some(path.to_string_lossy().to_string());
                 }
@@ -1619,7 +2783,7 @@ async fn incoming_message(
                         if std::fs::create_dir_all(dir).is_ok() {
                             let path = dir.join(format!(
                                 "{}.{}",
-                                info.id,
+                                id,
                                 extension_for(media.kind, media.media_type)
                             ));
                             if std::fs::write(&path, &bytes).is_ok() {
@@ -1627,16 +2791,27 @@ async fn incoming_message(
                             }
                         }
                     }
-                    Err(e) => log::warn!("failed to download {} media: {e}", info.id),
+                    Err(e) => log::warn!("failed to download {id} media: {e}"),
                 }
             }
         } else {
             // Keep the message so the file can be fetched on demand later.
-            media_ref = Some(buffa::Message::encode_to_vec(&*inbound.message));
+            media_ref = Some(buffa::Message::encode_to_vec(message));
         }
 
         if text.is_empty() {
             text = format!("[{}]", media.kind);
+        }
+    }
+
+    // Polls and events render as cards; the row carries their title.
+    if media_kind.is_none() {
+        if let Some((question, _, _)) = poll_of(message) {
+            text = question;
+            media_kind = Some("poll".to_string());
+        } else if let Some(event) = event_of(message) {
+            text = event.name;
+            media_kind = Some("event".to_string());
         }
     }
 
@@ -1653,7 +2828,7 @@ async fn incoming_message(
         reply_to_kind,
         reply_to_thumb,
         reply_to_chat,
-    ) = quote_of(&inbound.message)
+    ) = quote_of(message)
             .map(|(id, sender, text, kind, thumb, chat)| {
                 // Quoting our own message should read "You", not our phone number.
                 let mine = client
@@ -1686,16 +2861,16 @@ async fn incoming_message(
 
     // A link preview rides on the extended text message.
     let (preview_url, preview_title, preview_desc, preview_thumb) =
-        link_preview(&inbound.message, media_dir, &info.id.to_string());
+        link_preview(message, media_dir, id);
 
     Some(StoredMessage {
-        chat: info.source.chat.to_string(),
-        id: info.id.to_string(),
-        sender: info.source.sender.to_string(),
+        chat: envelope.chat,
+        id: envelope.id.clone(),
+        sender: envelope.sender,
         // Names are resolved separately and joined by the store on read.
         sender_name: None,
-        timestamp: info.timestamp.timestamp(),
-        from_me: info.source.is_from_me,
+        timestamp: envelope.timestamp,
+        from_me: envelope.from_me,
         text,
         media_kind,
         media_path,
@@ -1754,6 +2929,7 @@ fn extension_for(kind: &str, media_type: MediaType) -> &'static str {
         "image" => "jpg",
         "video" | "gif" => "mp4",
         "audio" => "ogg",
+        "sticker" => "webp",
         "document" => "bin",
         _ => match media_type {
             MediaType::Image => "jpg",
@@ -1857,13 +3033,6 @@ fn message_context(message: &wa::Message) -> Option<&wa::ContextInfo> {
         })
 }
 
-/// The JIDs a message mentions.
-fn mentioned_jids(message: &wa::Message) -> Vec<String> {
-    message_context(message)
-        .map(|c| c.mentioned_jid.clone())
-        .unwrap_or_default()
-}
-
 /// Whether a message mentions us: directly, or everyone through @all.
 fn mentions_me(message: &wa::Message, own: &[String]) -> bool {
     let Some(context) = message_context(message) else {
@@ -1876,65 +3045,6 @@ fn mentions_me(message: &wa::Message, own: &[String]) -> bool {
         let bare = mention.split(':').next().unwrap_or(mention);
         own.iter().any(|me| me == mention || me == bare)
     })
-}
-
-/// Rewrites `@<number>` mention tokens into the name we know for that JID.
-///
-/// The wire identifies a mention by its number; the UI shows the name, so the
-/// stored text is the display form.
-fn replace_mentions(text: &str, mentions: &[String], store: &MessageStore) -> String {
-    let mut out = text.to_string();
-    for jid in mentions {
-        let user = jid.split('@').next().unwrap_or(jid);
-        let user = user.split(':').next().unwrap_or(user);
-        let bare = jid.split(':').next().unwrap_or(jid);
-        let name = store
-            .name_for(jid)
-            .ok()
-            .flatten()
-            .or_else(|| store.name_for(bare).ok().flatten())
-            .unwrap_or_else(|| user.to_string());
-        out = out.replace(&format!("@{user}"), &format!("@{name}"));
-    }
-    out
-}
-
-/// Rewrites `@<digits>` tokens to a known name.
-///
-/// Used where no `mentioned_jid` is available: quoted text, and messages from
-/// senders that omit it. The token is a bare number, so both the phone-number
-/// and the LID form are tried.
-fn resolve_mention_tokens(text: &str, store: &MessageStore) -> String {
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'@' {
-            let start = i + 1;
-            let mut end = start;
-            while end < bytes.len() && bytes[end].is_ascii_digit() {
-                end += 1;
-            }
-            if end > start {
-                let number = &text[start..end];
-                let name = store
-                    .name_for(&format!("{number}@s.whatsapp.net"))
-                    .ok()
-                    .flatten()
-                    .or_else(|| store.name_for(&format!("{number}@lid")).ok().flatten());
-                if let Some(name) = name {
-                    out.push('@');
-                    out.push_str(&name);
-                    i = end;
-                    continue;
-                }
-            }
-        }
-        let ch = text[i..].chars().next().unwrap_or('\u{fffd}');
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
 }
 
 /// A link preview fetched from a URL.
@@ -1991,8 +3101,8 @@ fn fetch_link_preview(url: &str) -> Option<LinkPreview> {
 /// A small JPEG preview for an outgoing attachment.
 ///
 /// Images are downscaled locally. Video needs a decoder, so it is best effort:
-/// ffmpeg is used when present, and `None` means the file goes without a
-/// preview.
+/// Media Foundation on Windows, ffmpeg elsewhere when present, and `None`
+/// means the file goes without a preview.
 fn media_thumbnail(kind: &str, bytes: &[u8]) -> Option<Vec<u8>> {
     match kind {
         "image" => image_thumbnail(bytes),
@@ -2002,8 +3112,25 @@ fn media_thumbnail(kind: &str, bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn image_thumbnail(bytes: &[u8]) -> Option<Vec<u8>> {
-    let decoded = image::load_from_memory(bytes).ok()?;
-    let thumb = decoded.thumbnail(256, 256);
+    jpeg_thumbnail(image::load_from_memory(bytes).ok()?)
+}
+
+/// A centred square crop, at most `size` pixels a side, as JPEG.
+fn square_jpeg(bytes: &[u8], size: u32) -> Option<Vec<u8>> {
+    let image = image::load_from_memory(bytes).ok()?;
+    let side = image.width().min(image.height());
+    let square = image
+        .crop_imm((image.width() - side) / 2, (image.height() - side) / 2, side, side)
+        .resize_exact(side.min(size), side.min(size), image::imageops::FilterType::Lanczos3);
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgb8(square.to_rgb8())
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Jpeg)
+        .ok()?;
+    Some(out)
+}
+
+fn jpeg_thumbnail(image: image::DynamicImage) -> Option<Vec<u8>> {
+    let thumb = image.thumbnail(256, 256);
     let mut out = Vec::new();
     thumb
         .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Jpeg)
@@ -2011,6 +3138,115 @@ fn image_thumbnail(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+#[cfg(windows)]
+fn video_thumbnail(bytes: &[u8]) -> Option<Vec<u8>> {
+    use windows::Win32::{
+        Media::MediaFoundation::{MFShutdown, MFStartup, MFSTARTUP_NOSOCKET, MF_VERSION},
+        System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED},
+    };
+
+    // COM is initialised per thread, so decode on a thread of our own rather
+    // than on a runtime worker.
+    let frame = std::thread::scope(|scope| {
+        scope
+            .spawn(|| unsafe {
+                CoInitializeEx(None, COINIT_MULTITHREADED).ok().ok()?;
+                let frame = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).ok().and_then(|()| {
+                    let frame = first_frame(bytes);
+                    let _ = MFShutdown();
+                    frame
+                });
+                CoUninitialize();
+                frame
+            })
+            .join()
+            .ok()
+            .flatten()
+    })?;
+    jpeg_thumbnail(image::DynamicImage::ImageRgb8(frame))
+}
+
+/// The first decodable video frame, cropped to its visible area.
+///
+/// Must run between `MFStartup` and `MFShutdown` on a COM thread.
+#[cfg(windows)]
+unsafe fn first_frame(bytes: &[u8]) -> Option<image::RgbImage> {
+    use windows::Win32::{Media::MediaFoundation::*, UI::Shell::SHCreateMemStream};
+
+    let stream = MFCreateMFByteStreamOnStream(&SHCreateMemStream(Some(bytes))?).ok()?;
+    let mut attributes = None;
+    MFCreateAttributes(&mut attributes, 1).ok()?;
+    let attributes = attributes?;
+    // Lets the reader convert whatever the decoder emits to RGB32.
+    attributes.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1).ok()?;
+    let reader = MFCreateSourceReaderFromByteStream(&stream, &attributes).ok()?;
+
+    let video = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+    reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false).ok()?;
+    reader.SetStreamSelection(video, true).ok()?;
+    let wanted = MFCreateMediaType().ok()?;
+    wanted.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ok()?;
+    wanted.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32).ok()?;
+    reader.SetCurrentMediaType(video, None, &wanted).ok()?;
+
+    let mut sample: Option<IMFSample> = None;
+    for _ in 0..64 {
+        let mut flags = 0u32;
+        reader
+            .ReadSample(video, 0, None, Some(&mut flags as *mut _), None, Some(&mut sample as *mut _))
+            .ok()?;
+        if sample.is_some() || flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+            break;
+        }
+    }
+    let buffer = sample?.ConvertToContiguousBuffer().ok()?;
+
+    // Read after the first sample: the decoder only settles the frame size then.
+    let format = reader.GetCurrentMediaType(video).ok()?;
+    let size = format.GetUINT64(&MF_MT_FRAME_SIZE).ok()?;
+    let (width, height) = ((size >> 32) as u32, size as u32);
+    let stride = format
+        .GetUINT32(&MF_MT_DEFAULT_STRIDE)
+        .map(|s| s as i32)
+        .unwrap_or(width as i32 * 4);
+    // Decoders pad to whole macroblocks (1080 rows become 1088); the aperture is
+    // the picture. MFVideoArea: two MFOffset { fract: u16, value: i16 }, then SIZE.
+    let mut area = [0u8; 16];
+    let (left, top, visible_w, visible_h) = format
+        .GetBlob(&MF_MT_MINIMUM_DISPLAY_APERTURE, &mut area, None)
+        .ok()
+        .map(|()| {
+            (
+                i16::from_le_bytes([area[2], area[3]]).max(0) as u32,
+                i16::from_le_bytes([area[6], area[7]]).max(0) as u32,
+                i32::from_le_bytes([area[8], area[9], area[10], area[11]]).max(0) as u32,
+                i32::from_le_bytes([area[12], area[13], area[14], area[15]]).max(0) as u32,
+            )
+        })
+        .filter(|&(x, y, w, h)| w > 0 && h > 0 && x + w <= width && y + h <= height)
+        .unwrap_or((0, 0, width, height));
+
+    let mut data: *mut u8 = std::ptr::null_mut();
+    let mut len = 0u32;
+    buffer.Lock(&mut data, None, Some(&mut len as *mut _)).ok()?;
+    let pixels = std::slice::from_raw_parts(data, len as usize);
+    let row = stride.unsigned_abs() as usize;
+    let frame = (width > 0 && row >= width as usize * 4 && pixels.len() >= row * height as usize)
+        .then(|| {
+            image::RgbImage::from_fn(visible_w, visible_h, |x, y| {
+                let y = top + y;
+                // A negative stride means the rows are stored bottom-up.
+                let y = (if stride < 0 { height - 1 - y } else { y }) as usize;
+                let i = y * row + (left + x) as usize * 4;
+                // RGB32 is BGRX in memory.
+                image::Rgb([pixels[i + 2], pixels[i + 1], pixels[i]])
+            })
+        });
+    let _ = buffer.Unlock();
+    frame
+}
+
+#[cfg(not(windows))]
 fn video_thumbnail(bytes: &[u8]) -> Option<Vec<u8>> {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -2029,8 +3265,17 @@ fn video_thumbnail(bytes: &[u8]) -> Option<Vec<u8>> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    child.stdin.take()?.write_all(bytes).ok()?;
-    let output = child.wait_with_output().ok()?;
+    // Fed from another thread while stdout drains: ffmpeg stops reading after
+    // the first frame, so a write can fail with a broken pipe after the frame
+    // is out, or block while ffmpeg waits on a full stdout pipe.
+    let mut stdin = child.stdin.take()?;
+    let output = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let _ = stdin.write_all(bytes);
+        });
+        child.wait_with_output()
+    })
+    .ok()?;
     (output.status.success() && !output.stdout.is_empty()).then_some(output.stdout)
 }
 
@@ -2109,8 +3354,8 @@ mod tests {
     #[test]
     fn default_config_targets_its_data_dir() {
         let c = ServiceConfig::under("/tmp/example");
-        assert_eq!(c.session_path, PathBuf::from("/tmp/example/session.db"));
-        assert_eq!(c.messages_path, PathBuf::from("/tmp/example/messages.db"));
+        assert_eq!(c.session_path, Path::new("/tmp/example").join("session.db"));
+        assert_eq!(c.messages_path, Path::new("/tmp/example").join("messages.db"));
         assert_eq!(c.retention, Retention::default());
         assert!(!c.accept_full_history);
     }

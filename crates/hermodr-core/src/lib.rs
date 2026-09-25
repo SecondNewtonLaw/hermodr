@@ -5,14 +5,20 @@
 //! importantly, makes history sync a decision this program gets to make.
 
 pub mod history;
+pub mod ogg;
 pub mod service;
 pub mod store;
 
 use anyhow::Result;
 
 pub use history::HistoryPolicy;
-pub use service::{GroupInfo, Participant, SearchResult, Service, ServiceConfig, ServiceEvent};
-pub use store::{ChatSummary, MessageStore, Retention, StoredMessage};
+pub use service::{
+    GroupInfo, Participant, Profile, SearchResult, SendOptions, Service, ServiceConfig,
+    ServiceEvent, VoiceNote,
+};
+pub use store::{
+    ChatMarks, ChatSummary, MessageStore, NewEvent, Retention, StoredMessage, ViewOnce,
+};
 
 /// Renders a pairing code as an SVG string for the UI to display.
 ///

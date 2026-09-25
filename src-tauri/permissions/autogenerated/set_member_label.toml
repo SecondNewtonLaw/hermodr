@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-member-label"
+description = "Enables the set_member_label command without any pre-configured scope."
+commands.allow = ["set_member_label"]
+
+[[permission]]
+identifier = "deny-set-member-label"
+description = "Denies the set_member_label command without any pre-configured scope."
+commands.deny = ["set_member_label"]

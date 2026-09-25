@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-watch-presence"
+description = "Enables the watch_presence command without any pre-configured scope."
+commands.allow = ["watch_presence"]
+
+[[permission]]
+identifier = "deny-watch-presence"
+description = "Denies the watch_presence command without any pre-configured scope."
+commands.deny = ["watch_presence"]

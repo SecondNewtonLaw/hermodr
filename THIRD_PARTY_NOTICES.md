@@ -583,6 +583,7 @@ cssparser, cssparser-macros, dtoa-short, option-ext, selectors.
 | chokidar | 4.0.3 | MIT |
 | clsx | 2.1.1 | MIT |
 | cookie | 0.6.0 | MIT |
+| country-flag-emoji-polyfill | 0.1.10 | MIT (code), CC-BY-4.0 (font) |
 | deepmerge | 4.3.1 | MIT |
 | detect-libc | 2.1.2 | Apache-2.0 |
 | devalue | 5.9.4 | MIT |
@@ -616,6 +617,14 @@ cssparser, cssparser-macros, dtoa-short, option-ext, selectors.
 | vite | 8.3.0 | MIT |
 | vitefu | 1.1.3 | MIT |
 | zimmerframe | 1.1.5 | MIT |
+
+## Bundled artwork
+
+Country flags on Windows are drawn with the "Twemoji Country Flags" font from
+country-flag-emoji-polyfill (TalkJS). Its glyphs are Twemoji graphics,
+Copyright Twitter, Inc and other contributors, used unmodified under
+CC-BY 4.0 (https://creativecommons.org/licenses/by/4.0/).
+Source: https://github.com/twitter/twemoji
 
 ## Bundled C libraries
 

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-names"
+description = "Enables the names command without any pre-configured scope."
+commands.allow = ["names"]
+
+[[permission]]
+identifier = "deny-names"
+description = "Denies the names command without any pre-configured scope."
+commands.deny = ["names"]

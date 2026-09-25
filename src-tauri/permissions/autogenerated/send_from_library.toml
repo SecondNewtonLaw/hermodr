@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-send-from-library"
+description = "Enables the send_from_library command without any pre-configured scope."
+commands.allow = ["send_from_library"]
+
+[[permission]]
+identifier = "deny-send-from-library"
+description = "Denies the send_from_library command without any pre-configured scope."
+commands.deny = ["send_from_library"]
