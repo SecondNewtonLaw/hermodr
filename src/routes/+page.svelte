@@ -1221,11 +1221,13 @@
             <button class="load-older" onclick={loadOlder}>Load older messages</button>
           {/if}
           {#each messages.slice().reverse() as message (message.id)}
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
               class="bubble"
               class:mine={message.from_me}
               class:highlighted={message.id === highlightedId}
-              data-id={message.id}>
+              data-id={message.id}
+              ondblclick={() => (replyingTo = message)}>
               {#if !message.from_me && selectedChat?.endsWith("@g.us")}
                 <span class="sender">{senderLabel(message)}</span>
               {/if}
